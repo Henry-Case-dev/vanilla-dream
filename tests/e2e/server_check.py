@@ -84,11 +84,18 @@ def _audio_info_value(source: dict, key: str) -> int | None:
 
 def check_icecast(stats_url: str) -> None:
     try:
-        status, body, _ = http_get(stats_url)
-        data = json.loads(body)
-        source = data.get("icestats", {}).get("source")
-        if isinstance(source, list):
-            source = source[0] if source else None
+        deadline = time.time() + 25
+        source = None
+        data = {}
+        while time.time() < deadline:
+            status, body, _ = http_get(stats_url)
+            data = json.loads(body)
+            source = data.get("icestats", {}).get("source")
+            if isinstance(source, list):
+                source = source[0] if source else None
+            if source:
+                break
+            time.sleep(1)
         if not source:
             check("icecast mount", False, "no source mounted")
             return
