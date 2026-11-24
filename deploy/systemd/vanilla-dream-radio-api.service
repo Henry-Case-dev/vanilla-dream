@@ -12,10 +12,10 @@ WorkingDirectory=/opt/vanilla-dream-radio/current/backend
 EnvironmentFile=/etc/vanilla-dream-radio/env
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
-ExecStart=/opt/vanilla-dream-radio/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8100 --workers 1 --proxy-headers --forwarded-allow-ips 127.0.0.1 --timeout-graceful-shutdown 5
+ExecStart=/opt/vanilla-dream-radio/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8100 --workers 1 --proxy-headers --forwarded-allow-ips 127.0.0.1 --timeout-graceful-shutdown 2
 Restart=on-failure
 RestartSec=5
-TimeoutStopSec=20
+TimeoutStopSec=15
 Slice=vanilla-dream-radio.slice
 
 # sudo is used for the exact allow-listed systemctl calls, so no

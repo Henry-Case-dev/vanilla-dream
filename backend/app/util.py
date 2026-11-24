@@ -81,7 +81,13 @@ def epoch_to_dt(value: float | str | None) -> datetime | None:
 
 
 def atomic_write_text(path: Path, text: str, default_mode: int = 0o640) -> None:
-    """Write text atomically, preserving the existing file mode when possible."""
+    """Write text atomically, preserving the existing file mode when possible.
+
+    The production configuration directory is not writable by the service user
+    (root:vdradio 0750), so a rename cannot always be used. In that case the
+    existing file is rewritten in place: it keeps its owner and mode, and the
+    whole content is written in one small write.
+    """
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -89,23 +95,51 @@ def atomic_write_text(path: Path, text: str, default_mode: int = 0o640) -> None:
         mode = path.stat().st_mode & 0o777
     except FileNotFoundError:
         mode = default_mode
-    fd, tmp_name = tempfile.mkstemp(prefix="." + path.name + ".", dir=str(path.parent))
     try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(text)
+        fd, tmp_name = tempfile.mkstemp(prefix="." + path.name + ".", dir=str(path.parent))
+    except PermissionError:
+        tmp_name = ""
+        fd = -1
+    if fd != -1:
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            try:
+                os.chmod(tmp_name, mode)
+            except OSError:
+                pass
+            os.replace(tmp_name, path)
+            return
+        except PermissionError:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+        except BaseException:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+    data = text.encode("utf-8")
+    try:
+        with open(path, "r+b") as handle:
+            handle.seek(0)
+            handle.truncate()
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except FileNotFoundError:
+        with open(path, "wb") as handle:
+            handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
         try:
-            os.chmod(tmp_name, mode)
+            os.chmod(path, mode)
         except OSError:
             pass
-        os.replace(tmp_name, path)
-    except BaseException:
-        try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
-        raise
 
 
 def escape_liq_string(value: str) -> str:
