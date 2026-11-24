@@ -8,9 +8,11 @@ from pathlib import Path
 
 LOGGER = logging.getLogger("vdradio.liquidsoap")
 
-ALLOWED_COMMANDS = frozenset({"vd_sync", "radio.skip"})
+ALLOWED_COMMANDS = frozenset({"vd_sync", "vd_skip", "radio.skip"})
+SKIP_COMMANDS = frozenset({"vd_skip", "radio.skip"})
 END_MARKER = "END"
 MAX_REPLY_BYTES = 65536
+DONE_REPLIES = frozenset({"DONE", "DONE."})
 
 
 class LiquidsoapClient:
@@ -67,7 +69,12 @@ class LiquidsoapClient:
             if line.strip() == END_MARKER:
                 break
         reply = "\n".join(lines).strip()
-        ok = reply.lstrip().upper().startswith("OK")
+        first_line = reply.splitlines()[0].strip().upper() if reply else ""
+        ok = first_line.startswith("OK")
+        if not ok and name in SKIP_COMMANDS:
+            # Liquidsoap's builtin radio.skip answers "Done." while a registered
+            # custom command (vd_skip) answers "OK".
+            ok = first_line in DONE_REPLIES
         return ok, reply
 
     def sync(self) -> bool:
@@ -75,5 +82,8 @@ class LiquidsoapClient:
         return ok
 
     def skip(self) -> bool:
+        ok, _ = self.command("vd_skip")
+        if ok:
+            return True
         ok, _ = self.command("radio.skip")
         return ok

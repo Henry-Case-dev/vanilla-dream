@@ -454,6 +454,7 @@ def resolve_source(
 
     rule = scheduler.active_rule(conn, now)
     if rule is not None:
+        source = None
         if rule["playlist_id"]:
             key = f"schedule:{rule['id']}:playlist:{rule['playlist_id']}"
             if key not in excluded:
@@ -464,13 +465,19 @@ def resolve_source(
                     key,
                     rule_id=str(rule["id"]),
                 )
-                if source is not None:
-                    return source
-        else:
+        elif int(rule["rotation"] or 0):
             key = f"schedule:{rule['id']}:rotation"
             source = _rotation_source(conn, key, kind="schedule", rule_id=str(rule["id"]))
-            if source is not None and source.key not in excluded:
-                return source
+            if source is not None and source.key in excluded:
+                source = None
+        if source is not None:
+            return source
+        _warn_once(
+            conn,
+            f"schedule-source:{rule['id']}",
+            "Правило расписания пропущено: источник пуст или недоступен",
+            {"rule_id": rule["id"], "playlist_id": rule["playlist_id"]},
+        )
 
     source = _rotation_source(conn, "rotation", kind="rotation")
     if source is not None and source.key not in excluded:

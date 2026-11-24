@@ -80,6 +80,15 @@ server.register(description="Replace the prepared queue from the backend file", 
   end
 )
 
+# Deterministic skip: the builtin `radio.skip` replies "Done." and the backend
+# needs an unambiguous success marker.
+server.register(description="Skip the current track", "vd_skip", fun (_) ->
+  begin
+    queue.skip()
+    "OK"
+  end
+)
+
 # Empty queue means technical silence on a live mount, never a broken mount and
 # never a fake "on air" music state (the backend reports no_music).
 radio = fallback(track_sensitive=false, [queue, blank()])

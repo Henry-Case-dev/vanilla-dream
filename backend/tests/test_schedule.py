@@ -415,6 +415,112 @@ def test_immediate_transition_skips_current_track(env, admin):
     assert env.engine.skip_calls == 1
 
 
+def test_rule_without_source_is_rejected(env, admin):
+    response = env.client.post(
+        "/api/admin/schedule",
+        json={
+            "name": "e2e all day",
+            "playlist_id": None,
+            "use_rotation": False,
+            "days": [0, 1, 2, 3, 4, 5, 6],
+            "start": "00:00",
+            "end": "23:59",
+            "enabled": True,
+            "priority": 5,
+            "transition": "after_track",
+        },
+    )
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail["code"] == "invalid_rule_source"
+    assert "плейлист" in detail["message"]
+    assert env.client.get("/api/admin/schedule").json()["rules"] == []
+
+
+def test_empty_scheduled_playlist_falls_back_to_library(env, admin):
+    track = _upload(env, "fallback-a")
+    _upload(env, "fallback-b")
+    playlist = make_playlist(env.client, "Will empty", [track["id"]])
+    rule = env.client.post(
+        "/api/admin/schedule",
+        json={
+            "name": "All day",
+            "playlist_id": playlist["id"],
+            "use_rotation": False,
+            "days": [0, 1, 2, 3, 4, 5, 6],
+            "start": "00:00",
+            "end": "23:59",
+            "enabled": True,
+            "priority": 10,
+            "transition": "after_track",
+        },
+    )
+    assert rule.status_code == 201, rule.text
+    removed = env.client.delete(
+        f"/api/admin/playlists/{playlist['id']}/tracks/{track['id']}"
+    )
+    assert removed.status_code == 200
+
+    env.client.post("/api/admin/station/start")
+    env.icecast.payload = {
+        "available": True,
+        "mount_present": True,
+        "listeners": 1,
+        "bitrate": 128,
+        "title": None,
+        "error": None,
+    }
+    started = play_next(env)
+    assert started is not None
+    env.app.state.scheduler.tick()
+    payload = env.client.get("/api/public/now-playing").json()
+    assert payload["track"] is not None
+    assert payload["station"]["status"] != "no_music"
+    items = env.client.get("/api/admin/queue").json()["items"]
+    assert any(item["source"]["kind"] == "library" for item in items)
+    assert not any(item["source"]["kind"] == "schedule" for item in items)
+
+    conn = db.open_db(env.settings)
+    try:
+        warnings = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE message LIKE '%Правило расписания пропущено%'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert warnings >= 1
+
+
+def test_rule_without_rotation_sources_falls_back(env, admin):
+    _upload(env, "rot-fallback-a")
+    _upload(env, "rot-fallback-b")
+    rule = env.client.post(
+        "/api/admin/schedule",
+        json={
+            "name": "Rotation empty",
+            "playlist_id": None,
+            "use_rotation": True,
+            "days": [0, 1, 2, 3, 4, 5, 6],
+            "start": "00:00",
+            "end": "23:59",
+            "enabled": True,
+            "priority": 9,
+        },
+    )
+    assert rule.status_code == 201, rule.text
+    env.app.state.scheduler.tick()
+    items = env.client.get("/api/admin/queue").json()["items"]
+    assert items
+    assert all(item["source"]["kind"] == "library" for item in items)
+    conn = db.open_db(env.settings)
+    try:
+        warnings = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE message LIKE '%Правило расписания пропущено%'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert warnings >= 1
+
+
 def test_stopped_station_is_not_started_by_schedule(env, admin):
     track = _upload(env, "stop")
     playlist = make_playlist(env.client, "Stop", [track["id"]])

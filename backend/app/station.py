@@ -69,6 +69,7 @@ class StationController:
         self.engine = engine
         self.icecast = icecast
         self.runner = runner
+        self._unit_cache: dict[str, tuple[str, datetime]] = {}
 
     # -- systemctl ---------------------------------------------------------
     def _systemctl(self, action: str, unit: str = UNIT_LIQUIDSOAP, sudo: bool = True):
@@ -101,18 +102,34 @@ class StationController:
             ok = output in ("active", "activating", "reloading")
         return ok, output, result.returncode
 
-    def unit_info(self) -> tuple[bool, str]:
-        ok, output, code = self._systemctl("is-active")
+    def invalidate_unit_cache(self, unit: str | None = None) -> None:
+        if unit is None:
+            self._unit_cache.clear()
+        else:
+            self._unit_cache.pop(unit, None)
+
+    def _unit_state(self, unit: str, sudo: bool, now: datetime | None = None) -> str:
+        now = now or self.clock.now()
+        ttl = float(self.settings.unit_state_ttl or 0)
+        cached = self._unit_cache.get(unit)
+        if cached is not None and ttl > 0:
+            age = (now - cached[1]).total_seconds()
+            if 0 <= age < ttl:
+                return cached[0]
+        _ok, output, code = self._systemctl("is-active", unit, sudo=sudo)
         if code == -1:
-            return False, "unknown"
-        state = output.splitlines()[0].strip() if output else "unknown"
+            state = "unknown"
+        else:
+            state = output.splitlines()[0].strip() if output else "unknown"
+        self._unit_cache[unit] = (state, now)
+        return state
+
+    def unit_info(self, now: datetime | None = None) -> tuple[bool, str]:
+        state = self._unit_state(UNIT_LIQUIDSOAP, sudo=True, now=now)
         return state in ("active", "activating", "reloading"), state
 
-    def unit_state_of(self, unit: str) -> str:
-        _ok, output, code = self._systemctl("is-active", unit, sudo=False)
-        if code == -1:
-            return "unknown"
-        return output.splitlines()[0].strip() if output else "unknown"
+    def unit_state_of(self, unit: str, now: datetime | None = None) -> str:
+        return self._unit_state(unit, sudo=False, now=now)
 
     # -- desired state -----------------------------------------------------
     def _set_desired(self, conn, value: str) -> None:
@@ -159,7 +176,7 @@ class StationController:
         stats = stats if stats is not None else (
             self.icecast.stats() if self.icecast is not None else {"available": False, "mount_present": False}
         )
-        unit_active, unit_state = self.unit_info()
+        unit_active, unit_state = self.unit_info(now)
         active_since = self.active_since(conn, now, unit_active)
         desired = self.desired(conn)
         state_row = conn.execute("SELECT track_id FROM playback_state WHERE singleton = 1").fetchone()
@@ -198,6 +215,7 @@ class StationController:
     # -- commands ----------------------------------------------------------
     def _start_unit(self, conn, now: datetime, raise_on_error: bool) -> bool:
         ok, output, _code = self._systemctl("start")
+        self.invalidate_unit_cache(UNIT_LIQUIDSOAP)
         if ok:
             db.set_setting(conn, "engine_last_start", to_iso(now) or "")
             self._clear_failures(conn)
@@ -236,6 +254,7 @@ class StationController:
     def stop(self, conn, now: datetime | None = None) -> dict:
         now = now or self.clock.now()
         ok, output, _code = self._systemctl("stop")
+        self.invalidate_unit_cache(UNIT_LIQUIDSOAP)
         if not ok:
             db.set_setting(conn, "engine_last_error", (output or "Не удалось остановить движок")[:500])
             db.log_event(conn, "error", "station", "Не удалось остановить движок", {"output": output})
@@ -275,6 +294,7 @@ class StationController:
             )
         queue_engine.ensure_queue(conn, self.settings, now)
         ok, output, _code = self._systemctl("restart")
+        self.invalidate_unit_cache(UNIT_LIQUIDSOAP)
         if not ok:
             self._record_failure(conn, now, output or "Не удалось перезапустить движок")
             db.log_event(
@@ -298,6 +318,7 @@ class StationController:
         if self.desired(conn) != "playing":
             return False
         ok, output, _code = self._systemctl("restart")
+        self.invalidate_unit_cache(UNIT_LIQUIDSOAP)
         if ok:
             db.set_setting(conn, "engine_last_start", to_iso(now) or "")
             self._clear_failures(conn)

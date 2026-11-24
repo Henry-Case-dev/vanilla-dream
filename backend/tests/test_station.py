@@ -7,9 +7,9 @@ from datetime import timedelta
 from fastapi.testclient import TestClient
 
 from app import db
-from app.config import UNIT_LIQUIDSOAP
+from app.config import UNIT_LIQUIDSOAP, Settings
 from app.main import create_app
-from app.station import compute_state
+from app.station import StationController, compute_state
 from tests.helpers import upload_and_get, write_mp3
 
 
@@ -307,6 +307,68 @@ def test_station_play_now_and_play_next_endpoints(env, admin):
     assert queued.status_code == 200
     assert queued.json()["items"][0]["track"]["id"] == second["id"]
     assert env.engine.skip_calls == 1
+
+
+def test_unit_state_ttl_is_configurable(monkeypatch):
+    monkeypatch.setenv("VD_UNIT_STATE_TTL", "7.5")
+    assert Settings.from_env().unit_state_ttl == 7.5
+
+
+def test_unit_state_is_cached_for_ttl_and_invalidated_by_controls(env, admin):
+    def is_active_calls() -> int:
+        return len(
+            [
+                call
+                for call in env.runner.calls
+                if call[0] == "sudo" and call[-2] == "is-active"
+            ]
+        )
+
+    controller = StationController(
+        env.settings, env.clock, engine=env.engine, icecast=env.icecast, runner=env.runner
+    )
+    conn = db.open_db(env.settings)
+    try:
+        controller.status(conn, env.clock.now())
+        first = is_active_calls()
+        assert first == 1
+        controller.status(conn, env.clock.now())
+        assert is_active_calls() == first  # within TTL: no new process
+        env.clock.advance(1)
+        controller.status(conn, env.clock.now())
+        assert is_active_calls() == first
+        controller.stop(conn, env.clock.now())  # own stop invalidates immediately
+        after_stop = is_active_calls()
+        assert after_stop == first + 1
+        controller.status(conn, env.clock.now())
+        assert is_active_calls() == after_stop  # first read after stop repopulates cache
+        env.clock.advance(3.1)
+        controller.status(conn, env.clock.now())
+        assert is_active_calls() == after_stop + 1
+    finally:
+        conn.close()
+
+
+def test_skip_returns_503_only_on_real_engine_failure(env, admin):
+    _upload(env, "skipfail")
+    env.client.post("/api/admin/station/start")
+    original = env.station.engine
+
+    class BrokenEngine:
+        def sync(self):
+            return True
+
+        def skip(self):
+            return False
+
+    env.station.engine = BrokenEngine()
+    failed = env.client.post("/api/admin/station/skip")
+    assert failed.status_code == 503
+    assert failed.json()["detail"]["code"] == "engine_unavailable"
+
+    env.station.engine = original
+    ok = env.client.post("/api/admin/station/skip")
+    assert ok.status_code == 200
 
 
 def test_stop_failure_keeps_desired_state(env, admin):

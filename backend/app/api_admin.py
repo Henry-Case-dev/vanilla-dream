@@ -588,7 +588,15 @@ def _rule_payload_from_body(conn, body: dict, existing: sqlite3.Row | None, now:
         playlists.require_playlist(conn, str(playlist_id))
         rotation_flag = 1 if use_rotation else 0
     else:
-        rotation_flag = 0 if use_rotation is False else 1
+        if use_rotation is False:
+            raise ApiError(
+                422,
+                "invalid_rule_source",
+                "Правило должно ссылаться на существующий плейлист "
+                "или использовать ротацию.",
+                {"playlist_id": "Выберите плейлист."},
+            )
+        rotation_flag = 1
     days = merged.get("days")
     if not isinstance(days, list):
         raise ApiError(422, "invalid_days", "Передайте список дней недели.")

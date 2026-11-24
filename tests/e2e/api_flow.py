@@ -167,7 +167,9 @@ def main() -> int:
 
     name = f"Проверка {uuid.uuid4().hex[:6]}"
     status, pl = c.json("POST", "/api/admin/playlists", {"name": name, "description": "e2e"})
-    playlist_id = (pl or {}).get("id") if isinstance(pl, dict) else None
+    playlist_id = None
+    if isinstance(pl, dict):
+        playlist_id = pl.get("id") or (pl.get("playlist") or {}).get("id")
     check("create playlist", status in (200, 201) and bool(playlist_id), status)
 
     if playlist_id:
@@ -192,7 +194,9 @@ def main() -> int:
         "priority": 5,
         "transition": "after_track",
     })
-    rule_id = (rule or {}).get("id") if isinstance(rule, dict) else None
+    rule_id = None
+    if isinstance(rule, dict):
+        rule_id = rule.get("id") or (rule.get("rule") or {}).get("id")
     check("create schedule rule", status in (200, 201) and bool(rule_id), status)
 
     status, _ = c.json("PUT", "/api/admin/settings", {"schedule_enabled": 1, "default_playlist_id": playlist_id or ""})

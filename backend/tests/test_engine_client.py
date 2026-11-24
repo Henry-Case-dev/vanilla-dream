@@ -1,10 +1,10 @@
-"""Liquidsoap command socket protocol: allow-list, END marker, failure handling."""
+"""Liquidsoap command socket protocol: allow-list, END marker, skip variants."""
 
 from __future__ import annotations
 
 import pytest
 
-from app.liquidsoap import LiquidsoapClient
+from app.liquidsoap import ALLOWED_COMMANDS, LiquidsoapClient
 
 
 class FakeSocket:
@@ -41,6 +41,17 @@ def _client(replies: bytes, socket_path="/run/vanilla-dream-radio/liquidsoap.soc
     return client, sock
 
 
+def _multi_client(replies_list: list[bytes]):
+    sockets = [FakeSocket(replies) for replies in replies_list]
+    iterator = iter(sockets)
+    client = LiquidsoapClient(
+        "/run/vanilla-dream-radio/liquidsoap.sock",
+        timeout=5,
+        socket_factory=lambda: next(iterator),
+    )
+    return client, sockets
+
+
 def test_sync_reads_reply_until_end():
     client, sock = _client(b"OK\nprepared 2 requests\nEND\nremaining")
     ok, reply = client.command("vd_sync")
@@ -51,10 +62,39 @@ def test_sync_reads_reply_until_end():
     assert sock.replies == b"remaining"  # reading stopped at the END line
 
 
-def test_skip_uses_radio_skip():
+def test_vd_skip_is_allow_listed_and_used_first():
+    assert "vd_skip" in ALLOWED_COMMANDS
     client, sock = _client(b"OK\nEND\n")
     assert client.skip() is True
-    assert sock.sent == b"radio.skip\n"
+    assert sock.sent == b"vd_skip\n"
+
+
+def test_skip_accepts_done_and_done_dot():
+    for reply in (b"Done.\nEND\n", b"Done\nEND\n", b"DONE.\nEND\n"):
+        client, _sock = _client(reply)
+        assert client.skip() is True, reply
+
+
+def test_skip_falls_back_to_radio_skip_after_unknown_vd_skip():
+    client, sockets = _multi_client(
+        [b"ERROR: unknown command vd_skip\nEND\n", b"Done.\nEND\n"]
+    )
+    assert client.skip() is True
+    assert sockets[0].sent == b"vd_skip\n"
+    assert sockets[1].sent == b"radio.skip\n"
+
+
+def test_skip_unknown_replies_rejected():
+    client, _sockets = _multi_client(
+        [b"ERROR: nope\nEND\n", b"ERROR: nope\nEND\n"]
+    )
+    assert client.skip() is False
+
+
+def test_sync_does_not_accept_done():
+    client, _sock = _client(b"Done.\nEND\n")
+    ok, _reply = client.command("vd_sync")
+    assert ok is False
 
 
 def test_error_reply_is_not_success():

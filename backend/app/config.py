@@ -70,6 +70,7 @@ class Settings:
     log_dir: Path
     min_free_bytes: int
     scheduler_enabled: bool = True
+    unit_state_ttl: float = 3.0
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -102,6 +103,7 @@ class Settings:
             log_dir=Path(_env("VD_LOG_DIR", "/var/log/vanilla-dream-radio") or ""),
             min_free_bytes=_env_int("VD_MIN_FREE_BYTES", 3 * 1024 * 1024 * 1024),
             scheduler_enabled=_env_bool("VD_SCHEDULER_ENABLED", True),
+            unit_state_ttl=_env_float("VD_UNIT_STATE_TTL", 3.0),
         )
 
     def ensure_directories(self) -> None:
