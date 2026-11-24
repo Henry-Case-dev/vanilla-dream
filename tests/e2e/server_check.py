@@ -178,38 +178,20 @@ def check_stream(url: str, seconds: float) -> None:
 
 
 def check_listeners(stats_url: str, stream_url: str) -> None:
-    import threading
+    """Open two real listeners with curl (bounded lifetime) and read Icecast stats."""
+    import subprocess
 
-    def listen() -> None:
-        # Read a bounded amount with a raw socket: the stream never ends, so a
-        # plain urllib read would block forever.
-        import ssl
-        import urllib.parse
-
-        parsed = urllib.parse.urlparse(stream_url)
-        host = parsed.hostname or "127.0.0.1"
-        port = parsed.port or (443 if parsed.scheme == "https" else 80)
-        path = parsed.path or "/"
-        try:
-            sock = socket.create_connection((host, port), timeout=8)
-            if parsed.scheme == "https":
-                sock = ssl.create_default_context().wrap_socket(sock, server_hostname=host)
-            sock.sendall(f"GET {path} HTTP/1.0\r\nHost: {host}\r\nIcy-MetaData: 1\r\n\r\n".encode())
-            received = 0
-            while received < 64000:
-                chunk = sock.recv(4096)
-                if not chunk:
-                    break
-                received += len(chunk)
-            sock.close()
-        except Exception:  # noqa: BLE001
-            pass
-
-    threads = [threading.Thread(target=listen, daemon=True) for _ in range(2)]
-    for t in threads:
-        t.start()
-    time.sleep(2.5)
+    procs = []
     try:
+        for _ in range(2):
+            procs.append(
+                subprocess.Popen(
+                    ["curl", "-s", "--max-time", "9", stream_url, "-o", "/dev/null"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            )
+        time.sleep(3.5)
         _, body, _ = http_get(stats_url)
         source = json.loads(body).get("icestats", {}).get("source")
         if isinstance(source, list):
@@ -219,8 +201,12 @@ def check_listeners(stats_url: str, stream_url: str) -> None:
     except Exception as exc:  # noqa: BLE001
         check("two concurrent listeners", False, repr(exc))
     finally:
-        for t in threads:
-            t.join(timeout=10)
+        for proc in procs:
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def check_adminbot() -> None:
