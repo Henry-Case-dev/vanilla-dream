@@ -175,12 +175,31 @@ def check_listeners(stats_url: str, stream_url: str) -> None:
     import threading
 
     def listen() -> None:
+        # Read a bounded amount with a raw socket: the stream never ends, so a
+        # plain urllib read would block forever.
+        import ssl
+        import urllib.parse
+
+        parsed = urllib.parse.urlparse(stream_url)
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        path = parsed.path or "/"
         try:
-            http_get(stream_url, timeout=6)
+            sock = socket.create_connection((host, port), timeout=8)
+            if parsed.scheme == "https":
+                sock = ssl.create_default_context().wrap_socket(sock, server_hostname=host)
+            sock.sendall(f"GET {path} HTTP/1.0\r\nHost: {host}\r\nIcy-MetaData: 1\r\n\r\n".encode())
+            received = 0
+            while received < 64000:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                received += len(chunk)
+            sock.close()
         except Exception:  # noqa: BLE001
             pass
 
-    threads = [threading.Thread(target=listen) for _ in range(2)]
+    threads = [threading.Thread(target=listen, daemon=True) for _ in range(2)]
     for t in threads:
         t.start()
     time.sleep(2.5)
@@ -195,7 +214,7 @@ def check_listeners(stats_url: str, stream_url: str) -> None:
         check("two concurrent listeners", False, repr(exc))
     finally:
         for t in threads:
-            t.join(timeout=8)
+            t.join(timeout=10)
 
 
 def check_adminbot() -> None:
