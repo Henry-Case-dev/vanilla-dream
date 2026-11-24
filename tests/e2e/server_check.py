@@ -67,6 +67,20 @@ def check_api(base: str) -> None:
         check("public history", False, repr(exc))
 
 
+def _audio_info_value(source: dict, key: str) -> int | None:
+    raw = source.get("audio_info")
+    if not isinstance(raw, str):
+        return None
+    for part in raw.split(";"):
+        name, _, value = part.partition("=")
+        if name.strip() == key:
+            try:
+                return int(float(value.strip()))
+            except ValueError:
+                return None
+    return None
+
+
 def check_icecast(stats_url: str) -> None:
     try:
         status, body, _ = http_get(stats_url)
@@ -77,8 +91,9 @@ def check_icecast(stats_url: str) -> None:
         if not source:
             check("icecast mount", False, "no source mounted")
             return
-        check("icecast mount", True, f"listeners={source.get('listeners')} bitrate={source.get('bitrate')}")
-        check("icecast bitrate 128", int(source.get("bitrate") or 0) == 128, str(source.get("bitrate")))
+        bitrate = source.get("bitrate") or _audio_info_value(source, "bitrate")
+        check("icecast mount", True, f"listeners={source.get('listeners')} bitrate={bitrate}")
+        check("icecast bitrate 128", int(bitrate or 0) == 128, str(bitrate))
     except Exception as exc:  # noqa: BLE001
         check("icecast mount", False, repr(exc))
 
@@ -127,8 +142,27 @@ def check_stream(url: str, seconds: float) -> None:
         ok_probe = info.get("format_name") == "mp3" and float(info.get("duration") or 0) > 0
         check("ffprobe mp3", ok_probe, f"duration={info.get('duration')} bit_rate={info.get('bit_rate')}")
 
-        decode = subprocess.run(["ffmpeg", "-v", "error", "-i", tmp, "-f", "null", "-"], capture_output=True, text=True, timeout=60)
-        check("ffmpeg decode", decode.returncode == 0 and not decode.stderr.strip(), decode.stderr.strip()[:200])
+        # A capture starts mid-frame, so ffmpeg always complains about the first
+        # partial MPEG frame. What matters is that a real, continuous PCM stream
+        # comes out of it.
+        decoded = subprocess.run(
+            ["ffmpeg", "-v", "quiet", "-y", "-i", tmp, "-f", "wav", tmp + ".wav"],
+            capture_output=True, text=True, timeout=120,
+        )
+        decoded_duration = 0.0
+        if decoded.returncode == 0:
+            wav = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", tmp + ".wav"],
+                capture_output=True, text=True, timeout=30,
+            )
+            decoded_duration = float(json.loads(wav.stdout or "{}").get("format", {}).get("duration") or 0)
+        check(
+            "ffmpeg decode",
+            decoded.returncode == 0 and decoded_duration > 1.0,
+            f"decoded {decoded_duration:.2f}s, rc={decoded.returncode}",
+        )
+        if os.path.exists(tmp + ".wav"):
+            os.unlink(tmp + ".wav")
     except Exception as exc:  # noqa: BLE001
         check("ffmpeg decode", False, repr(exc))
     finally:

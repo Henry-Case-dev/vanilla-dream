@@ -103,10 +103,22 @@ class IcecastClient:
             "available": True,
             "mount_present": True,
             "listeners": int(chosen.get("listeners") or 0),
-            "bitrate": _safe_int(chosen.get("bitrate") or chosen.get("ice-bitrate")),
+            "bitrate": _safe_int(chosen.get("bitrate") or chosen.get("ice-bitrate"))
+            or _audio_info_int(chosen.get("audio_info"), "bitrate"),
             "title": chosen.get("title") or chosen.get("server_name") or None,
             "error": None,
         }
+
+
+def _audio_info_int(value: Any, key: str) -> int | None:
+    """Icecast 2.4 reports the real encoder parameters inside `audio_info`."""
+    if not isinstance(value, str):
+        return None
+    for part in value.split(";"):
+        name, _, raw = part.partition("=")
+        if name.strip() == key:
+            return _safe_int(raw.strip())
+    return None
 
 
 def _safe_int(value: Any) -> int | None:
