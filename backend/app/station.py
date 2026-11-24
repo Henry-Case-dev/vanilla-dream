@@ -363,8 +363,24 @@ class StationController:
         result = []
         for unit, label, always in units:
             if always:
-                state = "active"
-            else:
-                state = self.unit_state_of(unit)
-            result.append({"unit": unit, "label": label, "state": state})
+                # The request itself proves the API process is serving; this is
+                # not a systemd check, so do not claim unit health.
+                result.append(
+                    {
+                        "unit": unit,
+                        "label": label,
+                        "state": "active",
+                        "detail": "процесс отвечает",
+                    }
+                )
+                continue
+            state = self.unit_state_of(unit)
+            result.append(
+                {
+                    "unit": unit,
+                    "label": label,
+                    "state": state,
+                    "detail": "systemctl is-active",
+                }
+            )
         return result

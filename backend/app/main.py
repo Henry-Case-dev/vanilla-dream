@@ -33,6 +33,7 @@ def _error(status: int, code: str, message: str, fields: dict | None = None) -> 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings: Settings = app.state.settings
+    app.state.shutdown_event.clear()
     settings.ensure_directories()
     db.init_db(settings)
 
@@ -104,6 +105,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        app.state.shutdown_event.set()
         scheduler.stop()
         if scheduler.task is not None:
             try:
@@ -137,6 +139,8 @@ def create_app(
     app.state.next_schedule_change = None
     app.state.login_attempts = {}
     app.state.now_playing_changed = asyncio.Event()
+    app.state.shutdown_event = asyncio.Event()
+    app.state.sync_state = {}
     app.state.scheduler = SchedulerLoop(
         app.state, settings, clock, station, engine, icecast
     )

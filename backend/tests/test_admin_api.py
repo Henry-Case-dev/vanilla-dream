@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app import api_internal, db
+from app import api_admin, api_internal, db
 from app.config import SUPPORTED_BITRATES
 from app.util import ApiError
 from tests.helpers import make_playlist, play_next, upload_and_get, write_mp3
@@ -62,11 +62,12 @@ def test_encoder_and_station_files_are_written(env, admin):
         },
     )
     assert response.status_code == 200, response.text
-    assert env.settings.encoder_file.read_text(encoding="utf-8") == "bitrate := 192\n"
+    assert env.settings.encoder_file.read_text(encoding="utf-8") == "encoder_bitrate = 192\n"
     station_text = env.settings.station_file.read_text(encoding="utf-8")
-    assert 'station_name := "Dream \\"FM\\""' in station_text
-    assert 'station_description := "Ночь \\\\ утро"' in station_text
-    assert 'station_genre := "Ambient"' in station_text
+    assert 'station_name = "Dream \\"FM\\""' in station_text
+    assert 'station_description = "Ночь \\\\ утро"' in station_text
+    assert 'station_genre = "Ambient"' in station_text
+    assert ":=" not in station_text
 
     # The restart only happens while the station is meant to be playing.
     assert not [call for call in env.runner.calls if call[-2] == "restart"]
@@ -78,7 +79,37 @@ def test_encoder_and_station_files_are_written(env, admin):
     assert body["engine_restarted"] is True
     assert "bitrate" in body["engine_fields_changed"]
     assert [call[-2] for call in env.runner.calls].count("restart") == 1
-    assert env.settings.encoder_file.read_text(encoding="utf-8") == "bitrate := 160\n"
+    assert env.settings.encoder_file.read_text(encoding="utf-8") == "encoder_bitrate = 160\n"
+
+
+def test_unchanged_settings_do_not_rewrite_or_restart(env, admin, monkeypatch):
+    _upload(env, "unchanged-cfg")
+    env.client.post("/api/admin/station/start")
+    changed = env.client.put("/api/admin/settings", json={"bitrate": 160})
+    assert changed.status_code == 200
+    assert changed.json()["engine_fields_changed"] == ["bitrate"]
+    restarts = [call for call in env.runner.calls if call[-2] == "restart"]
+    assert len(restarts) == 1
+
+    writes: list[str] = []
+    original = api_admin.atomic_write_text
+
+    def spy(path, text, *args, **kwargs):
+        writes.append(str(path))
+        return original(path, text, *args, **kwargs)
+
+    monkeypatch.setattr(api_admin, "atomic_write_text", spy)
+    same = env.client.put(
+        "/api/admin/settings",
+        json={"bitrate": 160, "station_name": "Vanilla Dream Radio"},
+    )
+    assert same.status_code == 200, same.text
+    body = same.json()
+    assert body["engine_fields_changed"] == []
+    assert body["engine_restarted"] is False
+    assert writes == []
+    assert len([call for call in env.runner.calls if call[-2] == "restart"]) == 1
+    assert env.settings.encoder_file.read_text(encoding="utf-8") == "encoder_bitrate = 160\n"
 
 
 def test_settings_desired_state_routes_to_station(env, admin):

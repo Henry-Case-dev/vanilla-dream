@@ -42,7 +42,11 @@ import {
   transitionLabel,
 } from '../lib/format';
 
-const BITRATES = [64, 96, 128, 160, 192, 256];
+/**
+ * Допустимые битрейты backend (`SUPPORTED_BITRATES` в `backend/app/config.py`).
+ * Список должен совпадать с сервером: иначе сохранение вернёт 422.
+ */
+const BITRATES = [96, 112, 128, 160, 192, 224, 256, 320];
 
 interface BroadcastForm {
   name: string;

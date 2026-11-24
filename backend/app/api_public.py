@@ -19,6 +19,7 @@ router = APIRouter(tags=["public"])
 
 SSE_INTERVAL = 5
 SSE_HEARTBEAT = 15
+SSE_TICK = 1.0
 COVER_CACHE = "public, max-age=300"
 
 
@@ -180,25 +181,48 @@ def history(
     return {"items": items}
 
 
-async def _event_source(request: Request):
+async def _event_source(request: Request, *, shutdown_event=None, snapshot=None):
+    """Yield SSE snapshots until shutdown or client disconnect.
+
+    The shutdown event is checked at least once per second so a uvicorn restart
+    is not blocked by an open player tab.
+    """
+
     app = request.app
     loop = asyncio.get_running_loop()
+    shutdown = shutdown_event
+    if shutdown is None:
+        shutdown = getattr(app.state, "shutdown_event", None)
+    if shutdown is None:
+        shutdown = asyncio.Event()
+    changed = getattr(app.state, "now_playing_changed", None) or asyncio.Event()
+    take_snapshot = snapshot or (lambda: _snapshot(app))
     heartbeat_at = loop.time()
-    while True:
-        if await request.is_disconnected():
-            break
-        payload = await asyncio.to_thread(_snapshot, app)
-        yield "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
-        changed = app.state.now_playing_changed
-        try:
-            await asyncio.wait_for(changed.wait(), timeout=SSE_INTERVAL)
-            changed.clear()
-        except (asyncio.TimeoutError, TimeoutError):
-            pass
-        current = loop.time()
-        if current - heartbeat_at >= SSE_HEARTBEAT:
-            heartbeat_at = current
-            yield ": heartbeat\n\n"
+    last_sent = 0.0
+    try:
+        while True:
+            if shutdown.is_set():
+                return
+            if await request.is_disconnected():
+                return
+            now = loop.time()
+            if last_sent == 0.0 or now - last_sent >= SSE_INTERVAL:
+                payload = await asyncio.to_thread(take_snapshot)
+                yield "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
+                last_sent = loop.time()
+                heartbeat_at = max(heartbeat_at, last_sent)
+            if changed.is_set():
+                changed.clear()
+            if loop.time() - heartbeat_at >= SSE_HEARTBEAT:
+                heartbeat_at = loop.time()
+                yield ": heartbeat\n\n"
+            try:
+                await asyncio.wait_for(changed.wait(), timeout=SSE_TICK)
+            except (asyncio.TimeoutError, TimeoutError):
+                pass
+    finally:
+        # No external resources to close here; shutdown cleanup must not raise.
+        pass
 
 
 def _snapshot(app) -> dict:

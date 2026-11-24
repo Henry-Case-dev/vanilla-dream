@@ -202,6 +202,10 @@ def test_services_and_links_and_storage(env, admin):
     labels = {item["label"]: item["state"] for item in services["services"]}
     assert labels["Backend"] == "active"
     assert labels["Liquidsoap"] == "inactive"
+    backend = next(
+        item for item in services["services"] if item["label"] == "Backend"
+    )
+    assert backend["detail"] == "процесс отвечает"
     assert "last_start" in services and "last_error" in services
 
     storage = env.client.get("/api/admin/storage").json()

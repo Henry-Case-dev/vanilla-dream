@@ -82,6 +82,20 @@ def test_set_password_rejects_empty_stdin(cli_env, monkeypatch, capsys):
     assert "Пароль не получен" in capsys.readouterr().err
 
 
+def test_password_is_set_reports_machine_token(cli_env, monkeypatch, capsys):
+    assert cli.main(["password-is-set"]) == 0
+    assert capsys.readouterr().out == "unset\n"
+    assert cli.main(["init-db"]) == 0
+    capsys.readouterr()
+    assert cli.main(["password-is-set"]) == 0
+    assert capsys.readouterr().out == "unset\n"
+    monkeypatch.setattr(sys, "stdin", io.StringIO("password-123\n"))
+    assert cli.main(["set-password"]) == 0
+    capsys.readouterr()
+    assert cli.main(["password-is-set"]) == 0
+    assert capsys.readouterr().out == "set\n"
+
+
 def test_backup_copies_database_and_prunes(cli_env, capsys):
     assert cli.main(["init-db"]) == 0
     conn = db.open_db(cli_env)

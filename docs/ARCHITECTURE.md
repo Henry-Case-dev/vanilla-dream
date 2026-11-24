@@ -24,9 +24,8 @@ decides *how* it is decoded and encoded. Every listener receives the same stream
 
 | Component | Responsibility |
 | --- | --- |
-| `backend/app/queue_engine.py` | source resolution (override → schedule → rotation → default playlist → all library), shuffle cycles, repeat modes, manual positions, generation of the next positions |
+| `backend/app/queue_engine.py` | source resolution (override → schedule → rotation → default playlist → all library), shuffle cycles, repeat modes, manual positions, generation of the next positions, playlist rotation (sequential / by-count / random) with persisted counters, engine queue file and per-position symlinks |
 | `backend/app/scheduler.py` | weekly rules in the station timezone, overnight windows, priorities, overrides with expiry |
-| `backend/app/rotation.py` | sequential / by-count / random playlist rotation with persisted counters |
 | `backend/app/station.py` | desired state vs unit state vs stream availability, allow-listed systemctl calls |
 | `backend/app/media.py` | streaming upload, SHA-256 dedupe, Mutagen tags, cover extraction, safe delete |
 | `backend/app/liquidsoap.py` | engine queue file + `vd_sync` command, skip, honest error reporting |
@@ -51,16 +50,21 @@ A rule can never start a station the owner stopped.
 
 ## Queue positions
 
-Each generated position is a row in `queue_positions` with a stable UUID that is
-written into the Liquidsoap request as `annotate:vd_id="<uuid>"`. When the engine
-starts that request it reports the UUID back, so "current track" is an observed
-fact, not an estimate. Positions the engine has already received (`prepared`)
-cannot be reordered in the UI; only `pending` positions can.
+Each generated position is a row in `queue_positions` with a stable UUID. Before a
+position is prepared for the engine the backend creates a symlink
+`/run/vanilla-dream-radio/queue/<uuid>.mp3` to the real audio file and writes that
+path into `engine-queue.txt`; Liquidsoap plays the symlink and reports the exact
+`filename` back through `on_track`. "Current track" is therefore an observed fact,
+not an estimate, and it survives renames inside the music directory. (The
+`annotate:` request protocol cannot be used: Liquidsoap 2.2.4 rejects it for a
+non-root user.) Positions the engine has already received (`prepared`) cannot be
+reordered in the UI; only `pending` positions can.
 
 ## Failure behaviour
 
-- Backend down: Liquidsoap keeps playing the prepared requests; the queue is
-  reconciled from the engine state on the next start.
+- Backend down: Liquidsoap keeps playing the prepared requests. On the next start
+  the backend resets prepared positions to `pending`, re-reads the playback state
+  and history, and warns when the stored track disagrees with the Icecast title.
 - Engine down: the mount disappears, the API still works and reports
   `reconnecting`/`error`; the owner can restart from the panel.
 - Empty library or queue: the mount stays alive with technical silence and the

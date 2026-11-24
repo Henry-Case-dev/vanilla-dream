@@ -56,6 +56,26 @@ def cmd_set_password(_args) -> int:
     return 0
 
 
+def cmd_password_is_set(_args) -> int:
+    settings = _settings()
+    if not settings.db_path.exists():
+        print("unset")
+        return 0
+    try:
+        conn = db.open_db(settings)
+    except sqlite3.Error:
+        print("unset")
+        return 0
+    try:
+        row = conn.execute("SELECT password_hash FROM admin WHERE id = 1").fetchone()
+    except sqlite3.Error:
+        row = None
+    finally:
+        conn.close()
+    print("set" if row is not None and row["password_hash"] else "unset")
+    return 0
+
+
 def _prune_backups(directory: Path, keep: int = BACKUP_KEEP) -> list[Path]:
     candidates = sorted(
         (entry for entry in directory.glob(f"{BACKUP_PREFIX}*.db") if entry.is_file()),
@@ -195,6 +215,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     check_parser = subparsers.add_parser("check-config", help="проверить окружение и файлы")
     check_parser.set_defaults(handler=cmd_check_config)
+
+    password_state_parser = subparsers.add_parser(
+        "password-is-set", help="напечатать set или unset для пароля администратора"
+    )
+    password_state_parser.set_defaults(handler=cmd_password_is_set)
     return parser
 
 

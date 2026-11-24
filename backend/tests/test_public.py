@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import timedelta
+from types import SimpleNamespace
+
+from fastapi.testclient import TestClient
 
 from app import db
+from app.api_public import _event_source
+from app.main import create_app
 from tests.helpers import make_playlist, play_next, upload_and_get, write_mp3
 
 
@@ -193,6 +199,95 @@ def test_sse_first_event(env, admin):
                 break
         else:  # pragma: no cover
             raise AssertionError("SSE stream produced no data event")
+
+
+class _FakeSseRequest:
+    def __init__(self, app, disconnected: bool = False):
+        self.app = app
+        self._disconnected = disconnected
+
+    async def is_disconnected(self) -> bool:
+        return self._disconnected
+
+
+def _sse_app():
+    state = SimpleNamespace(
+        now_playing_changed=asyncio.Event(), shutdown_event=asyncio.Event()
+    )
+    return SimpleNamespace(state=state)
+
+
+async def _collect_sse(app, request, *, shutdown_event=None, snapshot=None):
+    chunks = []
+    async for chunk in _event_source(
+        request, shutdown_event=shutdown_event, snapshot=snapshot
+    ):
+        chunks.append(chunk)
+    return chunks
+
+
+def test_sse_stops_when_shutdown_event_is_set():
+    app = _sse_app()
+    app.state.shutdown_event.set()
+    request = _FakeSseRequest(app)
+    chunks = asyncio.run(
+        _collect_sse(
+            app,
+            request,
+            shutdown_event=app.state.shutdown_event,
+            snapshot=lambda: {"station": {"status": "off"}},
+        )
+    )
+    assert chunks == []
+
+
+def test_sse_stops_on_disconnect():
+    app = _sse_app()
+    request = _FakeSseRequest(app, disconnected=True)
+    chunks = asyncio.run(
+        _collect_sse(
+            app,
+            request,
+            shutdown_event=app.state.shutdown_event,
+            snapshot=lambda: {"station": {"status": "off"}},
+        )
+    )
+    assert chunks == []
+
+
+def test_sse_returns_after_shutdown_during_stream():
+    app = _sse_app()
+
+    def snapshot():
+        app.state.shutdown_event.set()
+        return {"station": {"status": "off"}}
+
+    request = _FakeSseRequest(app)
+    chunks = asyncio.run(
+        _collect_sse(
+            app,
+            request,
+            shutdown_event=app.state.shutdown_event,
+            snapshot=snapshot,
+        )
+    )
+    assert len(chunks) == 1
+    assert chunks[0].startswith("data: ")
+    assert json.loads(chunks[0][len("data: ") :])["station"]["status"] == "off"
+
+
+def test_lifespan_sets_shutdown_event(env):
+    app = create_app(
+        settings=env.settings,
+        clock=env.clock,
+        station=env.station,
+        engine=env.engine,
+        icecast=env.icecast,
+    )
+    assert not app.state.shutdown_event.is_set()
+    with TestClient(app):
+        assert not app.state.shutdown_event.is_set()
+    assert app.state.shutdown_event.is_set()
 
 
 def test_public_cover_404_for_missing(env):

@@ -229,6 +229,7 @@ class SchedulerLoop:
         self.icecast = icecast
         self._wake = asyncio.Event()
         self._stop = asyncio.Event()
+        self._sync_state: dict = getattr(app_state, "sync_state", {})
         self.task = None
 
     def wake(self) -> None:
@@ -284,7 +285,13 @@ class SchedulerLoop:
             if desired == "playing":
                 queue_engine.ensure_queue(conn, self.settings, now)
                 if self.engine is not None:
-                    queue_engine.sync_engine(conn, self.settings, self.engine)
+                    queue_engine.sync_engine(
+                        conn,
+                        self.settings,
+                        self.engine,
+                        now=now,
+                        sync_state=self._sync_state,
+                    )
                 if self.station.auto_start_if_needed(conn, now, status):
                     status = self.station.status(conn, now, stats)
             else:

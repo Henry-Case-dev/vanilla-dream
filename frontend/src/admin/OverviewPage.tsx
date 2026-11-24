@@ -141,10 +141,10 @@ function HistoryList({ entries, timeZone }: { entries: HistoryEntry[]; timeZone?
   return (
     <ul className="history-list">
       <li className="history-row history-row--head" aria-hidden="true">
-        <span>Время</span>
-        <span>Трек</span>
-        <span>Исполнитель</span>
-        <span>Источник</span>
+        <span className="history-row__time">Время</span>
+        <span className="history-row__title">Трек</span>
+        <span className="history-row__artist">Исполнитель</span>
+        <span className="history-row__source">Источник</span>
       </li>
       {entries.map((entry, index) => (
         <li key={`${entry.trackId ?? entry.title}-${entry.startedAt ?? index}`} className="history-row">

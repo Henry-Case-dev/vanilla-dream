@@ -447,6 +447,19 @@ def test_stale_links_are_removed_after_track_start(env, admin):
     assert not first_link.exists()
 
 
+def test_scheduler_sync_is_gated_by_window_and_five_seconds(env, admin):
+    tracks = [_upload(env, f"gate{i}", f"Gate {i}") for i in range(5)]
+    playlist = make_playlist(env.client, "Gate", [track["id"] for track in tracks])
+    _use_playlist(env, playlist["id"], start=True)
+    env.app.state.scheduler.tick()
+    calls = env.engine.sync_calls
+    env.app.state.scheduler.tick()
+    assert env.engine.sync_calls == calls  # unchanged prepared window within 5s
+    env.clock.advance(5.1)
+    env.app.state.scheduler.tick()
+    assert env.engine.sync_calls == calls + 1  # safety sync after 5s
+
+
 def test_skip_endpoint_uses_engine(env, admin):
     _upload(env, "skip", "Skip")
     env.client.post("/api/admin/station/start")

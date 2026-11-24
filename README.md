@@ -72,6 +72,16 @@ restarts the engine.
 | `/etc/vanilla-dream-radio` | configuration and secrets |
 | `/var/backups/vanilla-dream-radio` | daily compact database backups |
 
+## Screenshots
+
+| Public player | Admin overview |
+| --- | --- |
+| ![Public player](docs/screenshots/public-player.jpg) | ![Admin overview](docs/screenshots/overview.jpg) |
+
+| Library | Schedule |
+| --- | --- |
+| ![Library](docs/screenshots/library.jpg) | ![Schedule](docs/screenshots/schedule.jpg) |
+
 ## Tests
 
 ```bash

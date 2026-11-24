@@ -47,22 +47,37 @@ def _sync(request: Request, conn) -> bool:
     if request.app.state.station.desired(conn) != "playing":
         return False
     return queue_engine.sync_engine(
-        conn, request.app.state.settings, request.app.state.engine
+        conn,
+        request.app.state.settings,
+        request.app.state.engine,
+        now=request.app.state.clock.now(),
+        sync_state=getattr(request.app.state, "sync_state", None),
     )
 
 
 ENGINE_SETTING_KEYS = ("station_name", "station_description", "station_genre", "bitrate")
 
 
-def _write_engine_files(settings: Settings, values: dict) -> None:
-    if "bitrate" in values:
-        atomic_write_text(settings.encoder_file, f"bitrate := {int(values['bitrate'])}\n")
-    text = (
-        f'station_name := "{escape_liq_string(values.get("station_name", ""))}"\n'
-        f'station_description := "{escape_liq_string(values.get("station_description", ""))}"\n'
-        f'station_genre := "{escape_liq_string(values.get("station_genre", ""))}"\n'
-    )
-    atomic_write_text(settings.station_file, text)
+def _write_engine_files(settings: Settings, values: dict, changed: dict) -> None:
+    """Rewrite Liquidsoap include files that actually changed.
+
+    The engine script includes these files and expects plain bindings
+    (`encoder_bitrate = 128`, `station_name = "..."`); the `:=` operator is
+    rejected by liquidsoap 2.2.4.
+    """
+
+    if "bitrate" in changed:
+        atomic_write_text(
+            settings.encoder_file, f"encoder_bitrate = {int(values['bitrate'])}\n"
+        )
+    station_keys = {"station_name", "station_description", "station_genre"}
+    if station_keys & set(changed):
+        text = (
+            f'station_name = "{escape_liq_string(values.get("station_name", ""))}"\n'
+            f'station_description = "{escape_liq_string(values.get("station_description", ""))}"\n'
+            f'station_genre = "{escape_liq_string(values.get("station_genre", ""))}"\n'
+        )
+        atomic_write_text(settings.station_file, text)
 
 
 # ---------------------------------------------------------------------------
@@ -1201,7 +1216,7 @@ def put_settings(
     engine_restarted = False
     if changed_engine_fields:
         try:
-            _write_engine_files(settings, engine_values)
+            _write_engine_files(settings, engine_values, changed_engine_fields)
         except OSError:
             raise ApiError(
                 500,

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import io
-import struct
 from pathlib import Path
 
 from mutagen.id3 import APIC, ID3, TALB, TCON, TDRC, TIT2, TPE1
@@ -90,9 +89,10 @@ def play_next(env) -> dict | None:
         return None
     position = queue["items"][0]
     timestamp = env.clock.now().timestamp()
+    link_path = Path(env.settings.queue_link_dir) / f"{position['id']}.mp3"
     response = env.client.post(
         "/api/internal/engine/track-start",
-        data={"vd": position["id"], "ts": f"{timestamp:.3f}"},
+        data={"f": str(link_path), "ts": f"{timestamp:.3f}"},
         headers={"X-Internal-Token": env.internal_token},
     )
     assert response.status_code == 200, response.text

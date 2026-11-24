@@ -26,6 +26,7 @@ from .util import ApiError, parse_iso, to_iso
 LOGGER = logging.getLogger("vdradio.queue")
 
 ENGINE_PREFETCH = 2
+ENGINE_SYNC_MIN_INTERVAL = 5.0
 ROTATION_ID = "default"
 LIVE_STATES = ("pending", "prepared")
 
@@ -966,6 +967,13 @@ def build_engine_lines(conn: sqlite3.Connection, settings: Settings) -> list[str
     return lines
 
 
+def prepared_signature(conn: sqlite3.Connection) -> tuple[tuple[str, str], ...]:
+    return tuple(
+        (str(row["id"]), str(row["track_id"]))
+        for row in future_positions(conn)[:ENGINE_PREFETCH]
+    )
+
+
 def _cleanup_stale_links(settings: Settings, keep_ids: list[str]) -> None:
     link_dir = Path(settings.queue_link_dir)
     if not link_dir.exists():
@@ -1011,10 +1019,32 @@ def _drop_unplayable_positions(conn: sqlite3.Connection, settings: Settings) -> 
     return removed
 
 
-def sync_engine(conn: sqlite3.Connection, settings: Settings, engine) -> bool:
+@_locked
+def sync_engine(
+    conn: sqlite3.Connection,
+    settings: Settings,
+    engine,
+    *,
+    now: datetime | None = None,
+    force: bool = False,
+    sync_state: dict | None = None,
+) -> bool:
     """Refresh runtime symlinks, write the engine queue file and call ``vd_sync``."""
 
-    _drop_unplayable_positions(conn, settings)
+    from .util import utcnow
+
+    now = now or utcnow()
+    removed = _drop_unplayable_positions(conn, settings)
+    signature = prepared_signature(conn)
+    if sync_state is not None and not force and not removed:
+        last_signature = sync_state.get("signature")
+        last_at = sync_state.get("at")
+        if (
+            signature == last_signature
+            and isinstance(last_at, datetime)
+            and 0 <= (now - last_at).total_seconds() < ENGINE_SYNC_MIN_INTERVAL
+        ):
+            return True
     lines = build_engine_lines(conn, settings)
     content = "\n".join(lines)
     if content:
@@ -1035,6 +1065,9 @@ def sync_engine(conn: sqlite3.Connection, settings: Settings, engine) -> bool:
         return False
     ok = bool(engine and engine.sync())
     if ok:
+        if sync_state is not None:
+            sync_state["signature"] = signature
+            sync_state["at"] = now
         ids = [Path(line).stem for line in lines]
         if ids:
             placeholders = ",".join("?" for _ in ids)
