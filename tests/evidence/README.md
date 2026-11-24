@@ -34,7 +34,7 @@ after the checks.
 
 | Check | Result |
 | --- | --- |
-| `pytest -q` | 129 passed |
+| `pytest -q` | 140 passed |
 | `tsc --noEmit` / `npm run build` | clean, bundle built |
 | `server_check.py` | stream decodes to >1 s of PCM, ICY `br=128`, two concurrent listeners, Adminbot healthy |
 | `api_flow.py` | 26/26 checks passed against production |

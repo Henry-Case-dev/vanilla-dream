@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+import os
+import signal
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -30,10 +32,48 @@ def _error(status: int, code: str, message: str, fields: dict | None = None) -> 
     return JSONResponse({"detail": detail}, status_code=status)
 
 
+def _install_shutdown_signal(shutdown_event: asyncio.Event) -> None:
+    """Close long-lived SSE streams as soon as the service is asked to stop.
+
+    Uvicorn sets its own SIGTERM/SIGINT handlers and only finishes the lifespan
+    after it waited for connections; an open player tab would otherwise keep the
+    process until the graceful-shutdown timeout. Chaining the previous handler
+    means the shutdown event is set first, the SSE generators return, and the
+    normal uvicorn shutdown proceeds immediately.
+    """
+
+    if os.name != "posix":
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            previous = signal.getsignal(sig)
+        except (ValueError, OSError):
+            continue
+
+        def handler(signum, frame, _previous=previous):
+            try:
+                loop.call_soon_threadsafe(shutdown_event.set)
+            except RuntimeError:
+                pass
+            if callable(_previous):
+                _previous(signum, frame)
+
+        try:
+            signal.signal(sig, handler)
+        except (ValueError, OSError):
+            continue
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings: Settings = app.state.settings
     app.state.shutdown_event.clear()
+    _install_shutdown_signal(app.state.shutdown_event)
     settings.ensure_directories()
     db.init_db(settings)
 

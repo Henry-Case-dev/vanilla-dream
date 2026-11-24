@@ -184,8 +184,9 @@ def history(
 async def _event_source(request: Request, *, shutdown_event=None, snapshot=None):
     """Yield SSE snapshots until shutdown or client disconnect.
 
-    The shutdown event is checked at least once per second so a uvicorn restart
-    is not blocked by an open player tab.
+    The shutdown event is set from the SIGTERM/SIGINT handler installed in the
+    lifespan, so an open player tab stops the stream immediately instead of
+    waiting for the uvicorn graceful-shutdown timeout.
     """
 
     app = request.app

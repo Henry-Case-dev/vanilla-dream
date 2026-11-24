@@ -46,6 +46,19 @@ log "Validating Liquidsoap configuration"
 install -o root -g root -m 0644 "$REL/radio/liquidsoap.liq" "$ETC_DIR/liquidsoap.liq"
 sudo -u "$RADIO_USER" /usr/bin/liquidsoap --check "$ETC_DIR/liquidsoap.liq" || die "invalid liquidsoap configuration"
 
+log "Syncing systemd units and related files"
+install -o root -g root -m 0644 "$REL/deploy/systemd/vanilla-dream-radio.slice" /etc/systemd/system/vanilla-dream-radio.slice
+for unit in api liquidsoap icecast backup; do
+  install -o root -g root -m 0644 "$REL/deploy/systemd/vanilla-dream-radio-$unit.service" "/etc/systemd/system/vanilla-dream-radio-$unit.service"
+done
+install -o root -g root -m 0644 "$REL/deploy/systemd/vanilla-dream-radio-backup.timer" /etc/systemd/system/vanilla-dream-radio-backup.timer
+install -o root -g root -m 0440 "$REL/deploy/sudoers/vanilla-dream-radio" /etc/sudoers.d/vanilla-dream-radio
+visudo -cf /etc/sudoers.d/vanilla-dream-radio >/dev/null
+install -o root -g root -m 0644 "$REL/deploy/logrotate/vanilla-dream-radio" /etc/logrotate.d/vanilla-dream-radio
+install -o root -g root -m 0644 "$REL/deploy/tmpfiles/vanilla-dream-radio.conf" /etc/tmpfiles.d/vanilla-dream-radio.conf
+systemd-tmpfiles --create /etc/tmpfiles.d/vanilla-dream-radio.conf
+systemctl daemon-reload
+
 log "Installing Python dependencies"
 "$APP_DIR/venv/bin/pip" install --quiet -r "$REL/backend/requirements.txt"
 
