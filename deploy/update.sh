@@ -52,8 +52,12 @@ for unit in api liquidsoap icecast backup; do
   install -o root -g root -m 0644 "$REL/deploy/systemd/vanilla-dream-radio-$unit.service" "/etc/systemd/system/vanilla-dream-radio-$unit.service"
 done
 install -o root -g root -m 0644 "$REL/deploy/systemd/vanilla-dream-radio-backup.timer" /etc/systemd/system/vanilla-dream-radio-backup.timer
-install -o root -g root -m 0440 "$REL/deploy/sudoers/vanilla-dream-radio" /etc/sudoers.d/vanilla-dream-radio
-visudo -cf /etc/sudoers.d/vanilla-dream-radio >/dev/null
+# Validate the new sudoers content before it can replace a working file.
+sudoers_tmp="$(mktemp)"
+install -o root -g root -m 0440 "$REL/deploy/sudoers/vanilla-dream-radio" "$sudoers_tmp"
+visudo -cf "$sudoers_tmp" >/dev/null || { rm -f "$sudoers_tmp"; die "invalid sudoers file in release"; }
+install -o root -g root -m 0440 "$sudoers_tmp" /etc/sudoers.d/vanilla-dream-radio
+rm -f "$sudoers_tmp"
 install -o root -g root -m 0644 "$REL/deploy/logrotate/vanilla-dream-radio" /etc/logrotate.d/vanilla-dream-radio
 install -o root -g root -m 0644 "$REL/deploy/tmpfiles/vanilla-dream-radio.conf" /etc/tmpfiles.d/vanilla-dream-radio.conf
 systemd-tmpfiles --create /etc/tmpfiles.d/vanilla-dream-radio.conf

@@ -69,3 +69,11 @@ when free space is below 3 GiB or above `max_library_gb`. Check with
 - Never publish ports 8100/8101 or the UNIX socket.
 - The only sudo rights of `vdradio` are start/stop/restart/is-active of
   `vanilla-dream-radio-liquidsoap.service`.
+- `/etc/vanilla-dream-radio` is `0770 root:vdradio`: the backend must be able to
+  replace `encoder.liq`/`station.liq` atomically, which requires a writable
+  directory. The service user can therefore also replace the other files in that
+  directory, but it already reads all of them and no process gains privileges
+  from it (all radio processes run as `vdradio`, sudo is limited to the engine
+  unit). `deploy/update.sh` re-installs the supervisor-owned units, sudoers,
+  logrotate and Caddy site from the release on every deploy, so a stale or
+  tampered copy is corrected on the next update.
