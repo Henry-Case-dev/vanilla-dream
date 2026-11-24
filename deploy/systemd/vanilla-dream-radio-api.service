@@ -1,0 +1,28 @@
+[Unit]
+Description=Vanilla Dream Radio API (FastAPI/Uvicorn)
+Documentation=file:/opt/vanilla-dream-radio/current/docs/RUNBOOK.md
+After=network-online.target vanilla-dream-radio-icecast.service
+Wants=network-online.target vanilla-dream-radio-icecast.service
+
+[Service]
+Type=simple
+User=vdradio
+Group=vdradio
+WorkingDirectory=/opt/vanilla-dream-radio/current/backend
+EnvironmentFile=/etc/vanilla-dream-radio/env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/vanilla-dream-radio/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8100 --workers 1 --proxy-headers --forwarded-allow-ips 127.0.0.1
+Restart=on-failure
+RestartSec=5
+Slice=vanilla-dream-radio.slice
+
+# sudo is used for the exact allow-listed systemctl calls, so no
+# NoNewPrivileges here; everything else is sandboxed.
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/vanilla-dream-radio /var/log/vanilla-dream-radio /srv/vanilla-dream-radio /run/vanilla-dream-radio /etc/vanilla-dream-radio /opt/vanilla-dream-radio
+
+[Install]
+WantedBy=multi-user.target

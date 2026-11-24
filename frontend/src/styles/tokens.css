@@ -1,0 +1,43 @@
+/* Дизайн-токены станции — значения из ТЗ владельца §21. */
+:root {
+  --bg-base: #101016;
+  --bg-sidebar: #17171f;
+  --bg-surface: #1c1b25;
+  --bg-elevated: #24222f;
+  --border: #302d3a;
+  --text-primary: #f2eff7;
+  --text-secondary: #aaa4b5;
+  --text-muted: #878191;
+  --accent: #bca1f4;
+  --accent-hover: #d0b9ff;
+  --accent-selected: #30253f;
+  --success: #72cba0;
+  --danger: #e58b9e;
+  --warning: #e0be83;
+
+  --on-accent: #191323;
+  --border-soft: rgba(48, 45, 58, 0.62);
+  --surface-2: #14131b;
+  --accent-soft: rgba(188, 161, 244, 0.12);
+  --accent-line: rgba(188, 161, 244, 0.32);
+  --success-soft: rgba(114, 203, 160, 0.12);
+  --danger-soft: rgba(229, 139, 158, 0.12);
+  --warning-soft: rgba(224, 190, 131, 0.12);
+
+  --radius-sm: 8px;
+  --radius-md: 10px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+
+  --sidebar-w: 232px;
+  --player-h: 84px;
+  --main-pad: 24px;
+
+  --font-sans: 'Inter Variable', 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue',
+    Arial, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Cascadia Code', 'SFMono-Regular', Consolas, monospace;
+
+  --shadow-pop: 0 22px 48px rgba(5, 4, 10, 0.5);
+  --shadow-cover: 0 24px 60px rgba(5, 4, 10, 0.48);
+  --focus-ring: 0 0 0 3px rgba(188, 161, 244, 0.22);
+}

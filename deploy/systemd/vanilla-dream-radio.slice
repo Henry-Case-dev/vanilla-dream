@@ -1,0 +1,13 @@
+[Unit]
+Description=Vanilla Dream Radio resource slice
+Documentation=file:/opt/vanilla-dream-radio/current/docs/RUNBOOK.md
+
+[Slice]
+# Isolation from the rest of the host (Adminbot keeps the default priority).
+# The station normally needs ~150-250 MB; the limits leave headroom for
+# uploads, cover extraction and engine start without interrupting the stream.
+MemoryHigh=768M
+MemoryMax=1024M
+CPUWeight=50
+IOWeight=50
+TasksMax=256

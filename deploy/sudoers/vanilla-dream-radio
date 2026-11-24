@@ -1,0 +1,5 @@
+# Vanilla Dream Radio: exactly the engine operations the API needs, nothing else.
+vdradio ALL=(root) NOPASSWD: /usr/bin/systemctl start vanilla-dream-radio-liquidsoap.service
+vdradio ALL=(root) NOPASSWD: /usr/bin/systemctl stop vanilla-dream-radio-liquidsoap.service
+vdradio ALL=(root) NOPASSWD: /usr/bin/systemctl restart vanilla-dream-radio-liquidsoap.service
+vdradio ALL=(root) NOPASSWD: /usr/bin/systemctl is-active vanilla-dream-radio-liquidsoap.service

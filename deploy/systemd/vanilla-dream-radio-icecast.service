@@ -1,0 +1,21 @@
+[Unit]
+Description=Vanilla Dream Radio Icecast streaming server
+Documentation=file:/opt/vanilla-dream-radio/current/docs/RUNBOOK.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vdradio
+Group=vdradio
+ExecStart=/usr/bin/icecast2 -c /etc/vanilla-dream-radio/icecast.xml
+Restart=on-failure
+RestartSec=5
+Slice=vanilla-dream-radio.slice
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/vanilla-dream-radio /var/log/vanilla-dream-radio /run/vanilla-dream-radio
+
+[Install]
+WantedBy=multi-user.target

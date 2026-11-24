@@ -1,0 +1,12 @@
+[Unit]
+Description=Vanilla Dream Radio compact backup (database and configuration)
+
+[Service]
+Type=oneshot
+User=vdradio
+Group=vdradio
+WorkingDirectory=/opt/vanilla-dream-radio/current/backend
+EnvironmentFile=/etc/vanilla-dream-radio/env
+ExecStart=/opt/vanilla-dream-radio/venv/bin/python -m app.cli backup --dest /var/backups/vanilla-dream-radio
+Nice=10
+IOSchedulingClass=idle

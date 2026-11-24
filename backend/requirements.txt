@@ -1,0 +1,6 @@
+fastapi==0.165.0
+uvicorn==0.54.0
+mutagen==1.48.1
+Pillow==13.0.0
+python-multipart==0.0.34
+tzdata==2026.6

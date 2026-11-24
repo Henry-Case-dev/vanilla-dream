@@ -1,0 +1,72 @@
+# Vanilla Dream Radio — Caddy site configuration.
+# Installed as /etc/caddy/sites/vanilla-dream.caddy and imported from /etc/caddy/Caddyfile.
+# Adminbot keeps its own virtual host untouched.
+
+vanilladream.duckdns.org {
+	encode zstd gzip
+
+	# Direct MP3 stream: no buffering, long-lived connections, no caching.
+	handle /radio.mp3* {
+		reverse_proxy 127.0.0.1:8101 {
+			flush_interval -1
+			header_up Host {host}
+			transport http {
+				read_timeout 0
+				write_timeout 0
+			}
+		}
+	}
+
+	handle /radio.m3u {
+		reverse_proxy 127.0.0.1:8100
+	}
+
+	handle /radio.pls {
+		reverse_proxy 127.0.0.1:8100
+	}
+
+	# Public metadata and API (admin routes are authenticated by the backend).
+	handle /api/* {
+		reverse_proxy 127.0.0.1:8100
+	}
+
+	# Static frontend build (public player and admin panel SPA).
+	handle {
+		root * /opt/vanilla-dream-radio/frontend-dist
+		try_files {path} /index.html
+		file_server
+	}
+
+	header {
+		Referrer-Policy strict-origin-when-cross-origin
+		X-Content-Type-Options nosniff
+		-X-Powered-By
+	}
+}
+
+# Plain HTTP: only the direct MP3 route for players that require HTTP without TLS
+# (Minecraft World Radio). Everything else redirects to HTTPS; the admin panel is
+# never served over plain HTTP.
+http://vanilladream.duckdns.org {
+	handle /radio.mp3* {
+		reverse_proxy 127.0.0.1:8101 {
+			flush_interval -1
+		}
+	}
+
+	handle /radio.m3u {
+		reverse_proxy 127.0.0.1:8100
+	}
+
+	handle /radio.pls {
+		reverse_proxy 127.0.0.1:8100
+	}
+
+	handle /api/public/* {
+		reverse_proxy 127.0.0.1:8100
+	}
+
+	handle {
+		redir https://{host}{uri} permanent
+	}
+}

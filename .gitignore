@@ -1,0 +1,70 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+*.pfx
+*.p12
+secrets/
+deploy/.env
+deploy/*.local
+
+# Orchestrator / private planning (never public)
+plans/
+.opencode/
+.openviking/
+AGENTS.local.md
+runtime_task.md
+
+# Databases and user data
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+data/
+music/
+covers/
+uploads/
+backups/
+
+# Audio and media
+*.mp3
+*.flac
+*.ogg
+*.m4a
+*.wav
+!tests/fixtures/*.mp3
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+
+# Node
+node_modules/
+frontend/dist/
+dist/
+.vite/
+*.tsbuildinfo
+
+# Logs and temp
+*.log
+logs/
+tmp/
+.tmp/
+*.tmp
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

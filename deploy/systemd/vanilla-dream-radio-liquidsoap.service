@@ -1,0 +1,27 @@
+[Unit]
+Description=Vanilla Dream Radio Liquidsoap engine
+Documentation=file:/opt/vanilla-dream-radio/current/docs/RUNBOOK.md
+After=network-online.target vanilla-dream-radio-icecast.service
+Requires=vanilla-dream-radio-icecast.service
+
+[Service]
+Type=simple
+User=vdradio
+Group=vdradio
+ExecStartPre=/usr/bin/liquidsoap --check /etc/vanilla-dream-radio/liquidsoap.liq
+ExecStart=/usr/bin/liquidsoap /etc/vanilla-dream-radio/liquidsoap.liq
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=120
+StartLimitBurst=5
+TimeoutStopSec=15
+Slice=vanilla-dream-radio.slice
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/vanilla-dream-radio /var/log/vanilla-dream-radio /srv/vanilla-dream-radio /run/vanilla-dream-radio /etc/vanilla-dream-radio /opt/vanilla-dream-radio
+
+# Deliberately not enabled: the backend starts the engine only when the owner
+# wants the station on air. A stopped station stays stopped after reboot.
+[Install]
+WantedBy=multi-user.target
