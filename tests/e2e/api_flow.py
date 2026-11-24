@@ -154,12 +154,19 @@ def main() -> int:
         status, data = c.upload(path)
         track = data if isinstance(data, dict) else {}
         track_id = track.get("id") or (track.get("track") or {}).get("id")
-        check(f"upload {os.path.basename(path)}", status in (200, 201) and bool(track_id), status)
+        detail = track.get("detail") or {}
+        existing = detail.get("existing_track_id") if isinstance(detail, dict) else None
+        ok = status in (200, 201) and bool(track_id)
+        if status == 409 and existing:
+            track_id = existing
+            ok = True
+        check(f"upload {os.path.basename(path)}", ok, status)
         if track_id:
             upload_ids.append(track_id)
 
     status, dup = c.upload(files[0])
-    check("duplicate upload rejected", status == 409, status)
+    dup_detail = (dup or {}).get("detail") or {}
+    check("duplicate upload rejected", status == 409 and bool(dup_detail.get("existing_track_id")), status)
 
     status, library = c.json("GET", "/api/admin/tracks?limit=100")
     lib_items = items_of(library)
