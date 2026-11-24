@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import socket
 import subprocess
@@ -166,8 +167,6 @@ def check_stream(url: str, seconds: float) -> None:
     except Exception as exc:  # noqa: BLE001
         check("ffmpeg decode", False, repr(exc))
     finally:
-        import os
-
         os.unlink(tmp)
 
 
