@@ -19,6 +19,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [state, setState] = useState<AuthState>('loading');
   const [bootError, setBootError] = useState<string | null>(null);
   const mounted = useRef(true);
+  const authEpoch = useRef(0);
 
   useEffect(() => {
     mounted.current = true;
@@ -29,6 +30,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     onUnauthorized(() => {
+      authEpoch.current += 1;
       setCsrfToken(null);
       setState('guest');
     });
@@ -36,9 +38,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const refresh = useCallback(async () => {
+    const epoch = authEpoch.current;
     try {
       const result = await api.auth.me();
-      if (!mounted.current) return;
+      if (!mounted.current || epoch !== authEpoch.current) return;
       if (result.authenticated) {
         setCsrfToken(result.csrfToken);
         setState('authenticated');
@@ -49,7 +52,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         setBootError(null);
       }
     } catch (caught) {
-      if (!mounted.current) return;
+      if (!mounted.current || epoch !== authEpoch.current) return;
       setCsrfToken(null);
       setState('guest');
       setBootError(errorMessage(caught));
@@ -62,6 +65,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const login = useCallback(async (password: string) => {
     const result = await api.auth.login(password);
+    // Инвалидирует уже запущенный /api/auth/me, чтобы запоздавший ответ
+    // «guest» не перетёр только что установленную сессию.
+    authEpoch.current += 1;
     setCsrfToken(result.csrfToken);
     setState('authenticated');
     setBootError(null);
@@ -73,8 +79,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     } catch {
       /* даже при сетевой ошибке локально завершаем сессию */
     }
+    authEpoch.current += 1;
     setCsrfToken(null);
     setState('guest');
+    setBootError(null);
+    // Полная навигация очищает данные всех провайдеров (live/audio/query-состояния).
+    window.location.replace('/admin/login');
   }, []);
 
   const value = useMemo<AuthContextValue>(

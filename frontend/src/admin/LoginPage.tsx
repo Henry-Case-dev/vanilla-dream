@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import type { FormEvent } from 'react';
-import { Link, Navigate, useLocation, useNavigate } from 'react-router-dom';
+import { Link, Navigate, useLocation } from 'react-router-dom';
 import { Logo } from '../components/Logo';
 import { Button, TextField } from '../components/ui';
 import { useAuth } from '../lib/auth';
@@ -8,15 +8,17 @@ import { errorMessage } from '../lib/api';
 
 export function LoginPage() {
   const { state, bootError, login, refresh } = useAuth();
-  const navigate = useNavigate();
   const location = useLocation();
   const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
   const from = (location.state as { from?: string } | null)?.from;
-  const target = from && from.startsWith('/admin') ? from : '/admin';
+  const safeFrom =
+    from && /^\/admin(?:\/|$)/.test(from) && !from.startsWith('/admin/login') ? from : null;
+  const target = safeFrom ?? '/admin';
 
+  // Уже валидная сессия: не показываем форму и сразу уходим в панель.
   if (state === 'authenticated') {
     return <Navigate to={target} replace />;
   }
@@ -30,8 +32,9 @@ export function LoginPage() {
     setBusy(true);
     setError(null);
     try {
+      // login() переводит AuthProvider в authenticated; декларативный Navigate
+      // выше выполняет переход после коммита состояния (без гонки с guard).
       await login(password);
-      navigate(target, { replace: true });
     } catch (caught) {
       setError(errorMessage(caught));
     } finally {

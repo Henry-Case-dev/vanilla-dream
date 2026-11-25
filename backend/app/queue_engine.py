@@ -1302,7 +1302,9 @@ def sync_engine(
         last_signature = sync_state.get("signature")
         last_at = sync_state.get("at")
         if (
-            signature == last_signature
+            not sync_state.get("failed")
+            and not db.get_setting(conn, "_engine_sync_error")
+            and signature == last_signature
             and isinstance(last_at, datetime)
             and 0 <= (now - last_at).total_seconds() < ENGINE_SYNC_MIN_INTERVAL
         ):
@@ -1311,13 +1313,16 @@ def sync_engine(
     content = "\n".join(lines)
     if content:
         content += "\n"
+    diagnostic = source_diagnostic(conn, now)
+    source = diagnostic.get("source")
+    playable_source = bool(
+        source is not None
+        and diagnostic.get("reason") is None
+        and playlist_track_ids(conn, source.playlist_id)
+    )
+    empty_valid = False
     if not lines:
-        diagnostic = source_diagnostic(conn, now)
-        if (
-            diagnostic.get("source") is not None
-            and diagnostic.get("reason") is None
-            and playlist_track_ids(conn, diagnostic["source"].playlist_id)
-        ):
+        if playable_source:
             db.set_setting(conn, "_engine_sync_error", to_iso(now) or "")
             db.log_event(
                 conn,
@@ -1326,8 +1331,15 @@ def sync_engine(
                 "Пустая синхронизация при наличии источника отклонена",
                 None,
             )
+            if sync_state is not None:
+                sync_state["failed"] = True
+                sync_state.pop("signature", None)
+                sync_state.pop("at", None)
             conn.commit()
             return False
+        # No playable source (empty library, empty/exhausted user source):
+        # an empty queue is the correct state, not a sync failure.
+        empty_valid = True
     current = current_position(conn)
     keep_ids = [Path(line).stem for line in lines]
     if current is not None:
@@ -1340,6 +1352,10 @@ def sync_engine(
         _cleanup_stale_links(settings, keep_ids)
     except OSError:
         db.log_event(conn, "error", "engine", "Не удалось записать файл очереди движка", None)
+        if sync_state is not None:
+            sync_state["failed"] = True
+            sync_state.pop("signature", None)
+            sync_state.pop("at", None)
         conn.commit()
         return False
     if hasattr(engine, "sync_report"):
@@ -1363,10 +1379,18 @@ def sync_engine(
             "Движок не разрешил ни одной позиции очереди",
             {"lines": len(lines), "failed": failed},
         )
+    if empty_valid:
+        # A failed command while there is legitimately no playable source does
+        # not make the station unhealthy; the engine will start silence or keep
+        # its empty state. Clear the failure and wait for a real source/track.
+        ok = True
+        resolved = 0
+        failed = 0
     if ok:
         if sync_state is not None:
             sync_state["signature"] = signature
             sync_state["at"] = now
+            sync_state["failed"] = False
         ids = [Path(line).stem for line in lines]
         prepared_ids = ids[: int(resolved or 0)] if resolved is not None else ids
         if prepared_ids:
@@ -1391,12 +1415,17 @@ def sync_engine(
                 {"failed": failed, "resolved": resolved, "positions": len(ids)},
             )
         db.delete_setting(conn, "_engine_sync_error")
+        db.set_setting(conn, "engine_last_error", "")
         if db.get_setting(conn, "_sync_warned") == "1":
             db.delete_setting(conn, "_sync_warned")
             db.log_event(conn, "info", "engine", "Синхронизация очереди с движком восстановлена", None)
     else:
         conn.execute("UPDATE queue_positions SET state = 'pending' WHERE state = 'prepared'")
         db.set_setting(conn, "_engine_sync_error", to_iso(now) or "")
+        if sync_state is not None:
+            sync_state["failed"] = True
+            sync_state.pop("signature", None)
+            sync_state.pop("at", None)
         if db.get_setting(conn, "_sync_warned") != "1":
             db.set_setting(conn, "_sync_warned", "1")
             db.log_event(

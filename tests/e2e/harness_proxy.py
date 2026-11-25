@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Isolated harness front door: static frontend + reverse proxy to the e2e station.
 
-Listens on 127.0.0.1:8300, serves the built frontend from /opt/vanilla-dream-radio/current/frontend-dist,
+Listens on 127.0.0.1:8300, serves the built frontend from /opt/vanilla-dream-radio/frontend-dist,
 proxies /api/* and /radio.* to the isolated API/Icecast ports and streams the audio
 body without buffering. Test-only: bound to localhost, never installed as a service.
 """
@@ -13,7 +13,7 @@ import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-DIST = Path(os.environ.get("VDR_E2E_DIST", "/opt/vanilla-dream-radio/current/frontend-dist"))
+DIST = Path(os.environ.get("VDR_E2E_DIST", "/opt/vanilla-dream-radio/frontend-dist"))
 API = ("127.0.0.1", int(os.environ.get("VDR_E2E_API_PORT", "8301")))
 ICECAST = ("127.0.0.1", int(os.environ.get("VDR_E2E_ICECAST_PORT", "8401")))
 PORT = int(os.environ.get("VDR_E2E_PROXY_PORT", "8300"))
@@ -34,7 +34,7 @@ CONTENT_TYPES = {
 
 
 class Handler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
+    protocol_version = "HTTP/1.0"
 
     def log_message(self, fmt, *args):  # keep the harness quiet
         pass

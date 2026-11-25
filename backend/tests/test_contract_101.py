@@ -693,6 +693,72 @@ def test_playlist_cover_public_priority(env, admin):
     assert restored.status_code == 200
 
 
+def test_failed_sync_is_retried_and_clears_last_error(env, admin):
+    tracks = [_upload(env, f"retry-{i}") for i in range(3)]
+    playlist = make_playlist(env.client, "Retry", [track["id"] for track in tracks])
+    env.client.put("/api/admin/settings", json={"default_playlist_id": playlist["id"]})
+    _start(env)
+    conn = db.open_db(env.settings)
+    try:
+        state: dict = {}
+        now = env.clock.now()
+        env.engine.sync_ok = False
+        assert queue_engine.sync_engine(
+            conn, env.settings, env.engine, now=now, sync_state=state
+        ) is False
+        assert state.get("failed") is True
+        assert "signature" not in state
+        assert db.get_setting(conn, "_engine_sync_error")
+        env.engine.sync_ok = True
+        db.set_setting(conn, "engine_last_error", "old failure")
+        conn.commit()
+        assert queue_engine.sync_engine(
+            conn, env.settings, env.engine, now=now, sync_state=state
+        ) is True
+        assert not db.get_setting(conn, "_engine_sync_error")
+        assert db.get_setting(conn, "engine_last_error") == ""
+    finally:
+        conn.close()
+
+
+def test_empty_library_start_and_upload_recovery(env, admin):
+    env.engine.sync_ok = False  # socket not ready yet, like a just-started unit
+    _start(env)
+    status = env.client.get("/api/admin/station/status").json()
+    assert status["state"] == "no_music"
+    assert status["reason"] == "library_empty"
+    assert status["status"] == status["state"]
+    assert status["unit_active"] is True
+    starts = len(
+        [call for call in env.runner.calls if call[0] == "sudo" and call[-2] == "start"]
+    )
+    conn = db.open_db(env.settings)
+    try:
+        assert not db.get_setting(conn, "_engine_sync_error")
+    finally:
+        conn.close()
+
+    env.engine.sync_ok = True
+    _upload(env, "recovered")
+    env.icecast.payload = {
+        "available": True,
+        "mount_present": True,
+        "listeners": 1,
+        "bitrate": 128,
+        "title": None,
+        "error": None,
+    }
+    env.app.state.scheduler.tick()
+    play_next(env)
+    env.app.state.scheduler.tick()
+    status = env.client.get("/api/admin/station/status").json()
+    assert status["state"] == "on_air"
+    assert status["status"] == status["state"]
+    assert len(
+        [call for call in env.runner.calls if call[0] == "sudo" and call[-2] == "start"]
+    ) == starts
+
+
 def test_migration_v1_keeps_data_and_clears_library_cycle(settings):
     schema = db.SCHEMA_PATH.read_text(encoding="utf-8").replace(
         "    system INTEGER NOT NULL DEFAULT 0,\n", ""

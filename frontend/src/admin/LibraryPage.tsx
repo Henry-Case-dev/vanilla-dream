@@ -552,6 +552,7 @@ export function LibraryPage() {
               multiple
               accept={UPLOAD_ACCEPT}
               className="visually-hidden"
+              aria-label="Выбрать аудиофайлы для загрузки"
               onChange={(event) => {
                 addFiles(Array.from(event.target.files ?? []));
                 event.target.value = '';

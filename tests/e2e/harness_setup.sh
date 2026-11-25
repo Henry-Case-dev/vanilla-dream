@@ -111,7 +111,7 @@ VD_ENGINE_QUEUE_FILE=$ROOT/run/engine-queue.txt
 VD_ENGINE_SOCKET=$ROOT/run/liquidsoap.sock
 VD_ENGINE_UNIT=$UNIT
 VD_STATION_SUDO=0
-VD_ENGINE_LABEL=Liquidsoap e2e
+VD_ENGINE_LABEL=Liquidsoap-e2e
 VD_ENCODER_FILE=$ROOT/etc/encoder.liq
 VD_STATION_FILE=$ROOT/etc/station.liq
 VD_ICECAST_STATS_URL=http://127.0.0.1:$PORT_ICE/status-json.xsl
@@ -139,7 +139,7 @@ curl -fsS --max-time 5 http://127.0.0.1:$PORT_API/api/public/now-playing >/dev/n
 
 log "Front door (static + proxy)"
 pkill -f harness_proxy.py 2>/dev/null || true
-setsid env VDR_E2E_DIST="$APP/frontend-dist" VDR_E2E_API_PORT=$PORT_API \
+setsid env VDR_E2E_DIST="/opt/vanilla-dream-radio/frontend-dist" VDR_E2E_API_PORT=$PORT_API \
   VDR_E2E_ICECAST_PORT=$PORT_ICE VDR_E2E_PROXY_PORT=$PORT_WEB \
   python3 "$APP/tests/e2e/harness_proxy.py" > "$ROOT/log/proxy.log" 2>&1 < /dev/null &
 sleep 2

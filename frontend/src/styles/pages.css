@@ -505,6 +505,11 @@
   transition: border-color 0.15s ease, background-color 0.15s ease, color 0.15s ease;
 }
 
+.dropzone:focus-within {
+  border-color: var(--accent);
+  box-shadow: var(--focus-ring);
+}
+
 .dropzone:hover {
   border-color: var(--accent-line);
   background: var(--accent-soft);
