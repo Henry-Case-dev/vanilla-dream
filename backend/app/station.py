@@ -293,6 +293,23 @@ class StationController:
         ):
             state = "error"
             reason = "engine_sync_failed"
+        start_at = parse_iso(db.get_setting(conn, "_engine_start_at"))
+        start_synced = db.get_setting(conn, "_engine_start_synced") == "1"
+        grace = float(self.settings.engine_start_grace or 0)
+        in_start_grace = bool(
+            desired == "playing"
+            and start_at is not None
+            and not start_synced
+            and 0 <= (now - start_at).total_seconds() < grace
+        )
+        if in_start_grace and (
+            (state == "error" and reason == "engine_sync_failed")
+            or (state == "no_music" and reason == "engine_starting")
+        ):
+            # A normal engine start can briefly fail to sync while the unit is
+            # still coming up. Do not flash an error during the start window.
+            state = "starting"
+            reason = "engine_starting"
         conn.commit()
         return {
             "state": state,
@@ -314,7 +331,18 @@ class StationController:
         }
 
     # -- commands ----------------------------------------------------------
+    def _mark_engine_start(self, conn, now: datetime) -> None:
+        db.set_setting(conn, "_engine_start_at", to_iso(now) or "")
+        db.set_setting(conn, "_engine_start_synced", "0")
+        conn.commit()
+
+    def _clear_engine_start(self, conn) -> None:
+        db.delete_setting(conn, "_engine_start_at")
+        db.delete_setting(conn, "_engine_start_synced")
+        conn.commit()
+
     def _start_unit(self, conn, now: datetime, raise_on_error: bool) -> bool:
+        self._mark_engine_start(conn, now)
         ok, output, _code = self._systemctl("start")
         self.invalidate_unit_cache(self.settings.engine_unit)
         if ok:
@@ -372,6 +400,8 @@ class StationController:
             )
         self._set_desired(conn, "stopped")
         db.delete_setting(conn, "_engine_active_since")
+        self._clear_engine_start(conn)
+        db.delete_setting(conn, "_engine_sync_error")
         state = conn.execute(
             "SELECT position_id FROM playback_state WHERE singleton = 1"
         ).fetchone()
@@ -422,6 +452,7 @@ class StationController:
             )
         self._reset_prepared(conn)
         self._forget_current(conn, now)
+        self._mark_engine_start(conn, now)
         queue_engine.ensure_queue(conn, self.settings, now)
         ok, output, _code = self._systemctl("restart")
         self.invalidate_unit_cache(self.settings.engine_unit)
@@ -449,6 +480,7 @@ class StationController:
             return False
         self._reset_prepared(conn)
         self._forget_current(conn, now)
+        self._mark_engine_start(conn, now)
         ok, output, _code = self._systemctl("restart")
         self.invalidate_unit_cache(self.settings.engine_unit)
         if ok:

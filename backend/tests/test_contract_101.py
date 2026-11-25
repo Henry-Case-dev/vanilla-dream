@@ -759,6 +759,76 @@ def test_empty_library_start_and_upload_recovery(env, admin):
     ) == starts
 
 
+def test_start_grace_hides_temporary_sync_error(env, admin):
+    _upload(env, "grace-recover")
+    env.engine.sync_ok = False
+    started = env.client.post("/api/admin/station/start")
+    assert started.status_code == 200
+    assert started.json()["state"] == "starting"
+    assert started.json()["reason"] == "engine_starting"
+    env.app.state.scheduler.tick()
+    status = env.client.get("/api/admin/station/status").json()
+    assert status["state"] == "starting"
+    assert status["reason"] == "engine_starting"
+    assert status["status"] == "starting"
+
+    env.clock.advance(1)
+    env.app.state.scheduler.tick()
+    assert env.client.get("/api/admin/station/status").json()["state"] == "starting"
+    env.clock.advance(1)
+    env.engine.sync_ok = True
+    env.app.state.scheduler.tick()
+    status = env.client.get("/api/admin/station/status").json()
+    assert status["state"] != "error"
+    assert status["reason"] != "engine_sync_failed"
+
+    env.icecast.payload = {
+        "available": True,
+        "mount_present": True,
+        "listeners": 1,
+        "bitrate": 128,
+        "title": None,
+        "error": None,
+    }
+    play_next(env)
+    env.app.state.scheduler.tick()
+    status = env.client.get("/api/admin/station/status").json()
+    assert status["state"] == "on_air"
+
+
+def test_start_grace_expires_to_sync_error(env, admin):
+    _upload(env, "grace-fail")
+    env.engine.sync_ok = False
+    assert env.client.post("/api/admin/station/start").json()["state"] == "starting"
+    env.clock.advance(9.9)
+    env.app.state.scheduler.tick()
+    status = env.client.get("/api/admin/station/status").json()
+    assert status["state"] == "starting"
+    assert status["reason"] == "engine_starting"
+
+    env.clock.advance(0.2)
+    env.app.state.scheduler.tick()
+    status = env.client.get("/api/admin/station/status").json()
+    assert status["state"] == "error"
+    assert status["reason"] == "engine_sync_failed"
+
+
+def test_stop_resets_start_grace(env, admin):
+    _upload(env, "grace-stop")
+    env.engine.sync_ok = False
+    assert env.client.post("/api/admin/station/start").json()["state"] == "starting"
+    env.client.post("/api/admin/station/stop")
+    conn = db.open_db(env.settings)
+    try:
+        assert not db.get_setting(conn, "_engine_start_at")
+        assert not db.get_setting(conn, "_engine_sync_error")
+    finally:
+        conn.close()
+    status = env.client.get("/api/admin/station/status").json()
+    assert status["state"] == "off"
+    assert status["reason"] == "stopped_by_owner"
+
+
 def test_migration_v1_keeps_data_and_clears_library_cycle(settings):
     schema = db.SCHEMA_PATH.read_text(encoding="utf-8").replace(
         "    system INTEGER NOT NULL DEFAULT 0,\n", ""

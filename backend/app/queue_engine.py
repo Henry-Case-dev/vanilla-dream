@@ -1416,6 +1416,7 @@ def sync_engine(
             )
         db.delete_setting(conn, "_engine_sync_error")
         db.set_setting(conn, "engine_last_error", "")
+        db.set_setting(conn, "_engine_start_synced", "1")
         if db.get_setting(conn, "_sync_warned") == "1":
             db.delete_setting(conn, "_sync_warned")
             db.log_event(conn, "info", "engine", "Синхронизация очереди с движком восстановлена", None)

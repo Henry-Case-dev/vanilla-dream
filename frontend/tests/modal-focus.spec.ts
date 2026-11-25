@@ -31,6 +31,29 @@ async function assertFocused(page: Page, target: Locator, field: string, key: st
   transcript.push({ field, key, ...info });
 }
 
+async function recordActive(
+  page: Page,
+  field: string,
+  key: string,
+): Promise<{ tag: string; text: string; aria: string | null }> {
+  const info = await page.evaluate(() => {
+    const active = document.activeElement as HTMLElement | null;
+    return {
+      tag: active?.tagName ?? 'NONE',
+      text: active?.textContent?.trim().slice(0, 80) ?? '',
+      aria: active?.getAttribute('aria-label'),
+    };
+  });
+  transcript.push({
+    field,
+    key,
+    activeTag: info.tag,
+    activeId: null,
+    activePlaceholder: info.aria ?? info.text,
+  });
+  return info;
+}
+
 async function typePerCharacter(
   page: Page,
   target: Locator,
@@ -211,6 +234,58 @@ test('add-tracks, metadata, password and confirm dialogs use the same focus cont
   await expect(confirmDialog.getByRole('button', { name: 'Отмена' })).toBeFocused();
   await page.keyboard.press('Escape');
   await expect(confirmDialog).toBeHidden();
+});
+
+test('Escape restores focus to the real opener for create and add dialogs', async ({ page }) => {
+  await page.goto('/admin/playlists');
+  await expect(page.locator('.playlist-card').first()).toBeVisible();
+  const createTrigger = page.getByRole('button', { name: 'Создать плейлист' });
+  await recordActive(page, 'create-dialog', 'before-trigger-click');
+  await createTrigger.click();
+  const createDialog = page.getByRole('dialog');
+  const nameField = createDialog.getByLabel('Название', { exact: true });
+  await expect(createDialog).toBeVisible();
+  await expect(nameField).toBeFocused();
+  await recordActive(page, 'create-dialog', 'after-open');
+  await expect(createDialog.getByLabel('Описание', { exact: true })).toBeVisible();
+
+  await nameField.press('Tab');
+  await expect(createDialog.getByLabel('Описание', { exact: true })).toBeFocused();
+  await recordActive(page, 'create-dialog', 'tab-forward');
+  await page.keyboard.press('Shift+Tab');
+  await expect(nameField).toBeFocused();
+  await recordActive(page, 'create-dialog', 'shift-tab-back');
+
+  await page.keyboard.press('Escape');
+  await expect(createDialog).toBeHidden();
+  await expect(createTrigger).toBeFocused();
+  expect(await createTrigger.evaluate((element) => document.activeElement === element)).toBe(true);
+  await recordActive(page, 'create-dialog', 'after-escape');
+
+  await page.goto('/admin/playlists/p1');
+  await page.waitForSelector('.playlist-row:not(.playlist-row--head)');
+  const addTrigger = page.getByRole('button', { name: 'Добавить треки' });
+  await recordActive(page, 'add-tracks-dialog', 'before-trigger-click');
+  await addTrigger.click();
+  const addDialog = page.getByRole('dialog');
+  const searchField = addDialog.getByLabel('Поиск треков');
+  await expect(addDialog).toBeVisible();
+  await expect(searchField).toBeFocused();
+  await recordActive(page, 'add-tracks-dialog', 'after-open');
+
+  await searchField.press('Tab');
+  const bulkCheckbox = addDialog.getByRole('checkbox').first();
+  await expect(bulkCheckbox).toBeFocused();
+  await recordActive(page, 'add-tracks-dialog', 'tab-forward');
+  await page.keyboard.press('Shift+Tab');
+  await expect(searchField).toBeFocused();
+  await recordActive(page, 'add-tracks-dialog', 'shift-tab-back');
+
+  await page.keyboard.press('Escape');
+  await expect(addDialog).toBeHidden();
+  await expect(addTrigger).toBeFocused();
+  expect(await addTrigger.evaluate((element) => document.activeElement === element)).toBe(true);
+  await recordActive(page, 'add-tracks-dialog', 'after-escape');
 });
 
 test.afterAll(() => {

@@ -79,6 +79,7 @@ class Settings:
     station_sudo: bool = True
     engine_label: str = "Liquidsoap"
     playlist_cover_dir: Path | None = None
+    engine_start_grace: float = 10.0
 
     def __post_init__(self) -> None:
         if self.playlist_cover_dir is None:
@@ -124,6 +125,7 @@ class Settings:
             engine_unit=_env("VD_ENGINE_UNIT", UNIT_LIQUIDSOAP) or UNIT_LIQUIDSOAP,
             station_sudo=_env_bool("VD_STATION_SUDO", True),
             engine_label=_env("VD_ENGINE_LABEL", "Liquidsoap") or "Liquidsoap",
+            engine_start_grace=_env_float("VD_ENGINE_START_GRACE", 10.0),
         )
 
     def ensure_directories(self) -> None:

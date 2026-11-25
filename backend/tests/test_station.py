@@ -459,14 +459,17 @@ def test_engine_env_defaults_and_overrides(monkeypatch):
     assert defaults.engine_unit == "vanilla-dream-radio-liquidsoap.service"
     assert defaults.station_sudo is True
     assert defaults.engine_label == "Liquidsoap"
+    assert defaults.engine_start_grace == 10.0
 
     monkeypatch.setenv("VD_ENGINE_UNIT", "vanilla-dream-radio-liquidsoap-e2e.service")
     monkeypatch.setenv("VD_STATION_SUDO", "0")
     monkeypatch.setenv("VD_ENGINE_LABEL", "Liquidsoap E2E")
+    monkeypatch.setenv("VD_ENGINE_START_GRACE", "2.5")
     custom = Settings.from_env()
     assert custom.engine_unit == "vanilla-dream-radio-liquidsoap-e2e.service"
     assert custom.station_sudo is False
     assert custom.engine_label == "Liquidsoap E2E"
+    assert custom.engine_start_grace == 2.5
 
 
 def test_stop_failure_keeps_desired_state(env, admin):

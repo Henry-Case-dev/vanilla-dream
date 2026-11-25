@@ -41,6 +41,7 @@ def active(page: Page) -> dict:
         """() => { const a = document.activeElement; if (!a) return {tag: null};
         return {tag: a.tagName, type: a.getAttribute('type'), placeholder: a.getAttribute('placeholder'),
                 aria: a.getAttribute('aria-label'), cls: (a.className || '').toString().slice(0, 40),
+                text: (a.innerText || '').trim().slice(0, 40),
                 value: 'value' in a ? String(a.value).slice(0, 40) : null}; }"""
     )
 
@@ -95,7 +96,11 @@ def type_chars(page: Page, text: str) -> list[dict]:
 def scenario_focus(page: Page, base: str) -> None:
     print("\n--- focus regression (P0-INPUT-FOCUS)")
     goto_panel(page, base, "/admin/playlists", "Плейлисты")
-    check("create dialog opens", open_modal(page, "Создать плейлист"))
+    trigger = page.get_by_role("button", name=re.compile("Создать плейлист")).first
+    trigger.click()
+    page.wait_for_selector(".modal__panel", timeout=15000)
+    opener_before = active(page)
+    check("create dialog opens", True)
     panel = page.locator(".modal__panel").last
     field = panel.locator("input").first
     field.click()
@@ -112,7 +117,7 @@ def scenario_focus(page: Page, base: str) -> None:
     for _ in range(3):
         page.keyboard.press("ArrowRight")
     page.keyboard.type("XY")
-    check("middle edit keeps focus and text", active(page).get("tag") == "INPUT" and "XY" in field.input_value(),
+    check("middle edit keeps focus and text", active(page).get("tag") == "INPUT" and "ПроXY" in field.input_value(),
           field.input_value()[:12])
 
     page.keyboard.press("Control+A")
@@ -132,6 +137,10 @@ def scenario_focus(page: Page, base: str) -> None:
     page.keyboard.press("Escape")
     page.wait_for_timeout(400)
     check("escape closes the dialog", page.locator(".modal__panel").count() == 0)
+    restored = active(page)
+    check("escape returns focus to the trigger",
+          restored.get("tag") == "BUTTON" and "Создать плейлист" in (restored.get("text") or restored.get("aria") or ""),
+          f"{restored.get('tag')} {restored.get('text')}")
 
     check("re-opened dialog focuses a field", open_modal(page, "Создать плейлист"))
     page.wait_for_timeout(500)
@@ -204,6 +213,13 @@ def scenario_system_playlist(page: Page, base: str, ctx: APIRequestContext, fixt
 def scenario_user_playlist(page: Page, base: str, ctx: APIRequestContext) -> dict:
     print("\n--- user playlist: tracks, bulk add, persistence")
     goto_panel(page, base, "/admin/playlists", "Плейлисты")
+    csrf = api_json(ctx, "/api/auth/me").get("csrf_token") or ""
+    for stale in api_json(ctx, "/api/admin/playlists").get("items", []):
+        if stale["name"] == "Проверка состава":
+            ctx.fetch(f"/api/admin/playlists/{stale['id']}", method="DELETE", headers={"X-CSRF-Token": csrf})
+    page.reload(wait_until="commit")
+    wait_panel(page, "Плейлисты", 25)
+    page.wait_for_timeout(1200)
     if not open_modal(page, "Создать плейлист"):
         check("playlist dialog opens", False)
         return {}
@@ -220,10 +236,11 @@ def scenario_user_playlist(page: Page, base: str, ctx: APIRequestContext) -> dic
         return {}
 
     goto_panel(page, base, f"/admin/playlists/{user['id']}", "Проверка состава")
-    if not open_modal(page, "Добавить музыку|Добавить треки"):
-        check("add-tracks dialog opens", False)
-        return user
+    add_trigger = page.get_by_role("button", name=re.compile("Добавить музыку|Добавить треки")).first
+    add_trigger.click()
+    page.wait_for_selector(".modal__panel", timeout=15000)
     page.wait_for_timeout(1200)
+    add_opened = active(page)
     checkbox = page.get_by_role("checkbox", name=re.compile("Выбрать все", re.I)).first
     check("select-all control exists", checkbox.count() > 0)
     if checkbox.count():
@@ -258,6 +275,11 @@ def scenario_user_playlist(page: Page, base: str, ctx: APIRequestContext) -> dic
         check("nothing new selected for an already filled playlist",
               confirm2.count() == 0 or confirm2.is_disabled(), "")
         page.keyboard.press("Escape")
+        page.wait_for_timeout(500)
+        restored = active(page)
+        check("add-tracks escape returns focus to the trigger",
+              restored.get("tag") == "BUTTON" and "Добавить" in (restored.get("text") or restored.get("aria") or ""),
+              f"{restored.get('tag')} {restored.get('text')}")
 
     return detail
 

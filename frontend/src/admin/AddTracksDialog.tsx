@@ -222,7 +222,6 @@ export function AddTracksDialog({
           placeholder="Название, исполнитель, альбом"
           value={search}
           onChange={(event) => setSearch(event.target.value)}
-          autoFocus
         />
       </div>
 

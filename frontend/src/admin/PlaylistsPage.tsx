@@ -185,7 +185,6 @@ export function PlaylistsPage() {
             value={name}
             onChange={(event) => setName(event.target.value)}
             placeholder="Например: Ночной сиреневый"
-            autoFocus
           />
           <TextAreaField
             label="Описание"
