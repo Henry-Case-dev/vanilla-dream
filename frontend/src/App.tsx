@@ -5,6 +5,7 @@ import { AuthProvider, RequireAuth } from './lib/auth';
 import { UploadProvider } from './lib/uploads';
 import { ExportProvider } from './lib/exports';
 import { LiveProvider } from './lib/live';
+import { PlaylistSettingsProvider } from './lib/playlist-settings';
 import { AudioProvider } from './lib/audio';
 import { AdminLayout } from './admin/AdminLayout';
 import { LoginPage } from './admin/LoginPage';
@@ -42,6 +43,7 @@ export function App() {
             <UploadProvider>
               <ExportProvider>
                 <LiveProvider>
+                  <PlaylistSettingsProvider>
                   <AudioProvider>
                   <Routes>
                     <Route path="/" element={<PublicPlayerPage />} />
@@ -64,6 +66,7 @@ export function App() {
                     <Route path="*" element={<NotFoundPage />} />
                   </Routes>
                   </AudioProvider>
+                  </PlaylistSettingsProvider>
                 </LiveProvider>
               </ExportProvider>
             </UploadProvider>

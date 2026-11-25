@@ -10,70 +10,110 @@ import {
   Shuffle,
   SkipForward,
   Square,
+  X,
 } from 'lucide-react';
 import { Cover } from '../components/Cover';
 import { Equalizer, IconButton } from '../components/ui';
 import { VolumeControl } from '../components/VolumeControl';
+import { ConfirmDialog } from '../components/Modal';
 import { useToast } from '../components/Toasts';
 import { useAudio } from '../lib/audio';
-import { useLive } from '../lib/live';
-import { useResource } from '../lib/hooks';
+import { useLive, effectiveControl } from '../lib/live';
+import { usePlaylistSettings } from '../lib/playlist-settings';
 import { api, errorMessage } from '../lib/api';
-import { repeatLabel, sourceDisplayName } from '../lib/format';
 import { describeStationStatus, statusDotClass } from '../lib/status';
 import { notifyDataChanged } from '../lib/refresh';
 import type { RepeatMode } from '../lib/types';
 
-function nextRepeat(mode: RepeatMode): RepeatMode {
-  if (mode === 'none') return 'all';
-  if (mode === 'all') return 'one';
-  return 'none';
+function repeatTooltip(mode: RepeatMode, target: string | null): string {
+  const where = target ? ` «${target}»` : '';
+  if (mode === 'none') return `Без повтора${where}. Включить повтор плейлиста`;
+  if (mode === 'all') return `Повтор плейлиста${where}. Включить повтор трека`;
+  return `Повтор трека${where}. Выключить повтор`;
+}
+
+function localLabel(audio: ReturnType<typeof useAudio>, canPlay: boolean): string {
+  switch (audio.state) {
+    case 'connecting':
+      return 'Подключение…';
+    case 'buffering':
+      return 'Буферизация…';
+    case 'reconnecting':
+      return 'Переподключение…';
+    case 'station_off':
+      return 'Эфир остановлен';
+    case 'blocked':
+      return 'Нажмите Play';
+    case 'unavailable':
+      return 'Поток недоступен';
+    case 'playing':
+      return 'Локально';
+    default:
+      return canPlay ? 'Локально' : 'Недоступно';
+  }
 }
 
 /**
- * Постоянная нижняя панель. Локальное прослушивание отделено от управления
- * эфиром; зелёный индикатор и подпись берутся из общего маппинга статусов.
+ * Нижняя панель: текущий трек / музыка и локальное прослушивание / глобальные
+ * действия. Shuffle и Repeat управляют постоянными настройками программного
+ * плейлиста, а не разовой очередью.
  */
 export function PlayerBar() {
-  const { now, reload } = useLive();
+  const { now, control, reload, reloadControl } = useLive();
   const audio = useAudio();
   const toast = useToast();
+  const settings = usePlaylistSettings();
   const [busy, setBusy] = useState<string | null>(null);
+  const [restartOpen, setRestartOpen] = useState(false);
 
   const station = now?.station ?? null;
   const track = now?.track ?? null;
   const desired = station?.desired ?? 'stopped';
-  const sourcePlaylistId = now?.source?.playlistId ?? null;
+  const state = effectiveControl(control, now);
   const statusView = describeStationStatus(station?.status, station?.reason);
-  const sourceName = sourceDisplayName(now?.source);
 
-  const playlistResource = useResource(
-    () => (sourcePlaylistId ? api.admin.playlists.get(sourcePlaylistId) : Promise.resolve(null)),
-    [sourcePlaylistId],
-    { pollMs: 60000 },
-  );
-  const playlist = playlistResource.data?.playlist ?? null;
-  const repeatMode: RepeatMode = playlist?.repeatMode ?? 'none';
+  const programId =
+    state?.programPlaylistId ?? state?.selectedPlaylistId ?? null;
+  const program = settings.get(programId);
+  const repeatMode: RepeatMode = program?.repeatMode ?? 'none';
+  const shuffle = program?.shuffle ?? false;
+  const repeatGovernedBy = program?.repeatGovernedBy ?? state?.repeatGovernedBy ?? null;
+  const repeatDisabledReason =
+    repeatGovernedBy === 'rotation'
+      ? 'Повтор определяется ротацией'
+      : !state
+        ? 'Состояние источника ещё не получено'
+        : !programId
+          ? 'Источник эфира не определён'
+          : !program
+            ? 'Загрузка настроек плейлиста…'
+            : null;
+  const shuffleDisabledReason = !state
+    ? 'Состояние источника ещё не получено'
+    : !programId
+      ? 'Источник эфира не определён'
+      : !program
+        ? 'Загрузка настроек плейлиста…'
+        : null;
 
   const lastAudioError = useRef<string | null>(null);
   useEffect(() => {
     if (audio.error && audio.error !== lastAudioError.current) {
-      toast.notify('error', audio.error);
+      const isStatus = audio.state === 'reconnecting' || audio.state === 'buffering';
+      if (!isStatus) toast.notify('error', audio.error);
       lastAudioError.current = audio.error;
     }
     if (!audio.error) lastAudioError.current = null;
-  }, [audio.error, toast]);
+  }, [audio.error, audio.state, toast]);
 
   const run = async (key: string, action: () => Promise<void>, message: string) => {
     setBusy(key);
     try {
       await action();
-      toast.notify('success', message);
+      if (message) toast.notify('success', message);
       reload();
+      reloadControl();
       notifyDataChanged();
-      if (key === 'start' || key === 'stop' || key === 'restart') {
-        window.setTimeout(reload, 2500);
-      }
     } catch (caught) {
       toast.notify('error', errorMessage(caught));
     } finally {
@@ -81,21 +121,49 @@ export function PlayerBar() {
     }
   };
 
-  const changeRepeat = async () => {
-    if (!playlist) return;
-    const target = nextRepeat(repeatMode);
-    await run(
-      'repeat',
-      async () => {
-        await api.admin.playlists.update(playlist.id, { repeat_mode: target });
-        await playlistResource.reload(true);
-      },
-      `Режим повтора: ${repeatLabel(target).toLowerCase()}`,
-    );
+  const toggleShuffle = async () => {
+    if (!programId) return;
+    const current = settings.get(programId)?.shuffle ?? false;
+    await settings.setShuffle(programId, !current);
+  };
+
+  const cycleRepeat = async () => {
+    if (!programId || !program) return;
+    await settings.cycleRepeat(programId);
+  };
+
+  const localBusy = audio.state === 'connecting' || audio.state === 'reconnecting';
+  const localFailure = audio.state === 'unavailable';
+  const canPressLocal = audio.canPlay || audio.state === 'station_off';
+  const localTitle =
+    !audio.canPlay && audio.intent === 'idle'
+      ? audio.unavailableReason ?? 'Локальное прослушивание недоступно'
+      : (audio.state === 'station_off' || audio.state === 'buffering') && audio.intent !== 'idle'
+        ? 'Остановить локальное прослушивание'
+        : audio.state === 'blocked'
+      ? 'Нажмите Play, чтобы продолжить'
+      : localBusy
+        ? 'Отменить подключение'
+        : localFailure
+          ? 'Переподключиться к потоку'
+          : audio.playing
+            ? 'Остановить локальное прослушивание'
+            : 'Слушать эфир локально (эфир не меняется)';
+
+  const localClick = () => {
+    if (localBusy) {
+      audio.cancel();
+      return;
+    }
+    if (localFailure || audio.state === 'blocked') {
+      audio.reconnect();
+      return;
+    }
+    void audio.toggle();
   };
 
   const airDisabled = busy !== null;
-  const localUnavailable = audio.unavailableReason ?? 'Локальное прослушивание недоступно';
+  const playTargetName = program?.name ?? null;
 
   return (
     <footer className="player-bar" aria-label="Панель прослушивания и управления эфиром">
@@ -111,11 +179,6 @@ export function PlayerBar() {
             {track?.artist ?? statusView.shortLabel}
           </span>
         </div>
-        {now?.source?.kind === 'override' && (
-          <span className="pb-source-chip" title={sourceName ?? 'Ручной выбор'}>
-            Ручной выбор
-          </span>
-        )}
         {audio.playing && (
           <span className="pb-track__eq" title="Локальное прослушивание">
             <Equalizer />
@@ -127,31 +190,36 @@ export function PlayerBar() {
         <div className="pb-controls">
           <IconButton
             icon={Shuffle}
-            label="Перемешать будущую очередь"
-            title="Перемешать будущую очередь (ручные вставки сохраняются)"
-            disabled={airDisabled}
-            onClick={() => void run('shuffle', api.admin.queue.shuffle, 'Будущая очередь перемешана')}
+            label={
+              shuffleDisabledReason ??
+              (shuffle
+                ? `Выключить перемешивание${playTargetName ? ` «${playTargetName}»` : ''}`
+                : `Включить перемешивание${playTargetName ? ` «${playTargetName}»` : ''}`)
+            }
+            title={
+              shuffleDisabledReason ??
+              (shuffle
+                ? `Выключить перемешивание${playTargetName ? ` «${playTargetName}»` : ''}`
+                : `Включить перемешивание${playTargetName ? ` «${playTargetName}»` : ''}`)
+            }
+            active={shuffle && Boolean(program)}
+            disabled={Boolean(shuffleDisabledReason) || airDisabled}
+            loading={Boolean(programId && settings.busy(programId, 'shuffle'))}
+            onClick={() => void toggleShuffle()}
           />
           <IconButton
             icon={repeatMode === 'one' ? Repeat1 : Repeat}
-            label={
-              playlist
-                ? `Повтор: ${repeatLabel(repeatMode).toLowerCase()}. Нажмите, чтобы сменить`
-                : 'Повтор недоступен: источник не является плейлистом'
-            }
-            title={
-              playlist
-                ? `Повтор: ${repeatLabel(repeatMode).toLowerCase()}. Нажмите, чтобы сменить`
-                : 'Повтор доступен, когда источником эфира является плейлист'
-            }
-            active={repeatMode !== 'none'}
-            disabled={!playlist || airDisabled}
-            onClick={() => void changeRepeat()}
+            label={repeatDisabledReason ?? repeatTooltip(repeatMode, playTargetName)}
+            title={repeatDisabledReason ?? repeatTooltip(repeatMode, playTargetName)}
+            active={repeatMode !== 'none' && Boolean(program) && repeatGovernedBy !== 'rotation'}
+            disabled={Boolean(repeatDisabledReason) || airDisabled}
+            loading={Boolean(programId && settings.busy(programId, 'repeat'))}
+            onClick={() => void cycleRepeat()}
           />
           <IconButton
             icon={SkipForward}
-            label={desired === 'playing' ? 'Следующий трек' : 'Сначала запустите эфир'}
-            title={desired === 'playing' ? 'Пропустить текущий трек' : 'Сначала запустите эфир'}
+            label={desired === 'playing' ? 'Пропустить трек для всех слушателей' : 'Сначала запустите эфир'}
+            title={desired === 'playing' ? 'Пропустить текущий трек для всех слушателей' : 'Сначала запустите эфир'}
             disabled={desired !== 'playing' || airDisabled}
             onClick={() => void run('skip', api.admin.station.skip, 'Пропуск передан движку')}
           />
@@ -159,37 +227,25 @@ export function PlayerBar() {
 
         <div className="pb-local">
           <IconButton
-            icon={audio.playing ? Pause : Play}
-            label={
-              audio.canPlay
-                ? audio.playing
-                  ? 'Остановить локальное прослушивание'
-                  : 'Слушать эфир локально'
-                : localUnavailable
+            icon={
+              localBusy
+                ? X
+                : audio.state === 'station_off' && audio.intent !== 'idle'
+                  ? Square
+                  : localFailure
+                    ? RotateCw
+                    : audio.playing || audio.state === 'buffering'
+                      ? Pause
+                      : Play
             }
-            title={
-              audio.canPlay
-                ? audio.playing
-                  ? 'Остановить локальное прослушивание'
-                  : 'Слушать эфир локально (эфир не меняется)'
-                : localUnavailable
-            }
+            label={localTitle}
+            title={localTitle}
             tone="accent"
             active={audio.playing}
-            disabled={!audio.canPlay || audio.busy}
-            onClick={() => void audio.toggle()}
+            disabled={!canPressLocal && !audio.playing && audio.state !== 'station_off'}
+            onClick={localClick}
           />
-          <span className="pb-local__label">
-            {audio.state === 'connecting'
-              ? 'Подключение…'
-              : audio.state === 'reconnecting'
-                ? 'Переподключение…'
-                : !audio.canPlay
-                  ? audio.unavailableReason === 'Сначала запустите эфир'
-                    ? 'Сначала запустите эфир'
-                    : 'Недоступно'
-                  : 'Локально'}
-          </span>
+          <span className="pb-local__label">{localLabel(audio, audio.canPlay)}</span>
           <VolumeControl
             className="pb-volume"
             value={audio.volume}
@@ -207,8 +263,8 @@ export function PlayerBar() {
         <div className="pb-air__buttons">
           <IconButton
             icon={Power}
-            label={desired === 'playing' ? 'Эфир уже запущен' : 'Запустить эфир'}
-            title={desired === 'playing' ? `Эфир уже запущен. ${statusView.detail}` : 'Запустить эфир'}
+            label={desired === 'playing' ? 'Эфир уже запущен для всех слушателей' : 'Запустить эфир для всех слушателей'}
+            title={desired === 'playing' ? `Эфир уже запущен. ${statusView.detail}` : 'Запустить эфир для всех слушателей'}
             tone="accent"
             active={desired === 'playing'}
             disabled={desired === 'playing' || airDisabled}
@@ -216,24 +272,37 @@ export function PlayerBar() {
           />
           <IconButton
             icon={Square}
-            label={desired === 'stopped' ? 'Эфир уже остановлен' : 'Остановить эфир'}
-            title={desired === 'stopped' ? 'Эфир уже остановлен' : 'Остановить эфир'}
+            label={desired === 'stopped' ? 'Эфир уже остановлен' : 'Остановить эфир для всех слушателей'}
+            title={desired === 'stopped' ? 'Эфир уже остановлен' : 'Остановить эфир для всех слушателей'}
             disabled={desired === 'stopped' || airDisabled}
             onClick={() => void run('stop', api.admin.station.stop, 'Эфир останавливается')}
           />
           <IconButton
             icon={RotateCw}
-            label={desired === 'stopped' ? 'Сначала запустите эфир' : 'Перезапустить движок'}
+            label={desired === 'stopped' ? 'Сначала запустите эфир' : 'Перезапустить движок для всех слушателей'}
             title={
               desired === 'stopped'
                 ? 'Сначала запустите эфир'
-                : 'Перезапустить движок, сохранив состояние эфира'
+                : 'Перезапустить движок для всех слушателей. Эфир прервётся на несколько секунд.'
             }
             disabled={desired === 'stopped' || airDisabled}
-            onClick={() => void run('restart', api.admin.station.restart, 'Движок перезапускается')}
+            onClick={() => setRestartOpen(true)}
           />
         </div>
       </div>
+
+      <ConfirmDialog
+        open={restartOpen}
+        title="Перезапустить движок?"
+        description="Эфир прервётся на несколько секунд для всех слушателей. Локальное прослушивание в этом браузере переподключится автоматически."
+        confirmLabel="Перезапустить"
+        busy={busy === 'restart'}
+        onConfirm={() => {
+          setRestartOpen(false);
+          void run('restart', api.admin.station.restart, 'Движок перезапускается');
+        }}
+        onCancel={() => setRestartOpen(false)}
+      />
     </footer>
   );
 }

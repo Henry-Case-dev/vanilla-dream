@@ -275,6 +275,50 @@ export function timeZoneOptions(): string[] {
   return zones;
 }
 
+export function modeLabel(mode: 'playlist' | 'auto' | null | undefined): string {
+  return mode === 'auto' ? 'Автоматически' : 'Плейлист';
+}
+
+export function effectiveSourceName(
+  source: { kind?: string | null; name?: string | null; label?: string | null; playlistId?: string | null } | null | undefined,
+): string | null {
+  if (!source || !source.kind || source.kind === 'none') return null;
+  if (source.kind === 'library' || source.playlistId === 'library') return 'Вся медиатека';
+  if (source.kind === 'rotation') return 'Ротация';
+  if (source.kind === 'schedule') return source.name || source.label || 'Расписание';
+  if (source.kind === 'override') return source.name || source.label || 'Временное переключение';
+  return source.name || source.label || sourceKindLabel(source.kind);
+}
+
+const SOURCE_REASON_LABELS: Record<string, string> = {
+  selected_playlist: 'Выбранный плейлист',
+  system_playlist: 'Вся медиатека',
+  rotation: 'Ротация',
+  schedule: 'По расписанию',
+  schedule_rule: 'По расписанию',
+  override: 'Временное переключение',
+  default_playlist: 'Плейлист по умолчанию',
+  fallback_library: 'Вся медиатека',
+  library: 'Вся медиатека',
+};
+
+export function effectiveSourceWhy(
+  source: { kind?: string | null; name?: string | null; label?: string | null; reason?: string | null } | null | undefined,
+  mode: 'playlist' | 'auto' | null | undefined,
+): string | null {
+  if (!source || !source.kind || source.kind === 'none') return null;
+  if (source.reason) {
+    if (SOURCE_REASON_LABELS[source.reason]) return SOURCE_REASON_LABELS[source.reason];
+    if (!source.reason.includes('_')) return source.reason;
+  }
+  if (source.kind === 'schedule') return 'По расписанию';
+  if (source.kind === 'rotation') return 'Ротация';
+  if (source.kind === 'override') return 'Временное переключение';
+  if (source.kind === 'playlist') return mode === 'auto' ? 'Плейлист по умолчанию' : 'Выбранный плейлист';
+  if (source.kind === 'library') return mode === 'auto' ? 'Запасной источник' : 'Выбранный плейлист';
+  return null;
+}
+
 export function sourceDisplayName(source: { kind?: string | null; name?: string | null; playlistId?: string | null } | null | undefined): string | null {
   if (!source) return null;
   if (source.kind === 'none') return null;

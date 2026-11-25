@@ -51,7 +51,7 @@ def test_state_machine_mapping(env):
         )
         == "starting"
     )
-    assert compute_state(**{**base, "has_library": False}) == "no_music"
+    assert compute_state(**{**base, "has_library": False, "has_current": False}) == "no_music"
 
 
 def _sudo_calls(env):
@@ -96,8 +96,8 @@ def test_empty_library_starts_technical_silence(env, admin):
     assert response.status_code == 200
     body = response.json()
     assert body["desired"] == "playing"
-    assert body["state"] == "no_music"
-    assert body["reason"] == "library_empty"
+    assert body["state"] == "starting"
+    assert body["reason"] == "engine_starting"
     assert [call for call in _sudo_calls(env) if call[-2] == "start"]
 
     _upload(env, "late")
@@ -153,6 +153,8 @@ def test_auto_start_is_throttled(env, admin):
         conn = db.open_db(env.settings)
         try:
             db.set_setting(conn, "desired_state", value)
+            if value == "playing":
+                db.delete_setting(conn, "_stopping")
             conn.commit()
         finally:
             conn.close()
@@ -396,8 +398,8 @@ def test_admin_station_status_has_status_alias(env, admin):
     assert off["state"] == "off"
 
     env.client.post("/api/admin/station/start")
-    no_music = status()
-    assert no_music["state"] == "no_music"
+    starting = status()
+    assert starting["state"] == "starting"
 
     _upload(env, "status-on-air")
     env.icecast.payload = {

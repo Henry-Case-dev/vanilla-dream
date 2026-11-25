@@ -50,6 +50,7 @@ const tracks = Array.from({ length: 120 }, (_, index) => {
     ext: 'mp3',
     cover_url: index % 4 === 0 ? COVER : null,
     cover_kind: index % 4 === 0 ? 'file' : 'none',
+    original_cover_url: COVER,
     is_duplicate: index % 10 === 1,
     duplicate_kind: index % 10 === 1 ? 'tags' : null,
     duplicate_of: index % 10 === 1 ? 't1' : null,
@@ -67,7 +68,36 @@ const state = {
   desired: 'playing',
   status: 'on_air',
   reason: 'playing',
-  override: false,
+  mode: 'playlist',
+  selectedPlaylistId: 'p1',
+  effectivePlaylistId: 'p1',
+  programPlaylistId: 'p1',
+  pendingSource: null,
+  overrideInfo: null,
+  notice: null,
+  revision: 5,
+  appliedRevision: 5,
+  queueRevision: 3,
+  historyRevision: 2,
+  currentTrackId: 't1',
+  currentSource: {
+    kind: 'playlist',
+    playlist_id: 'p1',
+    name: 'Ночной сиреневый',
+    reason: 'selected_playlist',
+  },
+  startedAt: '2026-11-26T04:00:00+00:00',
+  queue: [
+    { id: 'pos-2', trackId: 't2', manual: false, prepared: true },
+    { id: 'pos-3', trackId: 't3', manual: false, prepared: true },
+    { id: 'pos-4', trackId: 't4', manual: false, prepared: false },
+    { id: 'pos-5', trackId: 't5', manual: false, prepared: false },
+  ],
+  delayMs: 0,
+  audioDelayMs: 0,
+  pendingSyncOnAdd: false,
+  rotationRepeat: false,
+  systemSettings: { shuffle: true, repeat_mode: 'all' },
   playlists: {
     p1: {
       id: 'p1',
@@ -91,6 +121,18 @@ const state = {
       membership: new Set(),
       updated_at: '2026-11-25T04:00:00+00:00',
     },
+    p3: {
+      id: 'p3',
+      name: 'Ротация вечера',
+      description: 'Плейлист под управлением ротации',
+      shuffle: false,
+      repeat_mode: 'all',
+      repeat_governed_by: 'rotation',
+      cover_kind: 'auto',
+      cover_url: `${COVER}?v=1764000000`,
+      membership: new Set(['t4', 't6']),
+      updated_at: '2026-11-25T04:00:00+00:00',
+    },
   },
   settings: {
     station_name: 'Vanilla Dream Radio',
@@ -111,6 +153,65 @@ const state = {
 };
 
 const byId = new Map(tracks.map((track) => [track.id, track]));
+
+const initialTracks = JSON.stringify(tracks);
+const initialPlaylists = JSON.stringify(
+  Object.fromEntries(
+    Object.entries(state.playlists).map(([id, playlist]) => [
+      id,
+      { ...playlist, membership: [...playlist.membership] },
+    ]),
+  ),
+);
+
+function resetMock() {
+  tracks.splice(0, tracks.length, ...JSON.parse(initialTracks));
+  byId.clear();
+  tracks.forEach((track) => byId.set(track.id, track));
+  const playlists = JSON.parse(initialPlaylists);
+  state.playlists = Object.fromEntries(
+    Object.entries(playlists).map(([id, playlist]) => [
+      id,
+      { ...playlist, membership: new Set(playlist.membership) },
+    ]),
+  );
+  state.desired = 'playing';
+  state.status = 'on_air';
+  state.reason = 'playing';
+  state.mode = 'playlist';
+  state.selectedPlaylistId = 'p1';
+  state.effectivePlaylistId = 'p1';
+  state.programPlaylistId = 'p1';
+  state.pendingSource = null;
+  state.overrideInfo = null;
+  state.notice = null;
+  state.revision = 5;
+  state.appliedRevision = 5;
+  state.queueRevision = 3;
+  state.historyRevision = 2;
+  state.currentTrackId = 't1';
+  state.currentSource = {
+    kind: 'playlist',
+    playlist_id: 'p1',
+    name: 'Ночной сиреневый',
+    reason: 'selected_playlist',
+  };
+  state.startedAt = '2026-11-26T04:00:00+00:00';
+  state.queue = [
+    { id: 'pos-2', trackId: 't2', manual: false, prepared: true },
+    { id: 'pos-3', trackId: 't3', manual: false, prepared: true },
+    { id: 'pos-4', trackId: 't4', manual: false, prepared: false },
+    { id: 'pos-5', trackId: 't5', manual: false, prepared: false },
+  ];
+  state.delayMs = 0;
+  state.audioDelayMs = 0;
+  state.pendingSyncOnAdd = false;
+  state.rotationRepeat = false;
+  state.systemSettings = { shuffle: true, repeat_mode: 'all' };
+  stateMedia.batches.clear();
+  stateMedia.exports.clear();
+  stateMedia.seq = 0;
+}
 
 const stateMedia = {
   batches: new Map(),
@@ -190,7 +291,7 @@ function readRaw(req) {
 function multipartField(buffer, name) {
   const text = buffer.toString('latin1');
   const match = text.match(new RegExp(`name="${name}"\\r?\\n\\r?\\n([^\\r]*)`));
-  return match ? match[1] : '';
+  return match ? Buffer.from(match[1], 'latin1').toString('utf8') : '';
 }
 
 function multipartFilename(buffer) {
@@ -220,6 +321,16 @@ function playlistTracks(id) {
   return [...playlist.membership].map((trackId) => byId.get(trackId)).filter(Boolean);
 }
 
+function userPlaylistCount(trackId) {
+  return Object.values(state.playlists).filter((playlist) =>
+    playlist.membership.has(trackId),
+  ).length;
+}
+
+function trackWithCounts(track) {
+  return { ...track, playlists_count: userPlaylistCount(track.id) };
+}
+
 function playlistPayload(id) {
   if (id === 'library') {
     const list = tracks;
@@ -228,8 +339,13 @@ function playlistPayload(id) {
       name: 'Вся медиатека',
       description: 'Все треки медиатеки. Обновляется автоматически.',
       system: true,
-      shuffle: true,
-      repeat_mode: 'all',
+      shuffle: state.systemSettings.shuffle,
+      repeat_mode: state.systemSettings.repeat_mode,
+      repeat_governed_by: state.rotationRepeat
+        ? 'rotation'
+        : state.programPlaylistId === 'library'
+          ? 'playlist'
+          : null,
       cover_url: `${COVER}?v=1764000000`,
       cover_kind: 'auto',
       track_count: list.length,
@@ -252,6 +368,12 @@ function playlistPayload(id) {
     cover_kind: playlist.cover_kind,
     track_count: list.length,
     duration: list.reduce((sum, track) => sum + track.duration, 0),
+    repeat_governed_by:
+      state.rotationRepeat || playlist.repeat_governed_by === 'rotation'
+        ? 'rotation'
+        : state.programPlaylistId === id
+          ? 'playlist'
+          : null,
     created_at: '2026-11-01T00:00:00+00:00',
     updated_at: playlist.updated_at,
     pending_delete_count: 0,
@@ -259,7 +381,7 @@ function playlistPayload(id) {
 }
 
 function detailPayload(id) {
-  const list = playlistTracks(id);
+  const list = playlistTracks(id).map(trackWithCounts);
   return {
     playlist: {
       ...playlistPayload(id),
@@ -269,20 +391,105 @@ function detailPayload(id) {
   };
 }
 
-function sourcePayload() {
-  if (state.override) {
+function playlistRecord(id) {
+  if (id === 'library') {
     return {
-      kind: 'override',
-      label: 'Ручной выбор',
-      playlist_id: 'p1',
-      name: state.playlists.p1.name,
+      id: 'library',
+      name: 'Вся медиатека',
+      shuffle: state.systemSettings.shuffle,
+      repeat_mode: state.systemSettings.repeat_mode,
     };
   }
+  return state.playlists[id] ?? null;
+}
+
+function programPlaylist() {
+  return playlistRecord(state.programPlaylistId);
+}
+
+function effectivePlaylist() {
+  return playlistRecord(state.effectivePlaylistId);
+}
+
+function effectiveSourcePayload() {
+  if (state.overrideInfo) {
+    return {
+      kind: 'override',
+      playlist_id: state.overrideInfo.playlist_id,
+      name: state.overrideInfo.name,
+      reason: 'override',
+    };
+  }
+  if (state.mode === 'auto') {
+    return {
+      kind: 'rotation',
+      playlist_id: state.programPlaylistId,
+      name: 'Ротация',
+      reason: 'rotation',
+    };
+  }
+  const playlist = effectivePlaylist();
+  if (!playlist) return { kind: 'none', playlist_id: null, name: null, reason: null };
+  const isLibrary = playlist.id === 'library';
   return {
-    kind: 'library',
-    label: 'Вся медиатека',
-    playlist_id: 'library',
-    name: 'Вся медиатека',
+    kind: isLibrary ? 'library' : 'playlist',
+    playlist_id: playlist.id,
+    name: playlist.name,
+    reason: isLibrary ? 'system_playlist' : 'selected_playlist',
+  };
+}
+
+function manualSourcePayload() {
+  return {
+    kind: 'manual',
+    label: 'Ручная вставка',
+    playlist_id: null,
+    name: 'Ручная вставка',
+    reason: 'manual',
+  };
+}
+
+function repeatGovernedBy() {
+  if (state.rotationRepeat) return 'rotation';
+  const playlist = programPlaylist();
+  if (!playlist) return null;
+  if (playlist.repeat_governed_by === 'rotation') return 'rotation';
+  return 'playlist';
+}
+
+function overridePayload() {
+  if (!state.overrideInfo) return null;
+  return {
+    id: state.overrideInfo.id ?? 'ov-1',
+    kind: 'playlist',
+    playlist_id: state.overrideInfo.playlist_id,
+    playlist_name: state.overrideInfo.name,
+    scope: state.overrideInfo.scope ?? 'until_schedule_change',
+    expires_at: state.overrideInfo.until,
+    active: true,
+    created_at: state.overrideInfo.requested_at,
+    note: state.overrideInfo.note ?? null,
+  };
+}
+
+function stationStatePayload() {
+  const status = state.desired === 'playing' ? state.status : 'off';
+  return {
+    mode: state.mode,
+    selected_playlist_id: state.selectedPlaylistId,
+    program_playlist_id: state.programPlaylistId,
+    effective_source: effectiveSourcePayload(),
+    pending_source: state.pendingSource,
+    override: overridePayload(),
+    desired: state.desired,
+    status,
+    reason: state.desired === 'playing' ? state.reason : 'stopped_by_owner',
+    repeat_governed_by: repeatGovernedBy(),
+    engine_instance: 'mock-engine-1',
+    state_revision: state.revision,
+    applied_revision: state.appliedRevision,
+    notice: state.notice ?? null,
+    diagnostic_reason: null,
   };
 }
 
@@ -290,9 +497,11 @@ function nowPlaying(req) {
   const stoppedHeader = req.headers['x-mock-stopped'] === '1';
   const desired = stoppedHeader ? 'stopped' : state.desired;
   const playing = desired === 'playing';
-  const current = playing ? byId.get('t1') : null;
+  const current = playing ? byId.get(state.currentTrackId) ?? byId.get('t1') : null;
   const status = stoppedHeader ? 'off' : playing ? (state.status === 'on_air' ? 'on_air' : state.status) : 'off';
   const reason = stoppedHeader ? 'stopped_by_owner' : playing ? state.reason : 'stopped_by_owner';
+  const effective = effectiveSourcePayload();
+  const nextTrack = state.queue[0] ? byId.get(state.queue[0].trackId) : null;
   return {
     station: {
       name: state.settings.station_name,
@@ -306,6 +515,15 @@ function nowPlaying(req) {
       pls_url: `${BASE}/radio.pls`,
       base_url: BASE,
       bitrate: state.settings.bitrate,
+      mode: state.mode,
+      program_playlist_id: state.programPlaylistId,
+      effective_source: effective,
+      pending_source: state.pendingSource,
+      override: overridePayload(),
+      repeat_governed_by: repeatGovernedBy(),
+      state_revision: state.revision,
+      notice: state.notice ?? null,
+      diagnostic_reason: null,
     },
     track: current
       ? {
@@ -317,18 +535,22 @@ function nowPlaying(req) {
           year: current.year,
           cover_url: current.cover_url,
           duration: current.duration,
-          started_at: nowIso(-96000),
+          started_at: state.startedAt,
           elapsed: 96,
           progress: 96 / current.duration,
         }
       : null,
-    source: playing ? sourcePayload() : { kind: 'none', label: 'Тишина', playlist_id: null, name: null },
+    source: playing
+      ? state.currentSource ?? effective
+      : { kind: 'none', label: 'Тишина', playlist_id: null, name: null },
     listeners: { available: true, count: 3 },
-    next_track: playing
-      ? { id: 't2', title: byId.get('t2').title, artist: byId.get('t2').artist, duration: byId.get('t2').duration }
+    next_track: playing && nextTrack
+      ? { id: nextTrack.id, title: nextTrack.title, artist: nextTrack.artist, duration: nextTrack.duration }
       : null,
     next_schedule_change: { at: nowIso(2 * 3600 * 1000), rule_name: 'Ночной эфир' },
     stats_available: true,
+    queue_revision: state.queueRevision,
+    history_revision: state.historyRevision,
   };
 }
 
@@ -440,22 +662,35 @@ function queuePayload() {
     current: {
       id: 'pos-current',
       position_id: 'pos-current',
-      track: byId.get('t1'),
-      source: sourcePayload(),
-      started_at: nowIso(-96000),
+      position: -1,
+      track: byId.get(state.currentTrackId) ?? byId.get('t1'),
+      source: effectiveSourcePayload(),
+      started_at: state.startedAt,
       elapsed: 96,
     },
-    items: ['t2', 't3', 't4', 't5'].map((trackId, index) => ({
-      id: `pos-${index + 2}`,
-      position_id: `pos-${index + 2}`,
+    items: state.queue.map((item, index) => ({
+      id: item.id,
+      position_id: item.id,
       position: index,
-      track: byId.get(trackId),
-      source: sourcePayload(),
-      prepared: index < 2,
-      manual: false,
+      track: byId.get(item.trackId),
+      source: item.manual
+        ? { kind: 'manual', label: 'Ручная вставка', name: 'Ручная вставка' }
+        : effectiveSourcePayload(),
+      prepared: Boolean(item.prepared),
+      manual: Boolean(item.manual),
       estimated_start: nowIso(96000 + index * 200000),
     })),
     depth: 6,
+    state_revision: state.revision,
+  };
+}
+
+function queueResult(extra = {}) {
+  return {
+    ...queuePayload(),
+    engine_synced: true,
+    applied_revision: state.appliedRevision,
+    ...extra,
   };
 }
 
@@ -492,9 +727,101 @@ const server = http.createServer(async (req, res) => {
   const route = url.pathname;
 
   if (route === '/api/health') return json(res, 200, { ok: true });
+  if (route === '/api/mock/reset') {
+    resetMock();
+    return json(res, 200, { ok: true });
+  }
   if (route === '/api/mock/override') {
-    state.override = url.searchParams.get('on') === '1';
-    return json(res, 200, { override: state.override });
+    if (url.searchParams.get('on') === '1') {
+      const playlistId = url.searchParams.get('playlist') || 'p2';
+      const playlist = state.playlists[playlistId];
+      state.overrideInfo = {
+        playlist_id: playlistId,
+        name: playlist?.name ?? 'Временный плейлист',
+        requested_at: nowIso(),
+        until: nowIso(3600 * 1000),
+      };
+      state.revision += 1;
+    } else {
+      state.overrideInfo = null;
+      state.revision += 1;
+    }
+    return json(res, 200, { override: overridePayload() });
+  }
+  if (route === '/api/mock/station') {
+    const desired = url.searchParams.get('desired');
+    if (desired === 'playing' || desired === 'stopped') {
+      state.desired = desired;
+      state.reason = desired === 'playing' ? 'playing' : 'stopped_by_owner';
+      state.revision += 1;
+    }
+    return json(res, 200, { state: stationStatePayload() });
+  }
+  if (route === '/api/mock/program') {
+    const playlistId = url.searchParams.get('playlist') || 'p1';
+    const mode = url.searchParams.get('mode') === 'auto' ? 'auto' : 'playlist';
+    state.mode = mode;
+    state.selectedPlaylistId = playlistId;
+    state.effectivePlaylistId = playlistId;
+    state.programPlaylistId = playlistId;
+    state.pendingSource = null;
+    state.revision += 1;
+    return json(res, 200, { state: stationStatePayload() });
+  }
+  if (route === '/api/mock/rotation-repeat') {
+    state.rotationRepeat = url.searchParams.get('on') === '1';
+    state.revision += 1;
+    return json(res, 200, { rotation: state.rotationRepeat });
+  }
+  if (route === '/api/mock/delay') {
+    state.delayMs = Math.max(0, Number(url.searchParams.get('ms') || 0));
+    return json(res, 200, { delay: state.delayMs });
+  }
+  if (route === '/api/mock/audio-delay') {
+    state.audioDelayMs = Math.max(0, Number(url.searchParams.get('ms') || 0));
+    return json(res, 200, { delay: state.audioDelayMs });
+  }
+  if (route === '/api/mock/sync-pending') {
+    state.pendingSyncOnAdd = url.searchParams.get('on') === '1';
+    return json(res, 200, { pending: state.pendingSyncOnAdd });
+  }
+  if (route === '/api/mock/sync-complete') {
+    state.pendingSyncOnAdd = false;
+    state.appliedRevision = state.revision;
+    state.queueRevision += 1;
+    return json(res, 200, { state: stationStatePayload() });
+  }
+  if (route === '/api/mock/advance') {
+    const next = state.queue.shift();
+    if (next) {
+      state.currentTrackId = next.trackId;
+      state.startedAt = nowIso();
+      if (state.pendingSource) {
+        state.mode = state.pendingSource.mode;
+        state.selectedPlaylistId = state.pendingSource.playlist_id;
+        state.effectivePlaylistId = state.pendingSource.playlist_id;
+        state.programPlaylistId = state.pendingSource.playlist_id;
+        state.pendingSource = null;
+      }
+      state.currentSource = next.manual ? manualSourcePayload() : effectiveSourcePayload();
+      state.queueRevision += 1;
+      state.historyRevision += 1;
+      state.revision += 1;
+      state.appliedRevision = state.revision;
+    }
+    return json(res, 200, { ok: true, state: stationStatePayload() });
+  }
+  if (route === '/api/mock/queue') {
+    state.queue = (url.searchParams.get('ids') || 't2,t3,t4,t5')
+      .split(',')
+      .map((trackId, index) => ({
+        id: `pos-${index + 2}`,
+        trackId,
+        manual: false,
+        prepared: index < 2,
+      }));
+    state.queueRevision += 1;
+    return json(res, 200, { queue: queuePayload() });
   }
   if (route === '/mock-cover.svg') {
     res.writeHead(200, { 'Content-Type': 'image/svg+xml' });
@@ -543,10 +870,12 @@ const server = http.createServer(async (req, res) => {
       const limit = Number(url.searchParams.get('limit') || 50);
       const offset = Number(url.searchParams.get('offset') || 0);
       const filtered = tracks.filter(
-        (track) => !q || `${track.title} ${track.artist} ${track.album}`.toLowerCase().includes(q),
+        (track) =>
+          !track.pending_delete &&
+          (!q || `${track.title} ${track.artist} ${track.album}`.toLowerCase().includes(q)),
       );
       return json(res, 200, {
-        items: filtered.slice(offset, offset + limit),
+        items: filtered.slice(offset, offset + limit).map(trackWithCounts),
         total: filtered.length,
         library: { count: tracks.length, bytes: 74040000 },
       });
@@ -659,6 +988,12 @@ const server = http.createServer(async (req, res) => {
       };
       tracks.unshift(track);
       byId.set(id, track);
+      state.revision += 1;
+      if (state.programPlaylistId === 'library' && state.desired === 'playing') {
+        state.appliedRevision = state.pendingSyncOnAdd ? state.revision - 1 : state.revision;
+        state.queueRevision += 1;
+        state.queue.push({ id: nextId('pos'), trackId: id, manual: false, prepared: false });
+      }
       batch.items.push({
         id: nextId('u'),
         filename,
@@ -670,7 +1005,23 @@ const server = http.createServer(async (req, res) => {
         decision: null,
         error: null,
       });
-      return json(res, 201, { status: 'added', track, batch_id: batch.id });
+      const activeLibrary =
+        state.programPlaylistId === 'library' && state.desired === 'playing';
+      const application = activeLibrary
+        ? state.pendingSyncOnAdd
+          ? 'pending'
+          : 'applied'
+        : 'saved';
+      return json(res, 201, {
+        status: 'added',
+        track,
+        batch_id: batch.id,
+        application,
+        in_current_cycle: activeLibrary,
+        engine_synced: application === 'applied',
+        state_revision: state.revision,
+        applied_revision: state.appliedRevision,
+      });
     }
 
     const batchMatch = route.match(/^\/api\/admin\/uploads\/([^/]+)$/);
@@ -712,6 +1063,12 @@ const server = http.createServer(async (req, res) => {
         };
         tracks.unshift(track);
         byId.set(id, track);
+        if (state.programPlaylistId === 'library') {
+          state.revision += 1;
+          state.appliedRevision = state.revision;
+          state.queueRevision += 1;
+          state.queue.push({ id: nextId('pos'), trackId: id, manual: false, prepared: false });
+        }
       }
     }
 
@@ -795,11 +1152,154 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { track });
     }
 
-    if (/^\/api\/admin\/tracks\/[^/]+$/.test(route) && req.method === 'PATCH') {
+    const playNowMatch = route.match(/^\/api\/admin\/tracks\/([^/]+)\/play-now$/);
+    if (playNowMatch && req.method === 'POST') {
+      const id = decodeURIComponent(playNowMatch[1]);
+      if (byId.has(id)) {
+        if (state.currentTrackId) {
+          state.queue.unshift({
+            id: nextId('pos'),
+            trackId: state.currentTrackId,
+            manual: false,
+            prepared: false,
+          });
+        }
+        state.currentTrackId = id;
+        state.currentSource = manualSourcePayload();
+        state.startedAt = nowIso();
+        state.queue = state.queue.filter((item) => item.trackId !== id);
+        state.queueRevision += 1;
+        state.historyRevision += 1;
+        state.revision += 1;
+        state.appliedRevision = state.revision;
+      }
+      return json(res, 200, queueResult());
+    }
+    const playNextMatch = route.match(/^\/api\/admin\/tracks\/([^/]+)\/play-next$/);
+    if (playNextMatch && req.method === 'POST') {
+      const id = decodeURIComponent(playNextMatch[1]);
+      if (byId.has(id)) {
+        state.queue = state.queue.filter((item) => item.trackId !== id);
+        state.queue.unshift({ id: nextId('pos'), trackId: id, manual: true, prepared: false });
+        state.queueRevision += 1;
+        state.revision += 1;
+        state.appliedRevision = state.revision;
+      }
+      return json(res, 200, queueResult());
+    }
+    const enqueueMatch = route.match(/^\/api\/admin\/tracks\/([^/]+)\/queue$/);
+    if (enqueueMatch && req.method === 'POST') {
+      const id = decodeURIComponent(enqueueMatch[1]);
+      if (byId.has(id) && !state.queue.some((item) => item.trackId === id)) {
+        state.queue.push({ id: nextId('pos'), trackId: id, manual: true, prepared: false });
+        state.queueRevision += 1;
+        state.revision += 1;
+        state.appliedRevision = state.revision;
+      }
+      return json(res, 200, queueResult());
+    }
+    if (route === '/api/admin/tracks/bulk-delete' && req.method === 'POST') {
       const body = await readBody(req);
+      const mode = body.mode === 'now' ? 'now' : 'after';
+      const marked = [];
+      const notFound = [];
+      const currentIds = (body.ids || []).includes(state.currentTrackId)
+        ? [state.currentTrackId]
+        : [];
+      const current = currentIds.length > 0;
+      for (const id of body.ids || []) {
+        const track = byId.get(id);
+        if (!track) {
+          notFound.push(id);
+          continue;
+        }
+        track.pending_delete = true;
+        marked.push(id);
+        state.queue = state.queue.filter((item) => item.trackId !== id);
+      }
+      let skipped = false;
+      if (mode === 'now' && current) {
+        const next = state.queue.shift();
+        if (next) {
+          state.currentTrackId = next.trackId;
+          state.currentSource = next.manual ? manualSourcePayload() : effectiveSourcePayload();
+        }
+        skipped = true;
+      }
+      state.queueRevision += 1;
+      state.revision += 1;
+      state.appliedRevision = state.revision;
+      return json(res, 200, {
+        marked,
+        deleted: marked,
+        purged: [],
+        pending: marked,
+        not_found: notFound,
+        current: currentIds,
+        mode,
+        skipped,
+      });
+    }
+    if (/^\/api\/admin\/tracks\/[^/]+$/.test(route) && (req.method === 'PUT' || req.method === 'PATCH')) {
+      let patch;
       const track = byId.get(route.split('/').pop());
-      if (track) Object.assign(track, body);
+      if (req.method === 'PUT') {
+        const buffer = await readRaw(req);
+        patch = {
+          title: multipartField(buffer, 'title') || track?.title,
+          artist: multipartField(buffer, 'artist') || null,
+          album: multipartField(buffer, 'album') || null,
+          cover_action: multipartField(buffer, 'cover_action') || 'keep',
+        };
+        if (patch.cover_action === 'replace') {
+          track.cover_kind = 'custom';
+          track.cover_url = `${COVER}?v=${Date.now()}`;
+          track.can_revert_cover = true;
+        } else if (patch.cover_action === 'revert') {
+          track.cover_kind = 'file';
+          track.cover_url = track.original_cover_url ?? COVER;
+          track.can_revert_cover = false;
+        }
+        delete patch.cover_action;
+      } else {
+        patch = await readBody(req);
+      }
+      if (track) {
+        Object.assign(track, patch);
+        track.updated_at = nowIso();
+      }
       return json(res, 200, { track });
+    }
+    if (/^\/api\/admin\/tracks\/[^/]+$/.test(route) && req.method === 'DELETE') {
+      const body = await readBody(req);
+      const mode = body.mode === 'now' ? 'now' : 'after';
+      const id = route.split('/').pop();
+      const track = byId.get(id);
+      if (!track) return json(res, 404, { detail: { code: 'track_not_found', message: 'Трек не найден' } });
+      track.pending_delete = true;
+      for (const playlist of Object.values(state.playlists)) {
+        playlist.membership.delete(id);
+      }
+      state.queue = state.queue.filter((item) => item.trackId !== id);
+      if (mode === 'now' && state.currentTrackId === id) {
+        const next = state.queue.shift();
+        if (next) {
+          state.currentTrackId = next.trackId;
+          state.currentSource = next.manual ? manualSourcePayload() : effectiveSourcePayload();
+          state.startedAt = nowIso();
+        }
+      }
+      state.queueRevision += 1;
+      state.revision += 1;
+      state.appliedRevision = state.revision;
+      return json(res, 200, {
+        deleted: true,
+        pending: mode === 'after',
+        playlists_count: 1,
+        mode,
+        current: state.currentTrackId === id,
+        skipped: mode === 'now' && state.currentTrackId !== id,
+      });
     }
     if (/^\/api\/admin\/tracks\/[^/]+\/stream$/.test(route)) {
       res.writeHead(204);
@@ -833,15 +1333,54 @@ const server = http.createServer(async (req, res) => {
     if (playlistMatch && req.method === 'PATCH') {
       const id = decodeURIComponent(playlistMatch[1]);
       const body = await readBody(req);
+      if (state.delayMs > 0) await new Promise((resolve) => setTimeout(resolve, state.delayMs));
+      const providedRevision = body.state_revision === undefined ? null : Number(body.state_revision);
+      if (providedRevision !== null && providedRevision < state.revision) {
+        return json(res, 409, {
+          detail: { code: 'stale_state', message: 'Состояние изменилось. Обновите страницу.' },
+        });
+      }
       const playlist = state.playlists[id];
-      if (playlist) {
+      let changed = false;
+      if (id === 'library') {
+        if (typeof body.shuffle === 'boolean') {
+          changed = changed || body.shuffle !== state.systemSettings.shuffle;
+          state.systemSettings.shuffle = body.shuffle;
+        }
+        if (typeof body.repeat_mode === 'string') {
+          changed = changed || body.repeat_mode !== state.systemSettings.repeat_mode;
+          state.systemSettings.repeat_mode = body.repeat_mode;
+        }
+      } else if (playlist) {
         if (typeof body.name === 'string') playlist.name = body.name;
         if ('description' in body) playlist.description = body.description ?? '';
-        if (typeof body.shuffle === 'boolean') playlist.shuffle = body.shuffle;
-        if (typeof body.repeat_mode === 'string') playlist.repeat_mode = body.repeat_mode;
+        if (typeof body.shuffle === 'boolean') {
+          changed = changed || body.shuffle !== playlist.shuffle;
+          playlist.shuffle = body.shuffle;
+        }
+        if (typeof body.repeat_mode === 'string') {
+          changed = changed || body.repeat_mode !== playlist.repeat_mode;
+          playlist.repeat_mode = body.repeat_mode;
+        }
         playlist.updated_at = nowIso();
       }
-      return json(res, 200, { playlist: playlistPayload(id) });
+      const isActive = state.programPlaylistId === id && state.desired === 'playing';
+      let application = 'saved';
+      if (changed) {
+        state.revision += 1;
+        if (isActive) {
+          application = state.pendingSyncOnAdd ? 'pending' : 'applied';
+          state.appliedRevision = application === 'applied' ? state.revision : state.appliedRevision;
+          state.queueRevision += 1;
+        }
+      }
+      return json(res, 200, {
+        playlist: playlistPayload(id),
+        application,
+        engine_synced: application === 'applied',
+        state_revision: state.revision,
+        applied_revision: state.appliedRevision,
+      });
     }
     if (playlistMatch && req.method === 'DELETE') {
       delete state.playlists[decodeURIComponent(playlistMatch[1])];
@@ -869,7 +1408,43 @@ const server = http.createServer(async (req, res) => {
         }
       }
       playlist.updated_at = nowIso();
-      return json(res, 200, { added, skipped, unavailable, playlist: playlistPayload(id) });
+      const isActive = state.programPlaylistId === id && state.desired === 'playing';
+      let application = 'saved';
+      if (added > 0) {
+        state.revision += 1;
+        application = isActive
+          ? state.pendingSyncOnAdd
+            ? 'pending'
+            : 'applied'
+          : 'saved';
+        if (isActive) {
+          state.appliedRevision =
+            application === 'applied' ? state.revision : state.appliedRevision;
+          state.queueRevision += 1;
+          for (const trackId of new Set(body.track_ids || [])) {
+            if (byId.has(trackId) && !state.queue.some((item) => item.trackId === trackId)) {
+              state.queue.push({
+                id: nextId('pos'),
+                trackId,
+                manual: false,
+                prepared: false,
+              });
+            }
+          }
+        }
+      }
+      return json(res, 200, {
+        added,
+        skipped,
+        unavailable,
+        application,
+        in_current_cycle: isActive && added > 0,
+        engine_synced: application === 'applied',
+        state_revision: state.revision,
+        applied_revision: state.appliedRevision,
+        queue_changed: added > 0 && isActive,
+        playlist: playlistPayload(id),
+      });
     }
     const removeMatch = route.match(/^\/api\/admin\/playlists\/([^/]+)\/tracks\/([^/]+)$/);
     if (removeMatch && req.method === 'DELETE') {
@@ -887,14 +1462,92 @@ const server = http.createServer(async (req, res) => {
     }
     const playMatch = route.match(/^\/api\/admin\/playlists\/([^/]+)\/play$/);
     if (playMatch && req.method === 'POST') {
+      const playlistId = decodeURIComponent(playMatch[1]);
+      const body = await readBody(req);
+      const mode = body.mode === 'next' ? 'next' : 'now';
+      const restart = Boolean(body.restart);
+      if (
+        state.mode === 'playlist' &&
+        state.effectivePlaylistId === playlistId &&
+        state.selectedPlaylistId === playlistId &&
+        !restart &&
+        !state.pendingSource &&
+        mode === 'now' &&
+        state.desired === 'playing'
+      ) {
+        return json(res, 200, {
+          status: 'already_active',
+          started: false,
+          engine_synced: true,
+          station: stationStatePayload(),
+          playlist: playlistPayload(playlistId),
+          state_revision: state.revision,
+          applied_revision: state.appliedRevision,
+        });
+      }
+      const wasStopped = state.desired === 'stopped';
       state.desired = 'playing';
-      state.status = 'on_air';
-      state.reason = 'playing';
-      state.override = true;
+      state.mode = 'playlist';
+      state.selectedPlaylistId = playlistId;
+      state.overrideInfo = null;
+      state.revision += 1;
+      if (mode === 'next') {
+        state.pendingSource = {
+          playlist_id: playlistId,
+          mode: 'playlist',
+          requested_at: nowIso(),
+        };
+      } else {
+        state.pendingSource = null;
+        state.effectivePlaylistId = playlistId;
+        state.programPlaylistId = playlistId;
+        state.status = 'starting';
+        state.reason = 'engine_starting';
+        state.appliedRevision = state.revision;
+        state.queueRevision += 1;
+        setTimeout(() => {
+          state.status = 'on_air';
+          state.reason = 'playing';
+          const first = playlistTracks(playlistId)[0];
+          if (first) state.currentTrackId = first.id;
+          state.currentSource = effectiveSourcePayload();
+          state.startedAt = nowIso();
+          state.revision += 1;
+          state.historyRevision += 1;
+        }, 700);
+      }
       return json(res, 200, {
-        started: true,
-        station: nowPlaying(req).station,
-        playlist: playlistPayload(decodeURIComponent(playMatch[1])),
+        started: wasStopped,
+        status: 'switching',
+        engine_synced: true,
+        station: stationStatePayload(),
+        playlist: playlistPayload(playlistId),
+        state_revision: state.revision,
+        applied_revision: state.appliedRevision,
+      });
+    }
+
+    const restartMatch = route.match(/^\/api\/admin\/playlists\/([^/]+)\/restart$/);
+    if (restartMatch && req.method === 'POST') {
+      const playlistId = decodeURIComponent(restartMatch[1]);
+      state.mode = 'playlist';
+      state.selectedPlaylistId = playlistId;
+      state.effectivePlaylistId = playlistId;
+      state.programPlaylistId = playlistId;
+      state.pendingSource = null;
+      state.overrideInfo = null;
+      state.revision += 1;
+      state.appliedRevision = state.revision;
+      state.queueRevision += 1;
+      state.startedAt = nowIso();
+      return json(res, 200, {
+        status: 'switching',
+        started: false,
+        engine_synced: true,
+        station: stationStatePayload(),
+        playlist: playlistPayload(playlistId),
+        state_revision: state.revision,
+        applied_revision: state.appliedRevision,
       });
     }
     const coverMatch = route.match(/^\/api\/admin\/playlists\/([^/]+)\/cover$/);
@@ -921,7 +1574,64 @@ const server = http.createServer(async (req, res) => {
     const rotationMatch = route.match(/^\/api\/admin\/playlists\/([^/]+)\/rotation$/);
     if (rotationMatch && req.method === 'POST') return json(res, 200, { ok: true });
 
-    if (route === '/api/admin/queue') return json(res, 200, queuePayload());
+    if (route === '/api/admin/queue') return json(res, 200, queueResult());
+    if (route === '/api/admin/queue/shuffle' && req.method === 'POST') {
+      const manual = state.queue.filter((item) => item.manual);
+      const automatic = state.queue.filter((item) => !item.manual);
+      for (let index = automatic.length - 1; index > 0; index -= 1) {
+        const swap = Math.floor(Math.random() * (index + 1));
+        [automatic[index], automatic[swap]] = [automatic[swap], automatic[index]];
+      }
+      state.queue = [...automatic, ...manual];
+      state.queueRevision += 1;
+      state.revision += 1;
+      state.appliedRevision = state.revision;
+      return json(res, 200, queueResult({ shuffled: automatic.length }));
+    }
+    if (route === '/api/admin/queue/clear-manual' && req.method === 'POST') {
+      const removed = state.queue.filter((item) => item.manual).length;
+      state.queue = state.queue.filter((item) => !item.manual);
+      state.queueRevision += 1;
+      state.revision += 1;
+      state.appliedRevision = state.revision;
+      return json(res, 200, queueResult({ removed }));
+    }
+    const queueMoveMatch = route.match(/^\/api\/admin\/queue\/([^/]+)$/);
+    if (queueMoveMatch && req.method === 'PATCH') {
+      const body = await readBody(req);
+      const id = decodeURIComponent(queueMoveMatch[1]);
+      const from = state.queue.findIndex((item) => item.id === id);
+      const target = Number(body.move_to);
+      if (from >= 0 && Number.isInteger(target) && target >= 0) {
+        const [item] = state.queue.splice(from, 1);
+        state.queue.splice(Math.min(target, state.queue.length), 0, item);
+        state.queueRevision += 1;
+        state.revision += 1;
+        state.appliedRevision = state.revision;
+      }
+      return json(res, 200, queueResult());
+    }
+    if (queueMoveMatch && req.method === 'DELETE') {
+      const id = decodeURIComponent(queueMoveMatch[1]);
+      state.queue = state.queue.filter((item) => item.id !== id);
+      state.queueRevision += 1;
+      state.revision += 1;
+      state.appliedRevision = state.revision;
+      return json(res, 200, queueResult());
+    }
+    const queueNextMatch = route.match(/^\/api\/admin\/queue\/([^/]+)\/move-next$/);
+    if (queueNextMatch && req.method === 'POST') {
+      const id = decodeURIComponent(queueNextMatch[1]);
+      const from = state.queue.findIndex((item) => item.id === id);
+      if (from > 0) {
+        const [item] = state.queue.splice(from, 1);
+        state.queue.unshift(item);
+        state.queueRevision += 1;
+        state.revision += 1;
+        state.appliedRevision = state.revision;
+      }
+      return json(res, 200, queueResult());
+    }
     if (route === '/api/admin/history') return json(res, 200, historyPayload());
     if (route === '/api/admin/settings' && req.method === 'GET') {
       return json(res, 200, { ...state.settings, settings: state.settings, supported: { bitrates: [96, 112, 128, 160, 192, 224, 256, 320] } });
@@ -937,9 +1647,47 @@ const server = http.createServer(async (req, res) => {
     if (route === '/api/admin/services') return json(res, 200, servicesPayload());
     if (route === '/api/admin/links') return json(res, 200, linksPayload());
     if (route === '/api/admin/station/status') return json(res, 200, nowPlaying(req));
+    if (route === '/api/admin/station/state' && req.method === 'GET') {
+      return json(res, 200, stationStatePayload());
+    }
+    if (route === '/api/admin/station/mode' && req.method === 'PUT') {
+      const body = await readBody(req);
+      const mode = body.mode === 'auto' ? 'auto' : 'playlist';
+      state.mode = mode;
+      if (mode === 'playlist') {
+        const playlistId = body.playlist_id || state.selectedPlaylistId || 'library';
+        state.selectedPlaylistId = playlistId;
+        state.effectivePlaylistId = playlistId;
+        state.programPlaylistId = playlistId;
+      }
+      state.pendingSource = null;
+      state.revision += 1;
+      state.appliedRevision = state.revision;
+      state.queueRevision += 1;
+      const payload = stationStatePayload();
+      return json(res, 200, {
+        ...payload,
+        station: payload,
+        engine_synced: true,
+        applied_revision: state.appliedRevision,
+      });
+    }
+    if (route === '/api/admin/station/override' && req.method === 'POST') {
+      const body = await readBody(req);
+      const playlistId = body.playlist_id || 'p2';
+      state.overrideInfo = {
+        playlist_id: playlistId,
+        name: playlistRecord(playlistId)?.name ?? 'Временный плейлист',
+        requested_at: nowIso(),
+        until: body.scope === 'indefinite' ? null : nowIso(3600 * 1000),
+      };
+      state.revision += 1;
+      return json(res, 200, stationStatePayload());
+    }
     if (route === '/api/admin/station/override' && req.method === 'DELETE') {
-      state.override = false;
-      return json(res, 200, { ok: true });
+      state.overrideInfo = null;
+      state.revision += 1;
+      return json(res, 200, stationStatePayload());
     }
     const stationAction = route.match(/^\/api\/admin\/station\/(start|stop|restart|skip)$/);
     if (stationAction) {
@@ -948,6 +1696,11 @@ const server = http.createServer(async (req, res) => {
         state.desired = 'playing';
         state.status = 'starting';
         state.reason = 'engine_starting';
+        setTimeout(() => {
+          state.status = 'on_air';
+          state.reason = 'playing';
+          state.revision += 1;
+        }, 500);
       } else if (action === 'stop') {
         state.desired = 'stopped';
         state.status = 'off';
@@ -955,7 +1708,17 @@ const server = http.createServer(async (req, res) => {
       } else if (action === 'restart') {
         state.status = 'starting';
         state.reason = 'engine_starting';
+      } else if (action === 'skip') {
+        const next = state.queue.shift();
+        if (next) {
+          state.currentTrackId = next.trackId;
+          state.currentSource = next.manual ? manualSourcePayload() : effectiveSourcePayload();
+          state.startedAt = nowIso();
+          state.queueRevision += 1;
+          state.historyRevision += 1;
+        }
       }
+      state.revision += 1;
       return json(res, 200, { ok: true });
     }
     if (route === '/api/admin/schedule') {
@@ -1047,6 +1810,9 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (route === '/radio.mp3') {
+    if (state.audioDelayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, state.audioDelayMs));
+    }
     res.writeHead(200, { 'Content-Type': 'audio/mpeg' });
     return res.end();
   }

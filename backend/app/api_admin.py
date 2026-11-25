@@ -17,13 +17,14 @@ from starlette.background import BackgroundTask
 
 from . import db, exports, media, playlists, queue_engine, scheduler, uploads
 from .auth import get_conn, require_csrf, require_session
-from .config import SUPPORTED_BITRATES, Settings
+from .config import SUPPORTED_BITRATES, SYSTEM_PLAYLIST_ID, Settings
 from .models import (
     REPEAT_MODES,
     ROTATION_MODES,
     TRANSITIONS,
     hhmm_to_minutes,
     minutes_to_hhmm,
+    playlist_membership_counts,
     playlist_payload,
     schedule_rule_payload,
     source_payload,
@@ -54,6 +55,46 @@ def _sync(request: Request, conn) -> bool:
         now=request.app.state.clock.now(),
         sync_state=getattr(request.app.state, "sync_state", None),
     )
+
+
+def _queue_sync(request: Request, conn) -> bool:
+    if request.app.state.station.desired(conn) != "playing":
+        return False
+    if not _sync(request, conn):
+        raise ApiError(
+            502,
+            "engine_sync_failed",
+            "Движок не подтвердил изменение очереди. Повторите попытку.",
+        )
+    return True
+
+
+def _applied_revision(request: Request) -> int | None:
+    value = getattr(request.app.state, "sync_state", {}).get("applied_revision")
+    if value is None:
+        conn = db.open_db(request.app.state.settings)
+        try:
+            raw = db.get_setting(conn, "applied_revision", "0")
+            value = int(raw or 0)
+        except (TypeError, ValueError, sqlite3.Error):
+            value = None
+        finally:
+            conn.close()
+    return int(value) if value is not None else None
+
+
+def _library_membership_changed(request: Request, conn, now) -> str:
+    """Return applied/pending/saved for a library membership change."""
+
+    if request.app.state.station.desired(conn) != "playing":
+        return "saved"
+    if queue_engine.program_playlist_id(conn, now) != SYSTEM_PLAYLIST_ID:
+        return "saved"
+    queue_engine.ensure_queue(conn, request.app.state.settings, now)
+    conn.commit()
+    synced = _sync(request, conn)
+    request.app.state.scheduler.wake()
+    return "applied" if synced else "pending"
 
 
 ENGINE_SETTING_KEYS = ("station_name", "station_description", "station_genre", "bitrate")
@@ -128,8 +169,12 @@ def list_tracks(
         f"SELECT * FROM tracks {where} ORDER BY {column} {direction}, rowid ASC LIMIT ? OFFSET ?",
         (*params, limit, offset),
     ).fetchall()
+    counts = playlist_membership_counts(conn, [row["id"] for row in rows])
     return {
-        "items": [track_payload(row, settings) for row in rows],
+        "items": [
+            track_payload(row, settings, playlists_count=counts.get(str(row["id"]), 0))
+            for row in rows
+        ],
         "total": int(total or 0),
         "library": db.library_totals(conn),
     }
@@ -182,13 +227,24 @@ def upload_track(
         conn, settings, file.file, file.filename, _now(request), batch_id=batch_id
     )
     if result["status"] == "added":
-        queue_engine.ensure_queue(conn, settings, _now(request))
-        _sync(request, conn)
-        request.app.state.scheduler.wake()
+        now = _now(request)
+        queue_engine.bump_state_revision(conn)
+        conn.commit()
+        application = _library_membership_changed(request, conn, now)
+        synced = application == "applied"
+        active_library = bool(
+            request.app.state.station.desired(conn) == "playing"
+            and queue_engine.program_playlist_id(conn, now) == SYSTEM_PLAYLIST_ID
+        )
         payload = {
             "status": "added",
             "track": track_payload(result["track"], settings, include_source=True),
             "batch_id": result["batch_id"],
+            "application": application,
+            "in_current_cycle": active_library,
+            "engine_synced": synced,
+            "state_revision": queue_engine.state_revision(conn),
+            "applied_revision": _applied_revision(request),
         }
         return JSONResponse(payload, status_code=201)
     return JSONResponse(
@@ -264,9 +320,17 @@ def decide_upload_batch(
         _now(request),
     )
     if action == "save" and result.get("processed"):
-        queue_engine.ensure_queue(conn, _settings(request), _now(request))
-        _sync(request, conn)
-        request.app.state.scheduler.wake()
+        queue_engine.bump_state_revision(conn)
+        conn.commit()
+        application = _library_membership_changed(request, conn, _now(request))
+        result["application"] = application
+        result["engine_synced"] = application == "applied"
+        result["in_current_cycle"] = bool(
+            request.app.state.station.desired(conn) == "playing"
+            and queue_engine.program_playlist_id(conn, _now(request)) == SYSTEM_PLAYLIST_ID
+        )
+        result["state_revision"] = queue_engine.state_revision(conn)
+        result["applied_revision"] = _applied_revision(request)
     return result
 
 
@@ -291,9 +355,17 @@ def decide_upload(
     action = str((body or {}).get("action") or "")
     result = uploads.decide(conn, _settings(request), pending_id, action, _now(request))
     if action == "save":
-        queue_engine.ensure_queue(conn, _settings(request), _now(request))
-        _sync(request, conn)
-        request.app.state.scheduler.wake()
+        queue_engine.bump_state_revision(conn)
+        conn.commit()
+        application = _library_membership_changed(request, conn, _now(request))
+        result["application"] = application
+        result["engine_synced"] = application == "applied"
+        result["in_current_cycle"] = bool(
+            request.app.state.station.desired(conn) == "playing"
+            and queue_engine.program_playlist_id(conn, _now(request)) == SYSTEM_PLAYLIST_ID
+        )
+        result["state_revision"] = queue_engine.state_revision(conn)
+        result["applied_revision"] = _applied_revision(request)
     return result
 
 
@@ -309,19 +381,76 @@ def patch_track(
     return {"track": track_payload(row, _settings(request), include_source=True)}
 
 
+@router.put("/tracks/{track_id}")
+def put_track_atomic(
+    track_id: str,
+    request: Request,
+    title: str | None = Form(None),
+    artist: str | None = Form(None),
+    album: str | None = Form(None),
+    cover_action: str = Form("keep"),
+    cover: UploadFile | None = File(None),
+    conn: sqlite3.Connection = Depends(get_conn),
+    session: dict = Depends(require_csrf),
+):
+    fields: dict = {}
+    if title is not None:
+        fields["title"] = title
+    if artist is not None:
+        fields["artist"] = artist
+    if album is not None:
+        fields["album"] = album
+    cover_stream = cover.file if cover is not None else None
+    row = media.update_track_atomic(
+        conn,
+        _settings(request),
+        track_id,
+        fields,
+        cover_stream,
+        cover_action,
+        _now(request),
+    )
+    return {"track": track_payload(row, _settings(request), include_source=True)}
+
+
 @router.delete("/tracks/{track_id}")
 def delete_track(
     track_id: str,
     request: Request,
+    body: dict = Body(default={}),
     conn: sqlite3.Connection = Depends(get_conn),
     session: dict = Depends(require_csrf),
 ):
     settings = _settings(request)
-    result = media.delete_track(conn, settings, track_id, _now(request))
-    queue_engine.ensure_queue(conn, settings, _now(request))
-    _sync(request, conn)
+    mode = str((body or {}).get("mode") or "after")
+    if mode not in ("after", "now"):
+        raise ApiError(422, "invalid_delete_mode", "Режим удаления должен быть after или now.")
+    now = _now(request)
+    result = media.delete_track(conn, settings, track_id, now, mode=mode)
+    queue_engine.ensure_queue(conn, settings, now)
+    synced = _sync(request, conn)
+    playing = request.app.state.station.desired(conn) == "playing"
+    skipped = False
+    if result.get("current") and mode == "now" and playing:
+        if not synced:
+            raise ApiError(
+                502,
+                "engine_sync_failed",
+                "Не удалось подтвердить очередь перед удалением. Трек исключён и будет удалён позже.",
+            )
+        request.app.state.station.skip(conn)
+        skipped = True
+    purged = False
+    if not result.get("current") and (synced or not playing):
+        purged = media.purge_confirmed(conn, settings, track_id)
+        conn.commit()
     request.app.state.scheduler.wake()
-    return result
+    return {
+        **result,
+        "deleted": purged,
+        "pending": not purged,
+        "skipped": skipped,
+    }
 
 
 @router.post("/tracks/bulk-delete")
@@ -336,21 +465,45 @@ def bulk_delete(
         raise ApiError(422, "invalid_ids", "Передайте список треков для удаления.")
     if len(ids) > 500:
         raise ApiError(422, "too_many_ids", "За один раз можно удалить не более 500 треков.")
+    mode = str((body or {}).get("mode") or "after")
+    if mode not in ("after", "now"):
+        raise ApiError(422, "invalid_delete_mode", "Режим удаления должен быть after или now.")
     settings = _settings(request)
     now = _now(request)
-    deleted, pending, not_found = [], [], []
-    for raw in ids:
-        track_id = str(raw or "")
-        row = conn.execute("SELECT id FROM tracks WHERE id = ?", (track_id,)).fetchone()
-        if row is None:
-            not_found.append(track_id)
-            continue
-        result = media.delete_track(conn, settings, track_id, now)
-        (pending if result["pending"] else deleted).append(track_id)
+    result = media.bulk_delete(conn, settings, [str(raw or "") for raw in ids], now)
     queue_engine.ensure_queue(conn, settings, now)
-    _sync(request, conn)
+    synced = _sync(request, conn)
+    playing = request.app.state.station.desired(conn) == "playing"
+    skipped = False
+    if result["current"] and mode == "now" and playing:
+        if not synced:
+            raise ApiError(
+                502,
+                "engine_sync_failed",
+                "Не удалось подтвердить очередь перед удалением. Треки исключены и будут удалены позже.",
+            )
+        request.app.state.station.skip(conn)
+        skipped = True
+    purged: list[str] = []
+    current_ids = set(result["current"])
+    if synced or not playing:
+        for track_id in result["marked"]:
+            if track_id in current_ids:
+                continue
+            if media.purge_confirmed(conn, settings, track_id):
+                purged.append(track_id)
+    if purged or not playing:
+        conn.commit()
+    pending = [track_id for track_id in result["marked"] if track_id not in set(purged)]
     request.app.state.scheduler.wake()
-    return {"deleted": deleted, "pending": pending, "not_found": not_found}
+    return {
+        **result,
+        "deleted": purged,
+        "purged": purged,
+        "pending": pending,
+        "mode": mode,
+        "skipped": skipped,
+    }
 
 
 AUDIO_TYPES = {
@@ -462,21 +615,48 @@ def download_track(
     )
 
 
-def _after_manual_change(request: Request, conn, settings, skip: bool) -> dict:
+def _after_manual_change(
+    request: Request,
+    conn,
+    settings,
+    skip: bool,
+    position_id: str | None = None,
+) -> dict:
     now = _now(request)
     queue_engine.ensure_queue(conn, settings, now)
-    _sync(request, conn)
+    synced = _sync(request, conn)
     if skip:
+        if not synced:
+            # Never skip into a track the engine did not confirm. Roll the
+            # manual position back so the previous queue stays intact.
+            if position_id:
+                conn.execute("DELETE FROM queue_positions WHERE id = ?", (position_id,))
+                conn.commit()
+                queue_engine.ensure_queue(conn, settings, now)
+                conn.commit()
+                # Restore the previous queue file even though the engine is
+                # currently refusing the command.
+                _sync(request, conn)
+            raise ApiError(
+                502,
+                "engine_sync_failed",
+                "Движок не подтвердил очередь. Трек не запущен, попробуйте снова.",
+            )
         request.app.state.station.skip(conn)
     request.app.state.scheduler.wake()
-    return queue_engine.queue_snapshot(conn, settings, now)
+    payload = queue_engine.queue_snapshot(conn, settings, now)
+    payload["engine_synced"] = synced
+    payload["applied_revision"] = _applied_revision(request)
+    return payload
 
 
 def _manual_add(request: Request, conn, track_id: str, mode: str, skip: bool) -> dict:
     settings = _settings(request)
-    queue_engine.enqueue_manual(conn, settings, track_id, mode, _now(request))
+    position_id = queue_engine.enqueue_manual(conn, settings, track_id, mode, _now(request))
     should_skip = skip and request.app.state.station.desired(conn) == "playing"
-    return _after_manual_change(request, conn, settings, skip=should_skip)
+    return _after_manual_change(
+        request, conn, settings, skip=should_skip, position_id=position_id
+    )
 
 
 @router.post("/exports")
@@ -531,6 +711,21 @@ def cancel_export(
     return exports.cancel_job(conn, _settings(request), job_id, _now(request))
 
 
+@router.post("/exports/{job_id}/retry")
+def retry_export(
+    job_id: str,
+    request: Request,
+    background: BackgroundTasks,
+    conn: sqlite3.Connection = Depends(get_conn),
+    session: dict = Depends(require_csrf),
+):
+    settings = _settings(request)
+    now = _now(request)
+    result = exports.retry_job(conn, settings, job_id, now)
+    background.add_task(exports.process_job, settings, job_id, now)
+    return result
+
+
 @router.post("/tracks/{track_id}/play-now")
 def track_play_now(
     track_id: str,
@@ -568,7 +763,7 @@ def track_queue(
 
 @router.get("/playlists")
 def get_playlists(request: Request, conn: sqlite3.Connection = Depends(get_conn)):
-    return {"items": playlists.list_playlists(conn, _settings(request))}
+    return {"items": playlists.list_playlists(conn, _settings(request), _now(request))}
 
 
 @router.post("/playlists", status_code=201)
@@ -604,17 +799,9 @@ def get_playlist(
             playlist_id,
             tracks_limit=tracks_limit,
             tracks_offset=tracks_offset,
+            now=_now(request),
         )
     }
-
-
-def _refresh_playlist_queue(request: Request, conn, playlist_id: str) -> None:
-    settings = _settings(request)
-    now = _now(request)
-    queue_engine.invalidate_playlist_sources(conn, playlist_id)
-    queue_engine.ensure_queue(conn, settings, now)
-    _sync(request, conn)
-    request.app.state.scheduler.wake()
 
 
 @router.patch("/playlists/{playlist_id}")
@@ -625,12 +812,59 @@ def patch_playlist(
     conn: sqlite3.Connection = Depends(get_conn),
     session: dict = Depends(require_csrf),
 ):
-    payload = playlists.update_playlist(
-        conn, _settings(request), playlist_id, body or {}, _now(request)
-    )
-    if isinstance(body, dict) and ("shuffle" in body or "repeat_mode" in body):
-        _refresh_playlist_queue(request, conn, playlist_id)
-    return {"playlist": payload}
+    settings = _settings(request)
+    now = _now(request)
+    provided_revision = (body or {}).get("state_revision") if isinstance(body, dict) else None
+    if provided_revision is not None:
+        try:
+            provided_revision = int(provided_revision)
+        except (TypeError, ValueError):
+            raise ApiError(422, "invalid_revision", "Некорректная ревизия состояния.")
+        if provided_revision < queue_engine.state_revision(conn):
+            raise ApiError(
+                409,
+                "stale_state",
+                "Настройки уже изменились в другой вкладке. Обновите данные.",
+            )
+    before = playlists.require_playlist(conn, playlist_id)
+    payload = playlists.update_playlist(conn, settings, playlist_id, body or {}, now)
+    shuffle_changed = isinstance(body, dict) and "shuffle" in body and bool(body.get("shuffle")) != bool(before["shuffle"])
+    repeat_changed = isinstance(body, dict) and "repeat_mode" in body and str(body.get("repeat_mode") or "") != str(before["repeat_mode"] or "")
+    if shuffle_changed or repeat_changed:
+        queue_engine.bump_state_revision(conn)
+        conn.commit()
+    application = "saved"
+    synced = False
+    if (shuffle_changed or repeat_changed) and request.app.state.station.desired(conn) == "playing":
+        diagnostic = queue_engine.source_diagnostic(conn, now)
+        source = diagnostic.get("source")
+        if source is not None and source.playlist_id == playlist_id:
+            queue_engine.reconcile_playlist_settings(
+                conn,
+                playlist_id,
+                shuffle=bool(payload["shuffle"]),
+                repeat=str(payload["repeat_mode"]),
+                shuffle_changed=shuffle_changed,
+                repeat_changed=repeat_changed,
+                now=now,
+                cycle_key=source.key,
+            )
+            queue_engine.rebuild_active_future(conn, settings, now, source.key)
+            conn.commit()
+            synced = _sync(request, conn)
+            application = "applied" if synced else "pending"
+            request.app.state.scheduler.wake()
+    elif shuffle_changed or repeat_changed:
+        application = "saved"
+    return {
+        "playlist": playlist_payload(
+            conn, playlists.require_playlist(conn, playlist_id), settings, _now(request)
+        ),
+        "application": application,
+        "engine_synced": synced,
+        "state_revision": queue_engine.state_revision(conn),
+        "applied_revision": _applied_revision(request),
+    }
 
 
 @router.delete("/playlists/{playlist_id}")
@@ -647,7 +881,11 @@ def delete_playlist(
             "SELECT id FROM rotation_items WHERE playlist_id = ?", (playlist_id,)
         ).fetchall()
     ]
+    pending = queue_engine.pending_source(conn)
+    if pending is not None and str(pending.get("playlist_id")) == playlist_id:
+        queue_engine.cancel_pending_source(conn)
     result = playlists.delete_playlist(conn, settings, playlist_id, _now(request))
+    queue_engine.bump_state_revision(conn)
     queue_engine.invalidate_playlist_sources(conn, playlist_id)
     queue_engine.invalidate_position_refs(
         conn, [f":item:{item_id}:" for item_id in rotation_item_ids]
@@ -667,11 +905,41 @@ def add_playlist_tracks(
     session: dict = Depends(require_csrf),
 ):
     ids = body.get("track_ids") if isinstance(body, dict) else None
+    settings = _settings(request)
+    now = _now(request)
     result = playlists.add_tracks(
-        conn, _settings(request), playlist_id, ids or [], _now(request)
+        conn, settings, playlist_id, ids or [], now
     )
-    _refresh_playlist_queue(request, conn, playlist_id)
-    return result
+    application = "saved"
+    synced = False
+    if result.get("added"):
+        queue_engine.bump_state_revision(conn)
+        conn.commit()
+        diagnostic = queue_engine.source_diagnostic(conn, now)
+        source = diagnostic.get("source")
+        if source is not None and source.playlist_id == playlist_id:
+            queue_engine.ensure_queue(conn, settings, now)
+            conn.commit()
+            if request.app.state.station.desired(conn) == "playing":
+                synced = queue_engine.sync_engine(
+                    conn,
+                    settings,
+                    request.app.state.engine,
+                    now=now,
+                    sync_state=getattr(request.app.state, "sync_state", None),
+                )
+                application = "applied" if synced else "pending"
+                request.app.state.scheduler.wake()
+            else:
+                application = "saved"
+    return {
+        **result,
+        "application": application,
+        "in_current_cycle": bool(result.get("added")) and application in ("applied", "pending"),
+        "engine_synced": synced,
+        "state_revision": queue_engine.state_revision(conn),
+        "applied_revision": _applied_revision(request),
+    }
 
 
 @router.delete("/playlists/{playlist_id}/tracks/{track_id}")
@@ -682,10 +950,27 @@ def remove_playlist_track(
     conn: sqlite3.Connection = Depends(get_conn),
     session: dict = Depends(require_csrf),
 ):
+    settings = _settings(request)
+    now = _now(request)
     result = playlists.remove_track(
-        conn, _settings(request), playlist_id, track_id, _now(request)
+        conn, settings, playlist_id, track_id, now
     )
-    _refresh_playlist_queue(request, conn, playlist_id)
+    queue_engine.bump_state_revision(conn)
+    conn.commit()
+    diagnostic = queue_engine.source_diagnostic(conn, now)
+    source = diagnostic.get("source")
+    if source is not None and source.playlist_id == playlist_id:
+        queue_engine.ensure_queue(conn, settings, now)
+        conn.commit()
+        synced = _sync(request, conn)
+        request.app.state.scheduler.wake()
+        result["engine_synced"] = synced
+        result["application"] = "applied" if synced or request.app.state.station.desired(conn) != "playing" else "pending"
+    else:
+        result["engine_synced"] = False
+        result["application"] = "saved"
+    result["state_revision"] = queue_engine.state_revision(conn)
+    result["applied_revision"] = _applied_revision(request)
     return result
 
 
@@ -697,14 +982,32 @@ def reorder_playlist(
     conn: sqlite3.Connection = Depends(get_conn),
     session: dict = Depends(require_csrf),
 ):
+    settings = _settings(request)
+    now = _now(request)
     result = playlists.reorder(
         conn,
-        _settings(request),
+        settings,
         playlist_id,
         body.get("track_ids") or [],
-        _now(request),
+        now,
     )
-    _refresh_playlist_queue(request, conn, playlist_id)
+    queue_engine.bump_state_revision(conn)
+    conn.commit()
+    diagnostic = queue_engine.source_diagnostic(conn, now)
+    source = diagnostic.get("source")
+    if source is not None and source.playlist_id == playlist_id:
+        queue_engine.reorder_cycle_to_playlist(conn, playlist_id, source.key)
+        queue_engine.rebuild_active_future(conn, settings, now, source.key)
+        conn.commit()
+        synced = _sync(request, conn)
+        request.app.state.scheduler.wake()
+        result["engine_synced"] = synced
+        result["application"] = "applied" if synced or request.app.state.station.desired(conn) != "playing" else "pending"
+    else:
+        result["engine_synced"] = False
+        result["application"] = "saved"
+    result["state_revision"] = queue_engine.state_revision(conn)
+    result["applied_revision"] = _applied_revision(request)
     return result
 
 
@@ -729,7 +1032,7 @@ def upload_playlist_cover(
     conn.commit()
     return {
         "playlist": playlist_payload(
-            conn, playlists.require_playlist(conn, playlist_id), settings
+            conn, playlists.require_playlist(conn, playlist_id), settings, _now(request)
         )
     }
 
@@ -751,7 +1054,7 @@ def delete_playlist_cover(
     conn.commit()
     return {
         "playlist": playlist_payload(
-            conn, playlists.require_playlist(conn, playlist_id), settings
+            conn, playlists.require_playlist(conn, playlist_id), settings, _now(request)
         )
     }
 
@@ -766,38 +1069,76 @@ def play_playlist(
 ):
     settings = _settings(request)
     now = _now(request)
-    playlists.require_playlist(conn, playlist_id)
-    if not queue_engine.playlist_track_ids(conn, playlist_id):
-        raise ApiError(422, "playlist_empty", "Плейлист пуст: добавьте треки перед запуском.")
-    mode = str((body or {}).get("mode") or "now")
-    if mode not in ("now", "next"):
-        raise ApiError(422, "invalid_mode", "Недопустимый режим запуска плейлиста.")
-    conn.execute("UPDATE overrides SET active = 0 WHERE active = 1")
-    override_id = uuid.uuid4().hex
-    conn.execute(
-        "INSERT INTO overrides(id, kind, playlist_id, scope, expires_at, active, created_at, note) "
-        "VALUES(?, 'playlist', ?, 'indefinite', NULL, 1, ?, ?)",
-        (override_id, playlist_id, to_iso(now), "Запуск плейлиста из панели"),
+    data = body or {}
+    mode = str(data.get("mode") or "now")
+    restart = bool(data.get("restart"))
+    result = queue_engine.select_playlist(
+        conn, settings, playlist_id, mode, restart, now
     )
-    db.delete_setting(conn, f"_cycle:override:{override_id}:playlist:{playlist_id}")
-    conn.commit()
-    current_status = request.app.state.station.status(conn, now)
-    was_stopped = request.app.state.station.desired(conn) != "playing"
-    if was_stopped or not current_status.get("unit_active"):
-        status = request.app.state.station.start(conn, now)
-    else:
-        queue_engine.ensure_queue(conn, settings, now)
-        _sync(request, conn)
-        status = request.app.state.station.status(conn, now)
+    started = False
+    synced = False
+    unit_active = bool(request.app.state.station.status(conn, now).get("unit_active"))
+    start_needed = mode == "now" and (
+        request.app.state.station.desired(conn) != "playing" or not unit_active
+    )
+    if start_needed:
+        request.app.state.station.start(conn, now)
+        started = True
+        synced = True
+    elif result["status"] != "already_active":
+        if request.app.state.station.desired(conn) == "playing":
+            if not result["pending"]:
+                queue_engine.ensure_queue(conn, settings, now)
+                conn.commit()
+            synced = _sync(request, conn)
+            if not synced:
+                if result["pending"]:
+                    queue_engine.cancel_pending_source(conn)
+                    queue_engine.ensure_queue(conn, settings, now)
+                    conn.commit()
+                    # Restore the old queue file even though the engine refused
+                    # the command; the next scheduler retry will confirm it.
+                    _sync(request, conn)
+                raise ApiError(
+                    502,
+                    "engine_sync_failed",
+                    "Движок не подтвердил новую очередь. Переключение не выполнено.",
+                )
+    if result.get("skip") and not started and request.app.state.station.desired(conn) == "playing":
+        request.app.state.station.skip(conn)
+    status = request.app.state.station.status(conn, now)
     request.app.state.station_status = status
     request.app.state.scheduler.wake()
+    response_status = result["status"]
+    if started and response_status == "already_active":
+        response_status = "switching" if status.get("has_current") else "applied"
     return {
-        "started": True,
+        "status": response_status,
+        "started": started,
+        "engine_synced": synced,
         "station": status,
         "playlist": playlist_payload(
-            conn, playlists.require_playlist(conn, playlist_id), settings
+            conn, playlists.require_playlist(conn, playlist_id), settings, _now(request)
         ),
+        "state_revision": queue_engine.state_revision(conn),
+        "applied_revision": _applied_revision(request),
     }
+
+
+@router.post("/playlists/{playlist_id}/restart")
+def restart_playlist(
+    playlist_id: str,
+    request: Request,
+    conn: sqlite3.Connection = Depends(get_conn),
+    session: dict = Depends(require_csrf),
+):
+    return play_playlist(
+        playlist_id,
+        request,
+        body={"mode": "now", "restart": True},
+        conn=conn,
+        session=session,
+    )
 
 
 @router.post("/playlists/{playlist_id}/rotation")
@@ -1164,9 +1505,41 @@ def patch_queue(
         move_to = int(body.get("move_to"))
     except (TypeError, ValueError):
         raise ApiError(422, "invalid_move", "Укажите новую позицию в очереди.")
-    queue_engine.move_position(conn, position_id, move_to)
-    _sync(request, conn)
-    return queue_engine.queue_snapshot(conn, _settings(request), _now(request))
+    try:
+        queue_engine.move_position(conn, position_id, move_to)
+    except ApiError as exc:
+        if exc.code == "position_started":
+            exc.extra["queue"] = queue_engine.queue_snapshot(
+                conn, _settings(request), _now(request)
+            )
+        raise
+    synced = _queue_sync(request, conn)
+    payload = queue_engine.queue_snapshot(conn, _settings(request), _now(request))
+    payload["engine_synced"] = synced
+    payload["applied_revision"] = _applied_revision(request)
+    return payload
+
+
+@router.post("/queue/{position_id}/move-next")
+def move_queue_next(
+    position_id: str,
+    request: Request,
+    conn: sqlite3.Connection = Depends(get_conn),
+    session: dict = Depends(require_csrf),
+):
+    try:
+        queue_engine.move_position_next(conn, position_id)
+    except ApiError as exc:
+        if exc.code == "position_started":
+            exc.extra["queue"] = queue_engine.queue_snapshot(
+                conn, _settings(request), _now(request)
+            )
+        raise
+    synced = _queue_sync(request, conn)
+    payload = queue_engine.queue_snapshot(conn, _settings(request), _now(request))
+    payload["engine_synced"] = synced
+    payload["applied_revision"] = _applied_revision(request)
+    return payload
 
 
 @router.delete("/queue/{position_id}")
@@ -1176,10 +1549,20 @@ def delete_queue(
     conn: sqlite3.Connection = Depends(get_conn),
     session: dict = Depends(require_csrf),
 ):
-    queue_engine.delete_position(conn, _settings(request), position_id)
+    try:
+        queue_engine.delete_position(conn, _settings(request), position_id)
+    except ApiError as exc:
+        if exc.code == "position_started":
+            exc.extra["queue"] = queue_engine.queue_snapshot(
+                conn, _settings(request), _now(request)
+            )
+        raise
     queue_engine.ensure_queue(conn, _settings(request), _now(request))
-    _sync(request, conn)
-    return queue_engine.queue_snapshot(conn, _settings(request), _now(request))
+    synced = _queue_sync(request, conn)
+    payload = queue_engine.queue_snapshot(conn, _settings(request), _now(request))
+    payload["engine_synced"] = synced
+    payload["applied_revision"] = _applied_revision(request)
+    return payload
 
 
 @router.post("/queue/shuffle")
@@ -1189,9 +1572,11 @@ def post_queue_shuffle(
     session: dict = Depends(require_csrf),
 ):
     count = queue_engine.shuffle_pending(conn)
-    _sync(request, conn)
+    synced = _queue_sync(request, conn)
     payload = queue_engine.queue_snapshot(conn, _settings(request), _now(request))
     payload["shuffled"] = count
+    payload["engine_synced"] = synced
+    payload["applied_revision"] = _applied_revision(request)
     return payload
 
 
@@ -1203,9 +1588,11 @@ def post_queue_clear_manual(
 ):
     removed = queue_engine.clear_manual(conn)
     queue_engine.ensure_queue(conn, _settings(request), _now(request))
-    _sync(request, conn)
+    synced = _queue_sync(request, conn)
     payload = queue_engine.queue_snapshot(conn, _settings(request), _now(request))
     payload["removed"] = removed
+    payload["engine_synced"] = synced
+    payload["applied_revision"] = _applied_revision(request)
     return payload
 
 
@@ -1214,11 +1601,65 @@ def post_queue_clear_manual(
 # ---------------------------------------------------------------------------
 
 
+@router.get("/station/state")
+def station_state(request: Request, conn: sqlite3.Connection = Depends(get_conn)):
+    now = _now(request)
+    status = request.app.state.station.status(conn, now)
+    request.app.state.station_status = status
+    state = queue_engine.station_state(
+        conn,
+        _settings(request),
+        now,
+        status=status,
+        engine_instance=request.app.state.station.engine_instance(),
+    )
+    state["applied_revision"] = _applied_revision(request)
+    return state
+
+
+@router.put("/station/mode")
+def station_mode(
+    request: Request,
+    body: dict = Body(...),
+    conn: sqlite3.Connection = Depends(get_conn),
+    session: dict = Depends(require_csrf),
+):
+    settings = _settings(request)
+    now = _now(request)
+    mode = str((body or {}).get("mode") or "")
+    playlist_id = (body or {}).get("playlist_id")
+    if queue_engine.pending_source(conn) is not None:
+        queue_engine.cancel_pending_source(conn)
+    queue_engine.set_playback_mode(conn, mode, str(playlist_id) if playlist_id else None)
+    queue_engine.rebuild_source_queue(conn, settings, now)
+    conn.commit()
+    synced = False
+    if request.app.state.station.desired(conn) == "playing":
+        synced = _sync(request, conn)
+    request.app.state.scheduler.wake()
+    status = request.app.state.station.status(conn, now)
+    request.app.state.station_status = status
+    state = queue_engine.station_state(
+        conn,
+        settings,
+        now,
+        status=status,
+        engine_instance=request.app.state.station.engine_instance(),
+    )
+    return {
+        **state,
+        "station": status,
+        "engine_synced": synced,
+        "applied_revision": _applied_revision(request),
+    }
+
+
 @router.get("/station/status")
 def station_status(request: Request, conn: sqlite3.Connection = Depends(get_conn)):
     status = request.app.state.station.status(conn, _now(request))
     request.app.state.station_status = status
     status["queue"] = queue_engine.queue_snapshot(conn, _settings(request), _now(request))
+    status["applied_revision"] = _applied_revision(request)
     return status
 
 
@@ -1264,9 +1705,26 @@ def station_skip(
     conn: sqlite3.Connection = Depends(get_conn),
     session: dict = Depends(require_csrf),
 ):
+    settings = _settings(request)
+    now = _now(request)
+    moved_target = queue_engine.advance_repeat_target(conn, now)
+    if moved_target:
+        diagnostic = queue_engine.source_diagnostic(conn, now)
+        source = diagnostic.get("source")
+        if source is not None:
+            queue_engine.rebuild_active_future(conn, settings, now, source.key)
+            conn.commit()
+            if request.app.state.station.desired(conn) == "playing" and not _sync(request, conn):
+                raise ApiError(
+                    502,
+                    "engine_sync_failed",
+                    "Движок не подтвердил новую цель повтора. Пропуск не выполнен.",
+                )
     request.app.state.station.skip(conn)
     request.app.state.scheduler.wake()
-    return queue_engine.queue_snapshot(conn, _settings(request), _now(request))
+    payload = queue_engine.queue_snapshot(conn, settings, now)
+    payload["repeat_target_moved"] = moved_target
+    return payload
 
 
 @router.post("/station/play-now/{track_id}")
@@ -1384,13 +1842,19 @@ def create_station_override(
             str(body.get("note") or "").strip() or None,
         ),
     )
+    queue_engine.bump_state_revision(conn)
     conn.commit()
     queue_engine.ensure_queue(conn, settings, now)
     _sync(request, conn)
     request.app.state.scheduler.wake()
+    status = request.app.state.station.status(conn, now)
     return {
         "override": _override_payload(conn, override_id),
         "queue": queue_engine.queue_snapshot(conn, settings, now),
+        "mode": queue_engine.playback_mode(conn),
+        "state_revision": queue_engine.state_revision(conn),
+        "applied_revision": _applied_revision(request),
+        "station": status,
     }
 
 
@@ -1401,13 +1865,25 @@ def delete_station_override(
     session: dict = Depends(require_csrf),
 ):
     conn.execute("UPDATE overrides SET active = 0 WHERE active = 1")
+    queue_engine.bump_state_revision(conn)
     conn.commit()
     settings = _settings(request)
     now = _now(request)
     queue_engine.ensure_queue(conn, settings, now)
     _sync(request, conn)
     request.app.state.scheduler.wake()
-    return {"cleared": True, "queue": queue_engine.queue_snapshot(conn, settings, now)}
+    status = request.app.state.station.status(conn, now)
+    return {
+        "cleared": True,
+        "queue": queue_engine.queue_snapshot(conn, settings, now),
+        "mode": queue_engine.playback_mode(conn),
+        "effective_source": queue_engine.station_state(
+            conn, settings, now, status=status, public=True
+        ).get("effective_source"),
+        "state_revision": queue_engine.state_revision(conn),
+        "applied_revision": _applied_revision(request),
+        "station": status,
+    }
 
 
 # ---------------------------------------------------------------------------

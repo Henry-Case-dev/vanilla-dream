@@ -5,8 +5,20 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from app import db, scheduler
 from tests.helpers import make_playlist, play_next, upload_and_get, write_mp3
+
+
+@pytest.fixture(autouse=True)
+def _auto_mode(env):
+    conn = db.open_db(env.settings)
+    try:
+        db.set_setting(conn, "playback_mode", "auto")
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _upload(env, name: str) -> dict:

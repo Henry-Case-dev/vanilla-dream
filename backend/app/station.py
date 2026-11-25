@@ -24,6 +24,7 @@ FAILURE_LIMIT = 3
 AUTO_START_COOLDOWN = 10.0
 PLAYBACK_STALL_SECONDS = 60
 CURRENT_TRACK_GRACE_SECONDS = 5
+ENGINE_INSTANCE_TTL_SECONDS = 5.0
 
 
 def compute_state(
@@ -40,21 +41,21 @@ def compute_state(
 ) -> str:
     if desired != "playing":
         return "off"
-    if not has_library:
-        return "no_music"
     if unit_state == "failed" or recent_failures >= FAILURE_LIMIT:
         return "error"
     if not unit_active:
         if unit_state in ("activating", "reloading", "deactivating"):
             return "starting"
         return "error"
-    if mount_present:
-        return "on_air" if has_current else "no_music"
-    if active_since is None:
-        return "starting"
-    if (now - active_since).total_seconds() <= STARTING_GRACE_SECONDS:
-        return "starting"
-    return "reconnecting"
+    if not mount_present:
+        if active_since is None:
+            return "starting"
+        if (now - active_since).total_seconds() <= STARTING_GRACE_SECONDS:
+            return "starting"
+        return "reconnecting"
+    if not has_current:
+        return "no_music"
+    return "on_air"
 
 
 class StationController:
@@ -72,6 +73,7 @@ class StationController:
         self.icecast = icecast
         self.runner = runner
         self._unit_cache: dict[str, tuple[str, datetime]] = {}
+        self._instance_cache: tuple[str, datetime] | None = None
 
     # -- systemctl ---------------------------------------------------------
     def _systemctl(self, action: str, unit: str | None = None, sudo: bool = True):
@@ -110,6 +112,11 @@ class StationController:
             self._unit_cache.clear()
         else:
             self._unit_cache.pop(unit, None)
+        if unit is None or unit == self.settings.engine_unit:
+            self.invalidate_engine_instance()
+
+    def invalidate_engine_instance(self) -> None:
+        self._instance_cache = None
 
     def _unit_state(self, unit: str, sudo: bool, now: datetime | None = None) -> str:
         now = now or self.clock.now()
@@ -152,9 +159,90 @@ class StationController:
             output = output.split("=", 1)[1].strip()
         return output or None
 
+    def engine_instance(self) -> str:
+        now = self.clock.now()
+        cached = self._instance_cache
+        if (
+            cached is not None
+            and 0
+            <= (now - cached[1]).total_seconds()
+            < ENGINE_INSTANCE_TTL_SECONDS
+        ):
+            return cached[0]
+        timestamp = self.unit_last_start(self.settings.engine_unit) or ""
+        try:
+            inode = str(self.settings.engine_socket.stat().st_ino)
+        except OSError:
+            inode = ""
+        instance = f"{timestamp}|{inode}" if timestamp or inode else ""
+        self._instance_cache = (instance, now)
+        return instance
+
+    def reconcile_engine_instance(
+        self,
+        conn,
+        now: datetime | None = None,
+        sync_state: dict | None = None,
+    ) -> bool:
+        """Detect a new Liquidsoap instance and reset the stale runtime state.
+
+        A backend-only restart keeps the same instance and therefore keeps the
+        prepared positions. An actual engine restart invalidates the prepared
+        positions and the current playback row so the scheduler can resync once.
+        """
+
+        now = now or self.clock.now()
+        instance = self.engine_instance()
+        stored = db.get_setting(conn, "_engine_instance")
+        if instance == stored:
+            return False
+        if not instance and stored:
+            # The engine identity is temporarily unavailable (unit down or
+            # systemctl failure). Waiting avoids resetting the queue every tick;
+            # the next visible identity is compared with the stored one.
+            return False
+
+        conn.execute(
+            "UPDATE queue_positions SET state = 'pending' WHERE state = 'prepared'"
+        )
+        playback = conn.execute(
+            "SELECT position_id FROM playback_state WHERE singleton = 1"
+        ).fetchone()
+        if playback is not None:
+            if playback["position_id"]:
+                if conn.execute(
+                    "UPDATE history SET ended_at = ? "
+                    "WHERE position_id = ? AND ended_at IS NULL",
+                    (to_iso(now), playback["position_id"]),
+                ).rowcount:
+                    queue_engine.bump_history_revision(conn)
+                if conn.execute(
+                    "DELETE FROM queue_positions WHERE id = ?",
+                    (playback["position_id"],),
+                ).rowcount:
+                    queue_engine.bump_queue_revision(conn)
+            conn.execute("DELETE FROM playback_state WHERE singleton = 1")
+        db.delete_setting(conn, "_engine_sync_error")
+        if sync_state is not None:
+            sync_state.clear()
+        db.set_setting(conn, "_engine_instance", instance)
+        db.log_event(
+            conn,
+            "info",
+            "station",
+            "Обнаружен перезапуск движка: очередь будет восстановлена",
+            {"instance": instance},
+            at=to_iso(now),
+        )
+        conn.commit()
+        return True
+
     # -- desired state -----------------------------------------------------
     def _set_desired(self, conn, value: str) -> None:
+        previous = self.desired(conn)
         db.set_setting(conn, "desired_state", value)
+        if previous != value:
+            queue_engine.bump_state_revision(conn)
 
     def desired(self, conn) -> str:
         return db.get_setting(conn, "desired_state", "stopped") or "stopped"
@@ -311,6 +399,13 @@ class StationController:
             state = "starting"
             reason = "engine_starting"
         conn.commit()
+        state_payload = queue_engine.station_state(
+            conn,
+            self.settings,
+            now,
+            status={"desired": desired, "state": state, "reason": reason},
+            engine_instance=self.engine_instance(),
+        )
         return {
             "state": state,
             "status": state,
@@ -328,6 +423,7 @@ class StationController:
             "since": to_iso(active_since),
             "last_start": db.get_setting(conn, "engine_last_start") or None,
             "last_error": db.get_setting(conn, "engine_last_error") or None,
+            **state_payload,
         }
 
     # -- commands ----------------------------------------------------------
@@ -365,12 +461,13 @@ class StationController:
 
     def start(self, conn, now: datetime | None = None) -> dict:
         now = now or self.clock.now()
+        db.delete_setting(conn, "_stopping")
         was_playing = self.desired(conn) == "playing" and self.unit_info(now)[0]
         self._set_desired(conn, "playing")
         conn.commit()
         if not was_playing:
             self._forget_current(conn, now)
-        self._reset_prepared(conn)
+            self._reset_prepared(conn)
         queue_engine.ensure_queue(conn, self.settings, now)
         if db.library_totals(conn)["count"] == 0:
             db.log_event(
@@ -387,6 +484,8 @@ class StationController:
 
     def stop(self, conn, now: datetime | None = None) -> dict:
         now = now or self.clock.now()
+        db.set_setting(conn, "_stopping", "1")
+        conn.commit()
         ok, output, _code = self._systemctl("stop")
         self.invalidate_unit_cache(self.settings.engine_unit)
         if not ok:
@@ -406,13 +505,15 @@ class StationController:
             "SELECT position_id FROM playback_state WHERE singleton = 1"
         ).fetchone()
         if state is not None and state["position_id"]:
-            conn.execute(
+            if conn.execute(
                 "UPDATE history SET ended_at = ? WHERE position_id = ? AND ended_at IS NULL",
                 (to_iso(now), state["position_id"]),
-            )
-            conn.execute(
+            ).rowcount:
+                queue_engine.bump_history_revision(conn)
+            if conn.execute(
                 "DELETE FROM queue_positions WHERE id = ?", (state["position_id"],)
-            )
+            ).rowcount:
+                queue_engine.bump_queue_revision(conn)
             remove_queue_link(self.settings, str(state["position_id"]))
         conn.execute("DELETE FROM playback_state WHERE singleton = 1")
         media.delete_pending_after_change(conn, self.settings)
@@ -500,6 +601,8 @@ class StationController:
             raise ApiError(503, "engine_unavailable", "Движок недоступен. Пропуск не выполнен.")
 
     def auto_start_if_needed(self, conn, now: datetime, status: dict) -> bool:
+        if db.get_setting(conn, "_stopping") == "1":
+            return False
         if status.get("desired") != "playing" or status.get("unit_active"):
             return False
         if len(self._failures(conn, now)) >= FAILURE_LIMIT:

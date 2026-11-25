@@ -31,15 +31,19 @@ import { ConfirmDialog, Modal } from '../components/Modal';
 import { EmptyState, ErrorState, LoadingState } from '../components/States';
 import { MenuButton } from '../components/Menu';
 import { DuplicateBadge } from '../components/DuplicateBadge';
+import { TrackMenu } from '../components/TrackMenu';
+import { DeleteTrackDialog } from '../components/DeleteTrackDialog';
 import { ManualOverrideBanner } from '../components/ManualOverrideBanner';
+import { TemporarySwitchDialog } from '../components/SourceControl';
+import { InlineError } from '../components/States';
 import { useToast } from '../components/Toasts';
 import { useResource } from '../lib/hooks';
-import { useLive } from '../lib/live';
+import { useLive, effectiveControl } from '../lib/live';
+import { usePlaylistSettings } from '../lib/playlist-settings';
 import { useDataChanged, notifyDataChanged } from '../lib/refresh';
-import { api, errorMessage, trackDownloadUrl } from '../lib/api';
-import { triggerDownload } from '../lib/download';
+import { api, errorMessage } from '../lib/api';
 import { formatDuration, formatLongDuration, repeatLabel, tracksLabel } from '../lib/format';
-import type { AddTracksResult, ExportComposition, RepeatMode, Track } from '../lib/types';
+import type { AddTracksResult, ExportComposition, Track } from '../lib/types';
 import { AddTracksDialog } from './AddTracksDialog';
 import { TrackEditorDialog } from './TrackEditorDialog';
 import { ExportDialog } from './ExportDialog';
@@ -51,7 +55,8 @@ export function PlaylistDetailPage() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const toast = useToast();
-  const { reload: reloadLive } = useLive();
+  const { now, control, revision, reload: reloadLive, reloadControl } = useLive();
+  const settingsStore = usePlaylistSettings();
 
   const detail = useResource(
     () => (id ? api.admin.playlists.get(id) : Promise.reject(new Error('Плейлист не выбран'))),
@@ -60,14 +65,28 @@ export function PlaylistDetailPage() {
   useDataChanged(() => void detail.reload(true));
 
   const playlist = detail.data?.playlist ?? null;
+  const stored = settingsStore.get(playlist?.id);
+  const shuffle = stored?.shuffle ?? playlist?.shuffle ?? false;
+  const repeatMode = stored?.repeatMode ?? playlist?.repeatMode ?? 'none';
+  const repeatGovernedBy = stored?.repeatGovernedBy ?? playlist?.repeatGovernedBy ?? null;
+  const state = effectiveControl(control, now);
   const [ordered, setOrdered] = useState<Track[]>([]);
   const [actionBusy, setActionBusy] = useState<string | null>(null);
   const [removingId, setRemovingId] = useState<string | null>(null);
   const [addOpen, setAddOpen] = useState(false);
   const [editOpen, setEditOpen] = useState(false);
   const [editTrack, setEditTrack] = useState<Track | null>(null);
+  const [deleteTrack, setDeleteTrack] = useState<Track | null>(null);
   const [exportComposition, setExportComposition] = useState<ExportComposition | null>(null);
   const [deleteOpen, setDeleteOpen] = useState(false);
+  const [tempOpen, setTempOpen] = useState(false);
+  const [switching, setSwitching] = useState<{
+    mode: 'now' | 'next';
+    playlistId: string;
+    name: string;
+    startedAt: string | null;
+  } | null>(null);
+  const [cyclePending, setCyclePending] = useState<number | null>(null);
   const [editName, setEditName] = useState('');
   const [editDescription, setEditDescription] = useState('');
   const [formBusy, setFormBusy] = useState(false);
@@ -82,6 +101,62 @@ export function PlaylistDetailPage() {
     if (detail.data) setOrdered(detail.data.tracks);
   }, [detail.data]);
 
+  useEffect(() => {
+    if (revision > 0) void detail.reload(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [revision]);
+
+  useEffect(() => {
+    if (!switching) return;
+    if (switching.mode === 'next') {
+      if (state?.pendingSource) {
+        if (state.pendingSource.playlistId !== switching.playlistId) setSwitching(null);
+        return;
+      }
+      if (
+        state?.effectiveSource?.playlistId === switching.playlistId &&
+        now?.station.status === 'on_air'
+      ) {
+        setSwitching(null);
+      }
+      return;
+    }
+    const startedAt = now?.track?.startedAt ?? null;
+    if (
+      startedAt &&
+      startedAt !== switching.startedAt &&
+      state?.effectiveSource?.playlistId === switching.playlistId &&
+      now?.station.status === 'on_air'
+    ) {
+      setSwitching(null);
+    }
+  }, [
+    switching,
+    state?.pendingSource,
+    state?.effectiveSource?.playlistId,
+    now?.station.status,
+    now?.track?.startedAt,
+  ]);
+
+  useEffect(() => {
+    if (cyclePending === null || !state) return;
+    if (state.appliedRevision !== null && state.appliedRevision >= cyclePending) {
+      toast.notify('success', 'Новые треки включены в текущий цикл');
+      setCyclePending(null);
+      refresh();
+      void settingsStore.refresh();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cyclePending, state?.appliedRevision, toast]);
+
+  // applied_revision может измениться без нового state_revision. Пока
+  // применение не подтверждено, перечитываем состояние, не дожидаясь SSE.
+  useEffect(() => {
+    if (cyclePending === null) return;
+    const timer = window.setInterval(() => reloadControl(), 1000);
+    return () => window.clearInterval(timer);
+  }, [cyclePending, reloadControl]);
+
   const existingIds = useMemo(() => new Set(ordered.map((track) => track.id)), [ordered]);
   const totalDuration = useMemo(() => {
     if (playlist) return playlist.duration;
@@ -93,27 +168,27 @@ export function PlaylistDetailPage() {
     notifyDataChanged();
   };
 
-  const patchPlaylist = async (patch: Record<string, unknown>, message: string) => {
-    if (!playlist) return;
-    setActionBusy('patch');
-    try {
-      await api.admin.playlists.update(playlist.id, patch);
-      toast.notify('success', message);
-      refresh();
-    } catch (caught) {
-      toast.notify('error', errorMessage(caught));
-    } finally {
-      setActionBusy(null);
-    }
-  };
-
-  const playInAir = async () => {
+  const switchPlaylist = async (mode: 'now' | 'next', restart = false) => {
     if (!playlist || playlist.trackCount === 0) return;
-    setActionBusy('play');
+    setActionBusy(mode === 'now' ? 'play' : 'next');
     try {
-      await api.admin.playlists.play(playlist.id, 'now');
-      toast.notify('success', 'Плейлист запущен в эфир');
+      const result = await api.admin.playlists.play(playlist.id, mode, restart);
       reloadLive();
+      if (result.status === 'already_active') {
+        toast.notify('info', 'Плейлист уже является источником эфира');
+        return;
+      }
+      if (result.status === 'applied') {
+        setSwitching(null);
+        refresh();
+        return;
+      }
+      setSwitching({
+        mode,
+        playlistId: playlist.id,
+        name: playlist.name,
+        startedAt: now?.track?.startedAt ?? null,
+      });
       refresh();
     } catch (caught) {
       toast.notify('error', errorMessage(caught));
@@ -122,19 +197,17 @@ export function PlaylistDetailPage() {
     }
   };
 
-  const cycleRepeat = () => {
+  const playInAir = () => switchPlaylist('now');
+
+  const cycleRepeat = async () => {
     if (!playlist) return;
-    const next: RepeatMode =
-      playlist.repeatMode === 'none' ? 'all' : playlist.repeatMode === 'all' ? 'one' : 'none';
-    void patchPlaylist({ repeat_mode: next }, `Режим повтора: ${repeatLabel(next).toLowerCase()}`);
+    await settingsStore.cycleRepeat(playlist.id);
   };
 
-  const toggleShuffle = () => {
+  const toggleShuffle = async () => {
     if (!playlist) return;
-    void patchPlaylist(
-      { shuffle: !playlist.shuffle },
-      playlist.shuffle ? 'Перемешивание выключено' : 'Перемешивание включено',
-    );
+    const current = settingsStore.get(playlist.id)?.shuffle ?? false;
+    await settingsStore.setShuffle(playlist.id, !current);
   };
 
   const addToRotation = async () => {
@@ -191,6 +264,20 @@ export function PlaylistDetailPage() {
     void persistOrder(next);
   };
 
+  const playTrackInAir = async (track: Track) => {
+    if (state?.desired !== 'playing') {
+      toast.notify('info', 'Сначала запустите эфир');
+      return;
+    }
+    try {
+      await api.admin.tracks.playNow(track.id);
+      toast.notify('success', 'Трек отправлен в эфир');
+      notifyDataChanged();
+    } catch (caught) {
+      toast.notify('error', errorMessage(caught));
+    }
+  };
+
   const removeTrack = async (track: Track) => {
     if (!playlist || playlist.system) return;
     setRemovingId(track.id);
@@ -207,10 +294,23 @@ export function PlaylistDetailPage() {
   };
 
   const onTracksAdded = (result: AddTracksResult) => {
-    if (result.added > 0) {
-      setOrdered((current) => [...current]);
-      void detail.reload(true);
+    if (result.added === 0) return;
+    void detail.reload(true);
+    void settingsStore.refresh();
+    if (!result.inCurrentCycle) {
+      setCyclePending(null);
+      return;
     }
+    if (result.application === 'applied') {
+      setCyclePending(null);
+      toast.notify('success', 'Новые треки включены в текущий цикл');
+      return;
+    }
+    if (result.application === 'pending') {
+      setCyclePending(result.stateRevision ?? state?.revision ?? -1);
+      return;
+    }
+    setCyclePending(null);
   };
 
   const openEdit = () => {
@@ -334,6 +434,20 @@ export function PlaylistDetailPage() {
   const tracksTotal = detail.data?.tracksTotal ?? ordered.length;
   const limited = tracksTotal > ordered.length;
   const canReorder = !isSystem && !savingOrder && !limited;
+  const isActive =
+    state?.effectiveSource?.playlistId === playlist.id &&
+    state?.desired === 'playing' &&
+    state?.status !== 'off' &&
+    switching?.playlistId !== playlist.id;
+  const isSelected =
+    state?.mode === 'playlist' &&
+    (state.selectedPlaylistId === playlist.id || state.programPlaylistId === playlist.id);
+  const isPending = state?.pendingSource?.playlistId === playlist.id;
+  const pendingName =
+    (state?.pendingSource
+      ? settingsStore.playlists?.find((item) => item.id === state.pendingSource?.playlistId)?.name
+      : null) ?? playlist.name;
+  const switchBusy = switching?.playlistId === playlist.id;
 
   const openPlaylistExport = () => {
     const sizeKnown = ordered.every((track) => track.size !== null);
@@ -377,14 +491,24 @@ export function PlaylistDetailPage() {
           <div className="playlist-head__eyebrow">
             <span className="eyebrow">Плейлист</span>
             {isSystem && <span className="playlist-system-label">Системный плейлист</span>}
+            {isActive && <span className="playlist-live-marker">Сейчас в эфире</span>}
+            {!isActive && isPending && (
+              <span className="playlist-awaiting-marker">Ожидает переключения</span>
+            )}
+            {!isActive && !isPending && isSelected && (
+              <span className="playlist-selected-marker">Выбран</span>
+            )}
           </div>
           <h1 className="playlist-head__name">{playlist.name}</h1>
           <p className="playlist-head__desc">{playlist.description || 'Без описания'}</p>
           <MetaRow>
             <span className="meta-item">{tracksLabel(playlist.trackCount)}</span>
             <span className="meta-item">{formatLongDuration(totalDuration)}</span>
-            {playlist.shuffle && <Chip tone="accent">Перемешивание</Chip>}
-            <Chip tone="neutral">{repeatLabel(playlist.repeatMode)}</Chip>
+            {shuffle && <Chip tone="accent">Перемешивание</Chip>}
+            <Chip tone="neutral">{repeatLabel(repeatMode)}</Chip>
+            {repeatGovernedBy === 'rotation' && (
+              <Chip tone="warning">Повтор определяется ротацией</Chip>
+            )}
             {playlist.pendingDeleteCount ? (
               <Chip tone="warning">
                 {playlist.pendingDeleteCount} ждут удаления после эфира
@@ -403,6 +527,24 @@ export function PlaylistDetailPage() {
             >
               В эфир
             </Button>
+            <MenuButton
+              label="Варианты запуска плейлиста"
+              items={[
+                {
+                  label: 'После текущего трека',
+                  onSelect: () => void switchPlaylist('next'),
+                },
+                {
+                  label: 'Начать сначала',
+                  onSelect: () => void switchPlaylist('now', true),
+                },
+                {
+                  label: 'Временное переключение',
+                  onSelect: () => setTempOpen(true),
+                },
+              ]}
+              align="start"
+            />
             <Button
               variant="secondary"
               icon={Download}
@@ -413,34 +555,28 @@ export function PlaylistDetailPage() {
               Скачать
             </Button>
             <Button
-              variant={playlist.shuffle ? 'secondary' : 'ghost'}
+              variant={shuffle ? 'secondary' : 'ghost'}
               icon={Shuffle}
-              onClick={toggleShuffle}
-              className={playlist.shuffle ? 'is-selected' : ''}
-              title="Перемешивание действует на следующий цикл плейлиста"
+              onClick={() => void toggleShuffle()}
+              className={shuffle ? 'is-selected' : ''}
+              title="Изменяет порядок оставшихся треков текущего прохода"
             >
-              {playlist.shuffle ? 'Перемешивание вкл.' : 'Перемешивание'}
+              {shuffle ? 'Перемешивание вкл.' : 'Перемешивание выкл.'}
             </Button>
             <Button
-              variant={playlist.repeatMode !== 'none' ? 'secondary' : 'ghost'}
-              icon={playlist.repeatMode === 'one' ? Repeat1 : Repeat}
-              onClick={cycleRepeat}
-              className={playlist.repeatMode !== 'none' ? 'is-selected' : ''}
+              variant={repeatMode !== 'none' ? 'secondary' : 'ghost'}
+              icon={repeatMode === 'one' ? Repeat1 : Repeat}
+              onClick={() => void cycleRepeat()}
+              className={repeatMode !== 'none' ? 'is-selected' : ''}
               title="Нажмите, чтобы сменить режим повтора"
             >
-              {repeatLabel(playlist.repeatMode)}
+              {repeatLabel(repeatMode)}
             </Button>
             {!isSystem && (
               <Button variant="secondary" icon={Plus} onClick={() => setAddOpen(true)}>
                 Добавить треки
               </Button>
             )}
-            <IconButton
-              icon={Pencil}
-              label={isSystem ? 'Изменить обложку' : 'Изменить плейлист'}
-              className="playlist-head__edit"
-              onClick={openEdit}
-            />
             <MenuButton
               label="Другие действия с плейлистом"
               icon={MoreHorizontal}
@@ -474,6 +610,33 @@ export function PlaylistDetailPage() {
               ]}
             />
           </div>
+
+          {switchBusy && switching?.mode === 'now' && (
+            <p className="playlist-switch-note" role="status">
+              Переключаем на «{switching.name}»…
+            </p>
+          )}
+          {switchBusy && switching?.mode === 'next' && (
+            <p className="playlist-switch-note" role="status">
+              После текущего трека: {switching.name}
+            </p>
+          )}
+          {!switchBusy && isPending && (
+            <p className="playlist-switch-note" role="status">
+              После текущего трека: {pendingName}
+            </p>
+          )}
+          {cyclePending !== null && (
+            <p className="playlist-sync-note" role="status">
+              Очередь обновится после подтверждения движка…
+            </p>
+          )}
+          {settingsStore.application(playlist.id) === 'pending' && (
+            <p className="playlist-sync-note" role="status">
+              Настройка сохранена, применяется…
+            </p>
+          )}
+          {settingsStore.error && <InlineError message={settingsStore.error} />}
         </div>
       </Panel>
 
@@ -571,7 +734,17 @@ export function PlaylistDetailPage() {
               >
                 <span className="playlist-row__index">
                   {!isSystem && <GripVertical size={13} className="playlist-row__grip" aria-hidden="true" />}
-                  {index + 1}
+                  <button
+                    type="button"
+                    className="row-play"
+                    title="Воспроизвести в эфире"
+                    aria-label={`Воспроизвести в эфире: ${track.title}`}
+                    disabled={state?.desired !== 'playing'}
+                    onClick={() => void playTrackInAir(track)}
+                  >
+                    <span className="row-play__number">{index + 1}</span>
+                    <Play size={12} className="row-play__icon" aria-hidden="true" />
+                  </button>
                 </span>
                 <Cover src={track.coverUrl} alt="" size="xs" />
                 <div className="playlist-row__text">
@@ -588,36 +761,13 @@ export function PlaylistDetailPage() {
                 </span>
                 <span className="playlist-row__duration">{formatDuration(track.duration)}</span>
                 <div className="playlist-row__actions">
-                  <MenuButton
-                    label={`Действия с треком ${track.title}`}
-                    items={[
-                      {
-                        label: 'Изменить трек',
-                        icon: Pencil,
-                        onSelect: () => setEditTrack(track),
-                      },
-                      {
-                        label: 'Скачать трек',
-                        icon: Download,
-                        onSelect: () => triggerDownload(trackDownloadUrl(track.id, 'tags')),
-                      },
-                      {
-                        label: 'Скачать оригинал',
-                        icon: Download,
-                        onSelect: () => triggerDownload(trackDownloadUrl(track.id, 'original')),
-                      },
-                      ...(!isSystem
-                        ? [
-                            {
-                              label: 'Убрать из плейлиста',
-                              icon: X,
-                              danger: true,
-                              separatorBefore: true,
-                              onSelect: () => void removeTrack(track),
-                            },
-                          ]
-                        : []),
-                    ]}
+                  <TrackMenu
+                    track={track}
+                    playlistId={playlist.id}
+                    systemPlaylist={isSystem}
+                    onEdit={setEditTrack}
+                    onDelete={setDeleteTrack}
+                    onRemoved={refresh}
                   />
                   {!isSystem && (
                     <>
@@ -791,6 +941,19 @@ export function PlaylistDetailPage() {
         open={exportComposition !== null}
         composition={exportComposition}
         onClose={() => setExportComposition(null)}
+      />
+
+      <TemporarySwitchDialog
+        open={tempOpen}
+        onClose={() => setTempOpen(false)}
+        defaultPlaylistId={playlist.id}
+      />
+
+      <DeleteTrackDialog
+        open={deleteTrack !== null}
+        track={deleteTrack}
+        onClose={() => setDeleteTrack(null)}
+        onDeleted={refresh}
       />
     </div>
   );

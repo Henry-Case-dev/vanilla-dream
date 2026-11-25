@@ -1,6 +1,6 @@
 import { useMemo } from 'react';
 import { Link } from 'react-router-dom';
-import { Headphones, Play, Square } from 'lucide-react';
+import { Headphones, Pause, Play, RotateCw, Square, X } from 'lucide-react';
 import { Logo } from '../components/Logo';
 import { Cover } from '../components/Cover';
 import { StatusPill } from '../components/StatusPill';
@@ -13,7 +13,7 @@ import { useAudio } from '../lib/audio';
 import { useLive } from '../lib/live';
 import { useResource } from '../lib/hooks';
 import { api, publicLinksFromStation } from '../lib/api';
-import { formatDuration, formatTime, formatUntil, sourceDisplayName } from '../lib/format';
+import { formatDuration, formatTime, formatUntil, effectiveSourceName } from '../lib/format';
 import { describeStationStatus } from '../lib/status';
 
 /**
@@ -27,7 +27,7 @@ export function PublicPlayerPage() {
 
   const station = now?.station ?? null;
   const track = now?.track ?? null;
-  const sourceName = sourceDisplayName(now?.source);
+  const sourceName = effectiveSourceName(station?.effectiveSource ?? now?.source);
   const statusView = describeStationStatus(station?.status, station?.reason);
 
   const links = useMemo(() => {
@@ -44,6 +44,39 @@ export function PublicPlayerPage() {
     if (track.elapsed !== null && track.duration) return Math.min(1, track.elapsed / track.duration);
     return null;
   }, [track]);
+
+  const localBusy = audio.state === 'connecting' || audio.state === 'reconnecting';
+  const localFailed = audio.state === 'unavailable';
+  const localLabel =
+    audio.state === 'connecting'
+      ? 'Подключение…'
+      : audio.state === 'buffering'
+        ? 'Буферизация…'
+        : audio.state === 'reconnecting'
+          ? 'Переподключение…'
+          : audio.state === 'station_off'
+            ? 'Эфир остановлен'
+            : audio.state === 'blocked'
+              ? 'Нажмите Play, чтобы продолжить'
+              : audio.state === 'unavailable'
+                ? 'Поток недоступен'
+                : audio.state === 'playing'
+                  ? 'Играет локально'
+                  : audio.canPlay
+                    ? 'Слушать эфир'
+                    : audio.unavailableReason ?? 'Прослушивание недоступно';
+
+  const localClick = () => {
+    if (localBusy) {
+      audio.cancel();
+      return;
+    }
+    if (localFailed || audio.state === 'blocked') {
+      audio.reconnect();
+      return;
+    }
+    void audio.toggle();
+  };
 
   if (loading && !now) {
     return (
@@ -140,11 +173,7 @@ export function PublicPlayerPage() {
             )}
 
             <MetaRow className="public-hero__meta">
-              {sourceName && (
-                <span className="meta-item">
-                  Источник: {now?.source?.kind === 'override' ? `Ручной выбор · ${sourceName}` : sourceName}
-                </span>
-              )}
+              {sourceName && <span className="meta-item">Источник: {sourceName}</span>}
               {station?.bitrate ? <span className="meta-item">{station.bitrate} кбит/с</span> : null}
               {now?.listeners.available ? (
                 <span className="meta-item">{now.listeners.count ?? 0} слушателей</span>
@@ -163,38 +192,47 @@ export function PublicPlayerPage() {
               <button
                 type="button"
                 className={`play-fab ${audio.playing ? 'is-playing' : ''}`.trim()}
-                onClick={() => void audio.toggle()}
-                disabled={!audio.canPlay || audio.busy}
-                aria-label={audio.playing ? 'Остановить локальное прослушивание' : 'Слушать эфир'}
-                title={
-                  audio.canPlay
-                    ? audio.playing
-                      ? 'Остановить локальное прослушивание'
-                      : 'Слушать эфир'
-                    : 'Ссылка на поток ещё не получена'
+                onClick={localClick}
+                disabled={!audio.canPlay && audio.intent === 'idle' && audio.state !== 'station_off'}
+                aria-label={
+                  localBusy
+                    ? 'Отменить подключение'
+                    : localFailed || audio.state === 'blocked'
+                      ? 'Переподключиться к потоку'
+                      : audio.playing
+                        ? 'Остановить локальное прослушивание'
+                        : 'Слушать эфир'
                 }
+                title={localLabel}
               >
-                {audio.playing ? <Square size={22} /> : <Play size={24} />}
+                {localBusy ? (
+                  <X size={22} />
+                ) : audio.state === 'station_off' && audio.intent !== 'idle' ? (
+                  <Square size={20} />
+                ) : localFailed ? (
+                  <RotateCw size={22} />
+                ) : audio.state === 'buffering' ? (
+                  <Pause size={22} />
+                ) : audio.playing ? (
+                  <Square size={22} />
+                ) : (
+                  <Play size={24} />
+                )}
               </button>
               <div className="public-hero__controls-text">
-                <span className="public-hero__controls-title">
-                  {!audio.canPlay
-                    ? audio.unavailableReason ?? 'Прослушивание недоступно'
-                    : audio.busy
-                      ? 'Подключение…'
-                      : audio.state === 'reconnecting'
-                        ? 'Переподключение…'
-                        : audio.playing
-                          ? 'Играет локально'
-                          : 'Слушать эфир'}
-                </span>
+                <span className="public-hero__controls-title">{localLabel}</span>
                 <span className="public-hero__controls-sub">Звук только в вашем браузере</span>
               </div>
               <VolumeControl value={audio.volume} onChange={audio.setVolume} disabled={!audio.canPlay} />
             </div>
 
-            {audio.error && <InlineError message={audio.error} />}
-            {!audio.canPlay && !audio.error && (
+            {audio.error && (audio.state === 'blocked' || audio.state === 'unavailable') && (
+              <InlineError message={audio.error} />
+            )}
+            {audio.state === 'reconnecting' && !audio.error && (
+              <p className="public-hero__hint">Переподключаемся к потоку…</p>
+            )}
+            {!audio.canPlay && audio.intent === 'idle' && (
               <p className="public-hero__hint">
                 {audio.unavailableReason === 'Сначала запустите эфир'
                   ? 'Локальное прослушивание включается после старта эфира.'
@@ -263,8 +301,9 @@ export function PublicPlayerPage() {
             title="Локальное прослушивание не меняет эфир"
             size="sm"
             className="public__footer-icon"
-            onClick={() => void audio.toggle()}
-            disabled={!audio.canPlay}
+            onClick={localClick}
+            disabled={!audio.canPlay && audio.intent === 'idle'}
+            loading={localBusy}
           />
           <Link to="/admin" className="public__footer-link">
             Панель управления

@@ -67,6 +67,52 @@ print('backup', dst, dst.stat().st_size)
 PY
 ls -1dt "$BACKUP_DIR"/app-*.db 2>/dev/null | tail -n +8 | xargs -r rm -f --
 
+# Icecast mount defaults follow the station settings (the live icy-* values are
+# sent by Liquidsoap from station.liq). A graceful reload keeps listeners.
+log "Applying station metadata to Icecast"
+icecast_cfg=/etc/vanilla-dream-radio/icecast.xml
+if [[ -f "$icecast_cfg" && -f /var/lib/vanilla-dream-radio/app.db ]]; then
+  before="$(sha256sum "$icecast_cfg" | cut -d' ' -f1)"
+  "$APP_DIR/venv/bin/python" - /var/lib/vanilla-dream-radio/app.db "$icecast_cfg" <<'PY'
+import re
+import sqlite3
+import sys
+
+db_path, cfg_path = sys.argv[1], sys.argv[2]
+conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+
+
+def setting(key: str, default: str = "") -> str:
+    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return row[0] if row and row[0] is not None else default
+
+
+values = {
+    "stream-name": setting("station_name", "Vanilla Dream Radio"),
+    "stream-description": setting("station_description", ""),
+    "stream-url": setting("public_base_url", ""),
+    "genre": setting("station_genre", ""),
+}
+
+
+def escape(value: str) -> str:
+    return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+with open(cfg_path, encoding="utf-8") as fh:
+    text = fh.read()
+for tag, value in values.items():
+    text = re.sub(rf"<{tag}>.*?</{tag}>", f"<{tag}>{escape(value)}</{tag}>", text, count=1, flags=re.S)
+with open(cfg_path, "w", encoding="utf-8") as fh:
+    fh.write(text)
+print("icecast metadata:", values["stream-name"])
+PY
+  after="$(sha256sum "$icecast_cfg" | cut -d' ' -f1)"
+  if [[ "$before" != "$after" ]] && systemctl is-active --quiet vanilla-dream-radio-icecast.service; then
+    systemctl kill -s HUP vanilla-dream-radio-icecast.service || true
+  fi
+fi
+
 log "Ensuring runtime directories"
 install -d -o "$RADIO_USER" -g "$RADIO_USER" -m 0755 /srv/vanilla-dream-radio/covers/playlists
 install -d -o "$RADIO_USER" -g "$RADIO_USER" -m 0750 /srv/vanilla-dream-radio/music/.pending
@@ -79,7 +125,9 @@ for line in \
   'VD_EXPORT_DIR=/var/lib/vanilla-dream-radio/exports' \
   'VD_UPLOAD_TTL_HOURS=24' \
   'VD_EXPORT_TTL_HOURS=6' \
-  'VD_EXPORT_RESERVE_BYTES=536870912'; do
+  'VD_EXPORT_RESERVE_BYTES=536870912' \
+  'VD_MIN_FREE_BYTES=3221225472' \
+  'VD_HISTORY_RETENTION_DAYS=0'; do
   key="${line%%=*}"
   grep -q "^${key}=" "$ETC_DIR/env" || printf '%s\n' "$line" >> "$ETC_DIR/env"
 done

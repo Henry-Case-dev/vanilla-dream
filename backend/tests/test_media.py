@@ -181,7 +181,9 @@ def test_delete_cleans_relations_and_files(env, admin):
     response = env.client.delete(f"/api/admin/tracks/{first['id']}")
     assert response.status_code == 200
     body = response.json()
-    assert body == {"deleted": True, "pending": False, "playlists_count": 1}
+    assert body["deleted"] is True
+    assert body["pending"] is False
+    assert body["playlists_count"] == 1
 
     conn = db.open_db(env.settings)
     try:
@@ -215,7 +217,11 @@ def test_delete_current_track_is_deferred(env, admin):
     assert file_path.exists()
 
     response = env.client.delete(f"/api/admin/tracks/{first['id']}")
-    assert response.json() == {"deleted": False, "pending": True, "playlists_count": 1}
+    body = response.json()
+    assert body["deleted"] is False
+    assert body["pending"] is True
+    assert body["playlists_count"] == 1
+    assert body["current"] is True
     assert file_path.exists()
 
     play_next(env)

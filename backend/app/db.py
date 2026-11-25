@@ -15,7 +15,7 @@ from .config import (
     Settings,
 )
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
 DEFAULT_SETTINGS: dict[str, str] = {
@@ -36,6 +36,13 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "engine_last_start": "",
     "engine_last_error": "",
     "last_schedule_change": "",
+    "playback_mode": "playlist",
+    "selected_playlist_id": SYSTEM_PLAYLIST_ID,
+    "pending_source": "",
+    "state_revision": "0",
+    "applied_revision": "0",
+    "queue_revision": "0",
+    "history_revision": "0",
 }
 
 # Keys starting with an underscore are internal bookkeeping and never exposed
@@ -123,6 +130,163 @@ def _migrate_locked(conn: sqlite3.Connection, previous_version: int) -> None:
             ("_cycle:library", "_cycle:playlist:library"),
         )
     _migrate_tracks_v3(conn)
+    _migrate_core_v4(conn, previous_version)
+
+
+def _convert_override_source_refs(
+    conn: sqlite3.Connection, override_id: str, playlist_id: str
+) -> None:
+    """Keep the converted playlist's cycle, queue and exclusions continuous.
+
+    A 1.1.1 database stores the live queue under
+    ``override:<id>:playlist:<playlist_id>``. After the override is converted
+    into the permanent playlist selection, the effective source key becomes
+    ``playlist:<playlist_id>`` (or ``library``). The old refs must be renamed
+    before the first ``ensure_queue`` so the passed part of the cycle is not
+    replayed and the prepared positions are not dropped.
+    """
+
+    old_prefix = f"override:{override_id}:playlist:{playlist_id}"
+    new_key = (
+        SYSTEM_PLAYLIST_ID
+        if playlist_id == SYSTEM_PLAYLIST_ID
+        else f"playlist:{playlist_id}"
+    )
+    for old_key, new_setting in (
+        (f"_cycle:{old_prefix}", f"_cycle:{new_key}"),
+        (f"_source_sig:{old_prefix}", f"_source_sig:{new_key}"),
+    ):
+        row = conn.execute(
+            "SELECT value FROM settings WHERE key = ?", (old_key,)
+        ).fetchone()
+        if row is not None:
+            conn.execute(
+                "INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)",
+                (new_setting, row["value"]),
+            )
+
+    prefix_length = len(old_prefix)
+    for table in ("queue_positions", "playback_state", "history"):
+        conn.execute(
+            f"UPDATE {table} SET source_ref = ? || substr(source_ref, ?) "
+            "WHERE substr(source_ref, 1, ?) = ?",
+            (new_key, prefix_length + 1, prefix_length, old_prefix),
+        )
+
+    old_exclusions = f"_queue_excluded:{old_prefix}"
+    new_exclusions = f"_queue_excluded:{new_key}"
+    exclusion_rows = conn.execute(
+        "SELECT key, value FROM settings WHERE substr(key, 1, ?) = ?",
+        (len(old_exclusions), old_exclusions),
+    ).fetchall()
+    for row in exclusion_rows:
+        suffix = str(row["key"])[len(old_exclusions):]
+        conn.execute(
+            "INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)",
+            (new_exclusions + suffix, row["value"]),
+        )
+        conn.execute("DELETE FROM settings WHERE key = ?", (row["key"],))
+
+
+def _migrate_core_v4(conn: sqlite3.Connection, previous_version: int = 4) -> None:
+    """Additive 1.2.0 settings, export columns and old-override conversion."""
+
+    export_columns = {
+        str(row["name"]) for row in conn.execute("PRAGMA table_info(export_jobs)")
+    }
+    if "snapshot" not in export_columns:
+        conn.execute("ALTER TABLE export_jobs ADD COLUMN snapshot TEXT")
+    if "finished_at" not in export_columns:
+        conn.execute("ALTER TABLE export_jobs ADD COLUMN finished_at TEXT")
+
+    def has_setting(key: str) -> bool:
+        return (
+            conn.execute("SELECT 1 FROM settings WHERE key = ? LIMIT 1", (key,)).fetchone()
+            is not None
+        )
+
+    def setting(key: str, default: str = "") -> str:
+        row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return str(row["value"]) if row is not None else default
+
+    old_overrides = (
+        conn.execute(
+            "SELECT id, playlist_id FROM overrides "
+            "WHERE active = 1 AND kind = 'playlist' AND scope = 'indefinite' "
+            "AND note LIKE '%Запуск плейлиста%' "
+            "ORDER BY created_at DESC, id DESC"
+        ).fetchall()
+        if previous_version < 4
+        else []
+    )
+    converted = old_overrides[0] if old_overrides else None
+
+    if not has_setting("playback_mode"):
+        if converted is not None and converted["playlist_id"]:
+            mode = "playlist"
+            selected = str(converted["playlist_id"])
+        else:
+            auto_configured = bool(
+                conn.execute("SELECT 1 FROM schedule_rules LIMIT 1").fetchone()
+                or conn.execute("SELECT 1 FROM rotation_items LIMIT 1").fetchone()
+                or setting("default_playlist_id")
+            )
+            mode = "auto" if auto_configured else "playlist"
+            selected = SYSTEM_PLAYLIST_ID
+            if mode == "playlist":
+                playback = conn.execute(
+                    "SELECT source_kind, source_ref FROM playback_state WHERE singleton = 1"
+                ).fetchone()
+                if playback is not None:
+                    parts = str(playback["source_ref"] or "").split(":")
+                    if "playlist" in parts:
+                        index = parts.index("playlist")
+                        if index + 1 < len(parts):
+                            selected = parts[index + 1]
+                    elif str(playback["source_kind"] or "") == "library":
+                        selected = SYSTEM_PLAYLIST_ID
+        conn.execute(
+            "INSERT INTO settings(key, value) VALUES('playback_mode', ?)", (mode,)
+        )
+        conn.execute(
+            "INSERT INTO settings(key, value) VALUES('selected_playlist_id', ?)",
+            (selected,),
+        )
+    for override in old_overrides:
+        conn.execute("UPDATE overrides SET active = 0 WHERE id = ?", (override["id"],))
+
+    if has_setting("playback_mode"):
+        mode = setting("playback_mode", "playlist")
+        if mode not in ("playlist", "auto"):
+            conn.execute(
+                "UPDATE settings SET value = 'playlist' WHERE key = 'playback_mode'"
+            )
+    if not has_setting("selected_playlist_id"):
+        selected = (
+            str(converted["playlist_id"])
+            if converted is not None and converted["playlist_id"]
+            else SYSTEM_PLAYLIST_ID
+        )
+        conn.execute(
+            "INSERT INTO settings(key, value) VALUES('selected_playlist_id', ?)",
+            (selected,),
+        )
+    if not has_setting("pending_source"):
+        conn.execute("INSERT INTO settings(key, value) VALUES('pending_source', '')")
+    if not has_setting("state_revision"):
+        conn.execute("INSERT INTO settings(key, value) VALUES('state_revision', '0')")
+    if not has_setting("queue_revision"):
+        conn.execute("INSERT INTO settings(key, value) VALUES('queue_revision', '0')")
+    if not has_setting("history_revision"):
+        conn.execute("INSERT INTO settings(key, value) VALUES('history_revision', '0')")
+
+    if converted is not None and converted["playlist_id"]:
+        playlist_id = str(converted["playlist_id"])
+        if (
+            setting("playback_mode") == "playlist"
+            and setting("selected_playlist_id") == playlist_id
+        ):
+            _convert_override_source_refs(conn, str(converted["id"]), playlist_id)
 
 
 TRACK_COLUMNS_V3 = (

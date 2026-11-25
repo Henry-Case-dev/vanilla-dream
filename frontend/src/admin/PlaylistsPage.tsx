@@ -6,7 +6,7 @@ import { Cover } from '../components/Cover';
 import { Modal } from '../components/Modal';
 import { EmptyState, ErrorState, LoadingState } from '../components/States';
 import { useToast } from '../components/Toasts';
-import { useResource } from '../lib/hooks';
+import { usePlaylistSettings } from '../lib/playlist-settings';
 import { api, errorMessage } from '../lib/api';
 import { formatCount, formatLongDuration, pluralRu, tracksLabel, repeatLabel } from '../lib/format';
 import { RotationPanel } from './RotationPanel';
@@ -18,7 +18,7 @@ export function PlaylistsPage() {
   const [params, setParams] = useSearchParams();
   const tab = params.get('tab') === 'rotation' ? 'rotation' : 'playlists';
 
-  const playlists = useResource(() => api.admin.playlists.list(), []);
+  const playlists = usePlaylistSettings();
   const [createOpen, setCreateOpen] = useState(false);
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
@@ -56,7 +56,7 @@ export function PlaylistsPage() {
     setParams(next === 'rotation' ? { tab: 'rotation' } : {});
   };
 
-  const items = playlists.data ?? [];
+  const items = playlists.playlists ?? [];
 
   return (
     <div className="page page--playlists">
@@ -80,7 +80,7 @@ export function PlaylistsPage() {
                 icon={RefreshCw}
                 label="Обновить список"
                 title="Обновить список"
-                onClick={() => void playlists.reload()}
+                onClick={() => void playlists.refresh()}
               />
               <Button variant="primary" icon={Plus} onClick={openCreate}>
                 Создать плейлист
@@ -113,10 +113,10 @@ export function PlaylistsPage() {
 
       {tab === 'rotation' ? (
         <RotationPanel />
-      ) : playlists.loading && !playlists.data ? (
+      ) : playlists.loading && !playlists.playlists ? (
         <LoadingState label="Загружаем плейлисты…" rows={4} />
-      ) : playlists.error && !playlists.data ? (
-        <ErrorState message={playlists.error} onRetry={() => void playlists.reload()} />
+      ) : playlists.error && !playlists.playlists ? (
+        <ErrorState message={playlists.error} onRetry={() => void playlists.refresh()} />
       ) : items.length === 0 ? (
         <Panel>
           <EmptyState

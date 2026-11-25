@@ -26,6 +26,7 @@ def _setup_playing(env, admin, *, listeners: int = 7):
     )
     playlist = make_playlist(env.client, "Эфир", [first["id"], second["id"]])
     env.client.put("/api/admin/settings", json={"default_playlist_id": playlist["id"]})
+    env.client.put("/api/admin/station/mode", json={"mode": "auto"})
     env.client.post("/api/admin/station/start")
     env.icecast.payload = {
         "available": True,
@@ -98,6 +99,7 @@ def test_stats_unavailable_is_not_zero(env, admin):
     )
     playlist = make_playlist(env.client, "Stats", [first["id"]])
     env.client.put("/api/admin/settings", json={"default_playlist_id": playlist["id"]})
+    env.client.put("/api/admin/station/mode", json={"mode": "auto"})
     env.client.post("/api/admin/station/start")
     env.icecast.payload = {
         "available": False,

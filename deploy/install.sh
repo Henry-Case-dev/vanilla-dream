@@ -116,6 +116,8 @@ VD_EXPORT_DIR=$STATE_DIR/exports
 VD_UPLOAD_TTL_HOURS=24
 VD_EXPORT_TTL_HOURS=6
 VD_EXPORT_RESERVE_BYTES=536870912
+VD_MIN_FREE_BYTES=3221225472
+VD_HISTORY_RETENTION_DAYS=0
 VD_ENGINE_DIR=$RUN_DIR
 VD_ENGINE_QUEUE_FILE=$RUN_DIR/engine-queue.txt
 VD_ENGINE_SOCKET=$RUN_DIR/liquidsoap.sock
@@ -211,6 +213,45 @@ run_as_radio() {
 # ---------------------------------------------------------------- database
 log "Database"
 run_as_radio "$APP_DIR/venv/bin/python" -m app.cli init-db || die "database initialisation failed"
+
+# Icecast mount defaults are rendered from the station settings, never from a
+# literal brand in the template. The live icy-* values are sent by Liquidsoap
+# from station.liq (also written from the settings).
+log "Applying station metadata to Icecast"
+"$APP_DIR/venv/bin/python" - "$STATE_DIR/app.db" "$ETC_DIR/icecast.xml" <<'PY'
+import re
+import sqlite3
+import sys
+
+db_path, cfg_path = sys.argv[1], sys.argv[2]
+conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+
+
+def setting(key: str, default: str = "") -> str:
+    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return row[0] if row and row[0] is not None else default
+
+
+values = {
+    "stream-name": setting("station_name", "Vanilla Dream Radio"),
+    "stream-description": setting("station_description", ""),
+    "stream-url": setting("public_base_url", ""),
+    "genre": setting("station_genre", ""),
+}
+
+
+def escape(value: str) -> str:
+    return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+with open(cfg_path, encoding="utf-8") as fh:
+    text = fh.read()
+for tag, value in values.items():
+    text = re.sub(rf"<{tag}>.*?</{tag}>", f"<{tag}>{escape(value)}</{tag}>", text, count=1, flags=re.S)
+with open(cfg_path, "w", encoding="utf-8") as fh:
+    fh.write(text)
+print("icecast metadata:", values["stream-name"])
+PY
 
 if [[ -n "$ADMIN_PASSWORD_FILE" && -f "$ADMIN_PASSWORD_FILE" ]]; then
   if run_as_radio "$APP_DIR/venv/bin/python" -m app.cli password-is-set 2>/dev/null | grep -q '^set$'; then

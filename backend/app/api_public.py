@@ -112,13 +112,21 @@ def build_now_playing(conn: sqlite3.Connection, app, now: datetime | None = None
     stats_available = bool(stats.get("available"))
     bitrate = stats.get("bitrate") if stats_available else None
     state = status.get("state", "off")
+    state_block = queue_engine.station_state(
+        conn, settings, now, status=status, public=True
+    )
     return {
+        "queue_revision": queue_engine.queue_revision(conn),
+        "history_revision": queue_engine.history_revision(conn),
         "station": {
             "name": db.get_setting(conn, "station_name"),
             "description": db.get_setting(conn, "station_description"),
             "status": state,
             "status_label": STATE_LABELS.get(state, state),
             "reason": status.get("reason"),
+            "mode": state_block.get("mode"),
+            "effective_source": state_block.get("effective_source"),
+            "state_revision": state_block.get("state_revision"),
             "desired": status.get("desired", db.get_setting(conn, "desired_state")),
             "stream_url": f"{base}/radio.mp3",
             "m3u_url": f"{base}/radio.m3u",
@@ -249,6 +257,7 @@ async def events(request: Request):
 def public_cover(
     track_id: str,
     request: Request,
+    source: str | None = None,
     conn: sqlite3.Connection = Depends(get_conn),
 ):
     row = conn.execute(
@@ -256,9 +265,17 @@ def public_cover(
     ).fetchone()
     if row is None:
         raise ApiError(404, "cover_not_found", "Обложка не найдена.")
-    path = media.effective_cover_path(request.app.state.settings, row)
-    if path is None:
-        raise ApiError(404, "cover_not_found", "Обложка не найдена.")
+    settings = request.app.state.settings
+    if source == "original":
+        if not row["cover_path"]:
+            raise ApiError(404, "cover_not_found", "Обложка не найдена.")
+        path = settings.cover_dir / str(row["cover_path"])
+        if not is_relative_to(path, settings.cover_dir) or not path.exists():
+            raise ApiError(404, "cover_not_found", "Обложка не найдена.")
+    else:
+        path = media.effective_cover_path(settings, row)
+        if path is None:
+            raise ApiError(404, "cover_not_found", "Обложка не найдена.")
     return FileResponse(path, media_type="image/jpeg", headers={"Cache-Control": COVER_CACHE})
 
 

@@ -122,6 +122,36 @@ def capture_stream(url: str, seconds: float) -> bytes:
     return bytes(buf)
 
 
+def check_icy_identity(base: str, stream: str) -> None:
+    """The public stream must carry the station identity from the settings."""
+
+    try:
+        payload = json.loads(http_get(base + "/api/public/now-playing")[1].decode("utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        check("icy identity: public api", False, repr(exc))
+        return
+    station = payload.get("station") or {}
+    expected_name = str(station.get("name") or "")
+    try:
+        req = urllib.request.Request(stream, headers={"Icy-MetaData": "1", "User-Agent": "vdr-check"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            headers = {key.lower(): value for key, value in resp.headers.items()}
+    except Exception as exc:  # noqa: BLE001
+        check("icy identity: stream headers", False, repr(exc))
+        return
+    icy_name = headers.get("icy-name") or headers.get("ice-name") or ""
+    check(
+        "icy-name is the station name from the settings",
+        bool(expected_name) and icy_name.strip() == expected_name.strip(),
+        f"icy-name={icy_name!r} settings={expected_name!r}",
+    )
+    check("icy-name is not the domain", icy_name.strip().lower() not in {
+        "vanilladream.duckdns.org", "localhost",
+    }, icy_name)
+    for field in ("icy-description", "icy-genre", "icy-url", "icy-br"):
+        check(f"icy identity: {field} present", bool(headers.get(field)), headers.get(field, ""))
+
+
 def check_stream(url: str, seconds: float) -> None:
     try:
         raw = capture_stream(url, seconds)
@@ -240,6 +270,7 @@ def main() -> int:
     check_api(args.base)
     check_icecast(args.stats)
     check_stream(args.stream, args.seconds)
+    check_icy_identity(args.base, args.stream)
     check_listeners(args.stats, args.stream)
     if not args.skip_adminbot:
         check_adminbot()

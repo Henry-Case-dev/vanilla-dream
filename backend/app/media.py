@@ -208,9 +208,7 @@ def effective_cover_name(row) -> str | None:
     return str(extracted) if extracted else None
 
 
-def save_custom_cover(settings: Settings, track_id: str, stream: BinaryIO) -> str:
-    """Validate, crop and store a custom square 600x600 JPEG cover."""
-
+def _render_square_cover(stream: BinaryIO) -> bytes:
     from PIL import Image
 
     data = stream.read(PLAYLIST_COVER_MAX_BYTES + 1)
@@ -241,23 +239,50 @@ def save_custom_cover(settings: Settings, track_id: str, stream: BinaryIO) -> st
     if image.mode not in ("RGB", "L"):
         image = image.convert("RGB")
     image = image.resize((PLAYLIST_COVER_SIDE, PLAYLIST_COVER_SIDE), Image.LANCZOS)
-    digest = hashlib.sha256(data).hexdigest()[:8]
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", quality=88, optimize=True)
+    return buffer.getvalue()
+
+
+def prepare_custom_cover(
+    settings: Settings, track_id: str, stream: BinaryIO
+) -> tuple[Path, str]:
+    """Validate and write a new custom cover to a temporary file."""
+
+    rendered = _render_square_cover(stream)
+    digest = hashlib.sha256(rendered).hexdigest()[:8]
     safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", str(track_id))[:64] or "track"
     custom_dir = settings.cover_dir / "custom"
     custom_dir.mkdir(parents=True, exist_ok=True)
-    destination = custom_dir / f"{safe_id}-{digest}.jpg"
     fd, temp_name = tempfile.mkstemp(prefix=".cover-", suffix=".jpg", dir=str(custom_dir))
     try:
         with os.fdopen(fd, "wb") as handle:
-            image.save(handle, format="JPEG", quality=88, optimize=True)
-        os.replace(temp_name, destination)
+            handle.write(rendered)
+            handle.flush()
+            os.fsync(handle.fileno())
     except BaseException:
         try:
             os.unlink(temp_name)
         except OSError:
             pass
         raise
-    return f"custom/{destination.name}"
+    return Path(temp_name), f"custom/{safe_id}-{digest}.jpg"
+
+
+def save_custom_cover(settings: Settings, track_id: str, stream: BinaryIO) -> str:
+    """Validate, crop and store a custom square 600x600 JPEG cover."""
+
+    temp_path, relative = prepare_custom_cover(settings, track_id, stream)
+    destination = settings.cover_dir / relative
+    try:
+        os.replace(temp_path, destination)
+    except BaseException:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    return relative
 
 
 def remove_custom_cover(settings: Settings, relative: str | None) -> None:
@@ -412,20 +437,58 @@ def ingest_upload(
     return uploads.receive_upload(conn, settings, stream, filename, now, batch_id=batch_id)
 
 
-def purge_track(conn: sqlite3.Connection, settings: Settings, track_id: str) -> None:
-    """Delete files and every DB reference for a track (caller owns the transaction)."""
+def _export_protects_track(conn: sqlite3.Connection, track_id: str) -> bool:
+    try:
+        from . import exports
+
+        return exports.track_is_exported(conn, track_id)
+    except Exception:  # noqa: BLE001 - protection is best effort, never destructive
+        LOGGER.warning("failed to check export protection for %s", track_id, exc_info=True)
+        return False
+
+
+def purge_track(conn: sqlite3.Connection, settings: Settings, track_id: str) -> bool:
+    """Delete the physical file first; keep the row when deletion fails."""
 
     row = conn.execute("SELECT * FROM tracks WHERE id = ?", (track_id,)).fetchone()
     if row is None:
-        return
+        return True
+    if _export_protects_track(conn, track_id):
+        warning_key = f"_warn:export-protect:{track_id}"
+        if db.get_setting(conn, warning_key) != "1":
+            db.set_setting(conn, warning_key, "1")
+            db.log_event(
+                conn,
+                "info",
+                "media",
+                "Удаление трека отложено: файл используется экспортом",
+                {"track_id": track_id},
+            )
+        return False
     path = Path(str(row["path"] or ""))
     if not path.is_absolute():
         path = settings.music_dir / path
-    if is_relative_to(path, settings.music_dir):
-        try:
-            path.unlink(missing_ok=True)
-        except OSError:
-            LOGGER.warning("failed to delete audio file %s", path, exc_info=True)
+    if not is_relative_to(path, settings.music_dir):
+        db.log_event(
+            conn,
+            "error",
+            "media",
+            "Удаление трека отменено: путь вне медиатеки",
+            {"track_id": track_id, "path": str(row["path"] or "")},
+        )
+        return False
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        LOGGER.warning("failed to delete audio file %s", path, exc_info=True)
+        db.log_event(
+            conn,
+            "error",
+            "media",
+            "Не удалось удалить файл трека, попытка будет повторена",
+            {"track_id": track_id, "path": str(path)},
+        )
+        return False
     cover = row["cover_path"]
     if cover:
         cover_file = settings.cover_dir / str(cover)
@@ -436,14 +499,15 @@ def purge_track(conn: sqlite3.Connection, settings: Settings, track_id: str) -> 
                 LOGGER.warning("failed to delete cover %s", cover_file, exc_info=True)
     if "custom_cover_path" in row.keys():
         remove_custom_cover(settings, row["custom_cover_path"])
-    positions = conn.execute(
-        "SELECT id FROM queue_positions WHERE track_id = ?", (track_id,)
-    ).fetchall()
-    for position in positions:
-        remove_queue_link(settings, str(position["id"]))
     conn.execute("DELETE FROM playlist_tracks WHERE track_id = ?", (track_id,))
-    conn.execute("DELETE FROM queue_positions WHERE track_id = ?", (track_id,))
+    if conn.execute(
+        "DELETE FROM queue_positions WHERE track_id = ?", (track_id,)
+    ).rowcount:
+        from . import queue_engine
+
+        queue_engine.bump_queue_revision(conn)
     conn.execute("DELETE FROM tracks WHERE id = ?", (track_id,))
+    return True
 
 
 def playlists_with_track(conn: sqlite3.Connection, track_id: str) -> int:
@@ -464,27 +528,153 @@ def is_track_current(conn: sqlite3.Connection, track_id: str) -> bool:
     return row is not None
 
 
+def track_has_future_positions(conn: sqlite3.Connection, track_id: str) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM queue_positions WHERE track_id = ? "
+            "AND state IN ('pending', 'prepared') LIMIT 1",
+            (track_id,),
+        ).fetchone()
+        is not None
+    )
+
+
+def queue_sync_unresolved(conn: sqlite3.Connection) -> bool:
+    """A failed sync means the engine may still reference the old queue."""
+
+    return bool(db.get_setting(conn, "_engine_sync_error"))
+
+
+def purge_confirmed(
+    conn: sqlite3.Connection, settings: Settings, track_id: str
+) -> bool:
+    """Purge a pending deletion only when the engine has released the file."""
+
+    row = conn.execute(
+        "SELECT pending_delete FROM tracks WHERE id = ?", (track_id,)
+    ).fetchone()
+    if row is None or not int(row["pending_delete"] or 0):
+        return False
+    if is_track_current(conn, track_id):
+        return False
+    if track_has_future_positions(conn, track_id):
+        return False
+    if queue_sync_unresolved(conn):
+        return False
+    return purge_track(conn, settings, track_id)
+
+
+def _cancel_pending_for_tracks(conn: sqlite3.Connection, track_ids: set[str]) -> None:
+    from . import queue_engine
+
+    pending = queue_engine.pending_source(conn)
+    if pending is None:
+        return
+    head_id = str(pending.get("head_position_id") or "")
+    if not head_id:
+        return
+    row = conn.execute(
+        "SELECT track_id FROM queue_positions WHERE id = ?", (head_id,)
+    ).fetchone()
+    if row is None or str(row["track_id"]) in track_ids:
+        queue_engine.cancel_pending_source(conn)
+
+
 def delete_track(
-    conn: sqlite3.Connection, settings: Settings, track_id: str, now: datetime
+    conn: sqlite3.Connection,
+    settings: Settings,
+    track_id: str,
+    now: datetime,
+    mode: str = "after",
 ) -> dict:
+    if mode not in ("after", "now"):
+        raise ApiError(422, "invalid_delete_mode", "Режим удаления должен быть after или now.")
     row = conn.execute("SELECT * FROM tracks WHERE id = ?", (track_id,)).fetchone()
     if row is None:
         raise ApiError(404, "track_not_found", "Трек не найден.")
+    _cancel_pending_for_tracks(conn, {track_id})
     playlists_count = playlists_with_track(conn, track_id)
-    if is_track_current(conn, track_id):
+    was_current = is_track_current(conn, track_id)
+    conn.execute(
+        "UPDATE tracks SET pending_delete = 1, updated_at = ? WHERE id = ?",
+        (to_iso(now), track_id),
+    )
+    if conn.execute(
+        "DELETE FROM queue_positions WHERE track_id = ? AND state IN ('pending', 'prepared')",
+        (track_id,),
+    ).rowcount:
+        from . import queue_engine
+
+        queue_engine.bump_queue_revision(conn)
+    db.log_event(
+        conn,
+        "info",
+        "media",
+        "Трек исключён из медиатеки",
+        {"track_id": track_id, "mode": mode, "current": was_current},
+        at=to_iso(now),
+    )
+    conn.commit()
+    # The physical purge happens only after the rebuilt queue is confirmed by
+    # the engine (or immediately when the station is stopped).
+    return {
+        "deleted": False,
+        "pending": True,
+        "playlists_count": playlists_count,
+        "mode": mode,
+        "current": was_current,
+    }
+
+
+def bulk_delete(
+    conn: sqlite3.Connection,
+    settings: Settings,
+    track_ids: list[str],
+    now: datetime,
+) -> dict:
+    marked: list[str] = []
+    not_found: list[str] = []
+    current: list[str] = []
+    _cancel_pending_for_tracks(conn, {str(raw or "") for raw in track_ids})
+    for raw in track_ids:
+        track_id = str(raw or "")
+        row = conn.execute("SELECT id FROM tracks WHERE id = ?", (track_id,)).fetchone()
+        if row is None:
+            not_found.append(track_id)
+            continue
+        was_current = is_track_current(conn, track_id)
         conn.execute(
             "UPDATE tracks SET pending_delete = 1, updated_at = ? WHERE id = ?",
             (to_iso(now), track_id),
         )
-        db.log_event(
-            conn, "info", "media", "Трек играет, удаление отложено", {"track_id": track_id}
-        )
-        conn.commit()
-        return {"deleted": False, "pending": True, "playlists_count": playlists_count}
-    purge_track(conn, settings, track_id)
-    db.log_event(conn, "info", "media", "Трек удалён", {"track_id": track_id}, at=to_iso(now))
+        if conn.execute(
+            "DELETE FROM queue_positions WHERE track_id = ? "
+            "AND state IN ('pending', 'prepared')",
+            (track_id,),
+        ).rowcount:
+            from . import queue_engine
+
+            queue_engine.bump_queue_revision(conn)
+        marked.append(track_id)
+        if was_current:
+            current.append(track_id)
+    db.log_event(
+        conn,
+        "info",
+        "media",
+        "Медиатека: удаление выбранных треков",
+        {"marked": marked, "current": current},
+        at=to_iso(now),
+    )
     conn.commit()
-    return {"deleted": True, "pending": False, "playlists_count": playlists_count}
+    return {
+        "marked": marked,
+        "deleted": [],
+        "purged": [],
+        "pending": [],
+        "not_found": not_found,
+        "current": current,
+    }
 
 
 def delete_pending_after_change(conn: sqlite3.Connection, settings: Settings) -> list[str]:
@@ -493,25 +683,23 @@ def delete_pending_after_change(conn: sqlite3.Connection, settings: Settings) ->
     rows = conn.execute("SELECT id FROM tracks WHERE pending_delete = 1").fetchall()
     if not rows:
         return []
+    if queue_sync_unresolved(conn):
+        # The engine may still hold the old queue; keep every file until a
+        # successful sync confirms that the positions are gone.
+        return []
     removed = []
     for row in rows:
         track_id = str(row["id"])
         if is_track_current(conn, track_id):
             continue
-        purge_track(conn, settings, track_id)
-        removed.append(track_id)
+        if track_has_future_positions(conn, track_id):
+            continue
+        if purge_track(conn, settings, track_id):
+            removed.append(track_id)
     return removed
 
 
-def update_metadata(
-    conn: sqlite3.Connection,
-    track_id: str,
-    fields: dict,
-    now: datetime,
-) -> sqlite3.Row:
-    row = conn.execute("SELECT * FROM tracks WHERE id = ?", (track_id,)).fetchone()
-    if row is None:
-        raise ApiError(404, "track_not_found", "Трек не найден.")
+def _validated_track_updates(fields: dict) -> dict:
     allowed = {"title", "artist", "album", "genre", "year"}
     updates: dict = {}
     for key, value in fields.items():
@@ -545,6 +733,19 @@ def update_metadata(
         else:
             text = str(value or "").strip()
             updates[key] = text[:300] if text else None
+    return updates
+
+
+def update_metadata(
+    conn: sqlite3.Connection,
+    track_id: str,
+    fields: dict,
+    now: datetime,
+) -> sqlite3.Row:
+    row = conn.execute("SELECT * FROM tracks WHERE id = ?", (track_id,)).fetchone()
+    if row is None:
+        raise ApiError(404, "track_not_found", "Трек не найден.")
+    updates = _validated_track_updates(fields)
     if not updates:
         return row
     updates["updated_at"] = to_iso(now)
@@ -554,4 +755,78 @@ def update_metadata(
         (*updates.values(), track_id),
     )
     conn.commit()
+    return conn.execute("SELECT * FROM tracks WHERE id = ?", (track_id,)).fetchone()
+
+
+def update_track_atomic(
+    conn: sqlite3.Connection,
+    settings: Settings,
+    track_id: str,
+    fields: dict,
+    cover_stream: BinaryIO | None,
+    cover_action: str,
+    now: datetime,
+) -> sqlite3.Row:
+    """Apply metadata and cover in one validated, all-or-nothing operation."""
+
+    if cover_action not in ("keep", "replace", "revert"):
+        raise ApiError(422, "invalid_cover_action", "cover_action должен быть keep, replace или revert.")
+    if cover_action == "replace" and cover_stream is None:
+        raise ApiError(422, "cover_required", "Для замены обложки передайте файл.")
+    row = conn.execute("SELECT * FROM tracks WHERE id = ?", (track_id,)).fetchone()
+    if row is None:
+        raise ApiError(404, "track_not_found", "Трек не найден.")
+    updates = _validated_track_updates(fields)
+
+    old_custom = row["custom_cover_path"]
+    temp_path: Path | None = None
+    new_relative: str | None = None
+    new_final: Path | None = None
+    if cover_action == "replace":
+        temp_path, new_relative = prepare_custom_cover(settings, track_id, cover_stream)
+        new_final = settings.cover_dir / new_relative
+        try:
+            os.replace(temp_path, new_final)
+        except BaseException:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+        temp_path = None
+        updates["custom_cover_path"] = new_relative
+    elif cover_action == "revert":
+        updates["custom_cover_path"] = None
+
+    updates["updated_at"] = to_iso(now)
+    assignments = ", ".join(f"{key} = ?" for key in updates)
+    started = not conn.in_transaction
+    try:
+        if started:
+            conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            f"UPDATE tracks SET {assignments} WHERE id = ?",
+            (*updates.values(), track_id),
+        )
+        if started:
+            conn.commit()
+    except BaseException:
+        if started:
+            conn.rollback()
+        if new_final is not None and old_custom != new_relative:
+            try:
+                new_final.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+    if cover_action == "replace" and old_custom and old_custom != new_relative:
+        remove_custom_cover(settings, old_custom)
+    elif cover_action == "revert" and old_custom:
+        remove_custom_cover(settings, old_custom)
     return conn.execute("SELECT * FROM tracks WHERE id = ?", (track_id,)).fetchone()

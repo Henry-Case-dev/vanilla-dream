@@ -133,6 +133,7 @@ def test_admin_history_and_pagination(env, admin):
     env.client.put(
         "/api/admin/settings", json={"default_playlist_id": playlist["id"]}
     )
+    env.client.put("/api/admin/station/mode", json={"mode": "auto"})
     env.client.post("/api/admin/station/start")
     play_next(env)
     play_next(env)

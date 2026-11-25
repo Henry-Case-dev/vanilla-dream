@@ -85,6 +85,7 @@ class Settings:
     upload_ttl_hours: float = 24.0
     export_ttl_hours: float = 6.0
     export_reserve_bytes: int = 536870912
+    history_retention_days: int = 0
 
     def __post_init__(self) -> None:
         if self.playlist_cover_dir is None:
@@ -146,6 +147,7 @@ class Settings:
             upload_ttl_hours=_env_float("VD_UPLOAD_TTL_HOURS", 24.0),
             export_ttl_hours=_env_float("VD_EXPORT_TTL_HOURS", 6.0),
             export_reserve_bytes=_env_int("VD_EXPORT_RESERVE_BYTES", 536870912),
+            history_retention_days=_env_int("VD_HISTORY_RETENTION_DAYS", 0),
         )
 
     def ensure_directories(self) -> None:

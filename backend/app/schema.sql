@@ -73,8 +73,10 @@ CREATE TABLE IF NOT EXISTS export_jobs (
     archive_name TEXT,
     size INTEGER,
     error TEXT,
+    snapshot TEXT,
     created_at TEXT,
     updated_at TEXT,
+    finished_at TEXT,
     expires_at TEXT
 );
 

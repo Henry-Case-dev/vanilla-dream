@@ -1,15 +1,14 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import {
-  AlertTriangle,
+  ArrowUpToLine,
   ChevronDown,
   ChevronUp,
   Clock,
   Disc3,
+  GripVertical,
   Link2,
   ListMusic,
-  Lock,
-  RefreshCw,
   Shuffle,
   Trash2,
   Users,
@@ -21,8 +20,10 @@ import { StatusPill } from '../components/StatusPill';
 import { LinkList } from '../components/LinkList';
 import { EmptyState, ErrorState, LoadingState } from '../components/States';
 import { ConfirmDialog } from '../components/Modal';
+import { SourceControl } from '../components/SourceControl';
 import { useToast } from '../components/Toasts';
-import { useLive } from '../lib/live';
+import { useLive, effectiveControl } from '../lib/live';
+import { usePlaylistSettings } from '../lib/playlist-settings';
 import { useResource, useTick } from '../lib/hooks';
 import { api, errorMessage } from '../lib/api';
 import {
@@ -64,80 +65,123 @@ function Metric({
   );
 }
 
+function queueSourceLabel(item: QueueItem): string {
+  if (item.manual || item.sourceKind === 'manual') return 'Ручная вставка';
+  if (item.sourceKind === 'override') return 'Временное переключение';
+  if (item.sourceKind === 'library' || item.sourceLabel === 'library') return 'Вся медиатека';
+  if (item.sourceKind === 'rotation') return 'Ротация';
+  if (item.sourceKind === 'schedule') return item.sourceLabel || 'Расписание';
+  if (item.sourceKind === 'playlist') {
+    return item.sourceLabel || sourceDisplayName({ kind: 'playlist', name: item.sourceLabel }) || 'Плейлист';
+  }
+  return item.sourceLabel || (item.sourceKind ? sourceKindLabel(item.sourceKind) : 'Источник');
+}
+
 function QueueRow({
   item,
   index,
   total,
   current = false,
   timeZone,
-  onMove,
-  onRemove,
   busy,
+  onMove,
+  onMoveNext,
+  onRemove,
+  dragFrom,
+  onDragFrom,
+  onDropAt,
+  dropIndex,
+  setDropIndex,
 }: {
   item: QueueItem;
   index: number;
   total: number;
   current?: boolean;
   timeZone?: string;
-  onMove: (id: string, target: number) => void;
-  onRemove: (item: QueueItem) => void;
   busy: boolean;
+  onMove: (id: string, target: number) => void;
+  onMoveNext: (id: string) => void;
+  onRemove: (item: QueueItem) => void;
+  dragFrom: number | null;
+  onDragFrom: (index: number | null) => void;
+  onDropAt: (index: number) => void;
+  dropIndex: number | null;
+  setDropIndex: (index: number | null) => void;
 }) {
+  const canDrag = !current && !busy;
   return (
-    <div className={`queue-row ${current ? 'queue-row--current' : ''}`.trim()}>
-      <span className="queue-row__index">{current ? 'Сейчас' : index + 1}</span>
+    <div
+      className={`queue-row ${current ? 'queue-row--current' : ''} ${
+        dropIndex === index && !current ? 'is-drop-target' : ''
+      }`.trim()}
+      draggable={canDrag}
+      onDragStart={(event) => {
+        if (!canDrag) return;
+        event.dataTransfer.effectAllowed = 'move';
+        onDragFrom(index);
+      }}
+      onDragEnd={() => {
+        onDragFrom(null);
+        setDropIndex(null);
+      }}
+      onDragOver={(event) => {
+        if (!canDrag || dragFrom === null) return;
+        event.preventDefault();
+        if (dropIndex !== index) setDropIndex(index);
+      }}
+      onDrop={(event) => {
+        if (!canDrag || dragFrom === null) return;
+        event.preventDefault();
+        onDropAt(index);
+      }}
+    >
+      <span className="queue-row__index">
+        {current ? 'Сейчас' : canDrag ? <GripVertical size={12} className="queue-row__grip" aria-hidden="true" /> : null}
+        {!current && index + 1}
+      </span>
       <Cover src={item.track?.coverUrl} alt={item.track ? `Обложка: ${item.track.title}` : 'Обложка'} size="xs" />
       <div className="queue-row__text">
         <span className="queue-row__title">{item.track?.title ?? 'Трек удалён'}</span>
         <span className="queue-row__sub">
-          {item.track?.artist ?? '—'}
-          {item.sourceKind === 'override'
-            ? ' · Ручной выбор'
-            : item.sourceKind === 'library' || item.sourceLabel === 'library'
-              ? ' · Вся медиатека'
-              : item.sourceLabel
-                ? ` · ${item.sourceLabel}`
-                : item.sourceKind
-                  ? ` · ${sourceKindLabel(item.sourceKind)}`
-                  : ''}
+          {item.track?.artist ?? '—'} · {queueSourceLabel(item)}
         </span>
       </div>
       <span className="queue-row__time">
-        {item.prepared ? (
-          <span className="chip chip--neutral" title="Подготовлен движком — изменение недоступно">
-            <Lock size={11} aria-hidden="true" /> подготовлен
-          </span>
-        ) : item.estimatedStart ? (
-          formatTime(item.estimatedStart, timeZone)
-        ) : (
-          '—'
-        )}
+        {item.estimatedStart ? formatTime(item.estimatedStart, timeZone) : '—'}
       </span>
       {!current && (
         <div className="queue-row__actions">
           <IconButton
             icon={ChevronUp}
-            label={item.prepared ? 'Трек уже подготовлен движком' : 'Переместить выше'}
-            title={item.prepared ? 'Подготовленный движком трек нельзя перемещать' : 'Переместить выше'}
+            label="Переместить выше"
+            title="Переместить выше"
             size="sm"
-            disabled={busy || item.prepared || index === 0}
+            disabled={busy || index === 0}
             onClick={() => onMove(item.id, index - 1)}
           />
           <IconButton
             icon={ChevronDown}
-            label={item.prepared ? 'Трек уже подготовлен движком' : 'Переместить ниже'}
-            title={item.prepared ? 'Подготовленный движком трек нельзя перемещать' : 'Переместить ниже'}
+            label="Переместить ниже"
+            title="Переместить ниже"
             size="sm"
-            disabled={busy || item.prepared || index === total - 1}
+            disabled={busy || index === total - 1}
             onClick={() => onMove(item.id, index + 1)}
           />
           <IconButton
+            icon={ArrowUpToLine}
+            label="Поставить следующим"
+            title="Поставить следующим"
+            size="sm"
+            disabled={busy || index === 0}
+            onClick={() => onMoveNext(item.id)}
+          />
+          <IconButton
             icon={Trash2}
-            label={item.prepared ? 'Подготовленный трек нельзя удалить из очереди' : 'Убрать из очереди'}
-            title={item.prepared ? 'Подготовленный движком трек нельзя убрать' : 'Убрать из очереди'}
+            label="Убрать из очереди"
+            title="Убрать из очереди"
             size="sm"
             tone="danger"
-            disabled={busy || item.prepared}
+            disabled={busy}
             onClick={() => onRemove(item)}
           />
         </div>
@@ -173,35 +217,41 @@ function HistoryList({ entries, timeZone }: { entries: HistoryEntry[]; timeZone?
 }
 
 export function OverviewPage() {
-  const { now, loading, error, reload } = useLive();
+  const { now, control, loading, error, reload, queueRevision, historyRevision } = useLive();
   const toast = useToast();
+  const settingsStore = usePlaylistSettings();
   useTick(30000);
 
-  const queue = useResource(() => api.admin.queue.get(), [], { pollMs: 20000 });
+  const queue = useResource(() => api.admin.queue.get(), [], { pollMs: 30000 });
   const links = useResource(() => api.admin.links(), []);
   const history = useResource(() => api.admin.history(8), [], { pollMs: 60000 });
   const library = useResource(() => api.admin.tracks.list({ limit: 1 }), [], { pollMs: 60000 });
   const settings = useResource(() => api.admin.settings.get(), []);
-  const services = useResource(() => api.admin.services(), [], { pollMs: 30000 });
 
   const [busyQueue, setBusyQueue] = useState(false);
   const [clearManualOpen, setClearManualOpen] = useState(false);
+  const [dragFrom, setDragFrom] = useState<number | null>(null);
+  const [dropIndex, setDropIndex] = useState<number | null>(null);
 
   const timeZone = settings.data?.timezone ?? undefined;
   const station = now?.station ?? null;
   const track = now?.track ?? null;
   const statusView = describeStationStatus(station?.status, station?.reason);
-  const currentSourceName = sourceDisplayName(now?.source);
-  const sourceLabel =
-    now?.source?.kind === 'override'
-      ? 'Ручной выбор'
-      : now?.source?.kind === 'library'
-        ? 'Вся медиатека'
-        : now?.source?.label ?? null;
-  const sourceDetail =
-    now?.source && now.source.kind !== 'override' && now.source.kind !== 'library'
-      ? currentSourceName
-      : null;
+  const state = effectiveControl(control, now);
+  const program = settingsStore.get(state?.programPlaylistId ?? null);
+  const repeatOne = program?.repeatMode === 'one';
+
+  useEffect(() => {
+    if (queueRevision === null) return;
+    void queue.reload(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [queueRevision]);
+
+  useEffect(() => {
+    if (historyRevision === null && !track?.startedAt) return;
+    void history.reload(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [historyRevision, track?.startedAt]);
 
   useDataChanged(() => {
     reload();
@@ -222,29 +272,33 @@ export function OverviewPage() {
   }, [track]);
 
   const radioLinks = links.data ?? [];
-
-  const failedService = services.data?.find((service) => service.state === 'failed');
-  const engineError = settings.data?.engineLastError || failedService?.lastError || null;
-
   const queueItems = queue.data?.items ?? [];
   const hasManual = queueItems.some((item) => item.manual);
-
-  const reloadAll = () => {
-    reload();
-    void queue.reload(true);
-    void links.reload(true);
-    void history.reload(true);
-    void library.reload(true);
-    void settings.reload(true);
-    void services.reload(true);
-  };
 
   const moveItem = async (id: string, target: number) => {
     if (target < 0 || target >= queueItems.length) return;
     setBusyQueue(true);
     try {
-      await api.admin.queue.move(id, target);
+      const result = await api.admin.queue.move(id, target);
       await queue.reload(true);
+      if (result.engineSynced === false) {
+        toast.notify('info', 'Порядок сохранён, применяется движком…');
+      }
+    } catch (caught) {
+      toast.notify('error', errorMessage(caught));
+    } finally {
+      setBusyQueue(false);
+    }
+  };
+
+  const moveNext = async (id: string) => {
+    setBusyQueue(true);
+    try {
+      const result = await api.admin.queue.moveNext(id);
+      await queue.reload(true);
+      if (result.engineSynced === false) {
+        toast.notify('info', 'Позиция сохранена, применяется движком…');
+      }
     } catch (caught) {
       toast.notify('error', errorMessage(caught));
     } finally {
@@ -255,8 +309,13 @@ export function OverviewPage() {
   const removeItem = async (item: QueueItem) => {
     setBusyQueue(true);
     try {
-      await api.admin.queue.remove(item.id);
-      toast.notify('success', 'Трек убран из очереди');
+      const result = await api.admin.queue.remove(item.id);
+      toast.notify(
+        result.engineSynced === false ? 'info' : 'success',
+        result.engineSynced === false
+          ? 'Удаление сохранено, применяется движком…'
+          : 'Трек убран из очереди',
+      );
       await queue.reload(true);
     } catch (caught) {
       toast.notify('error', errorMessage(caught));
@@ -266,10 +325,19 @@ export function OverviewPage() {
   };
 
   const shuffleQueue = async () => {
+    if (repeatOne) {
+      toast.notify('info', 'При повторе трека разовое перемешивание недоступно');
+      return;
+    }
     setBusyQueue(true);
     try {
-      await api.admin.queue.shuffle();
-      toast.notify('success', 'Будущая очередь перемешана');
+      const result = await api.admin.queue.shuffle();
+      toast.notify(
+        result.engineSynced === false ? 'info' : 'success',
+        result.engineSynced === false
+          ? 'Порядок сохранён, применяется движком…'
+          : 'Ближайшие автоматические треки перемешаны',
+      );
       await queue.reload(true);
     } catch (caught) {
       toast.notify('error', errorMessage(caught));
@@ -281,8 +349,13 @@ export function OverviewPage() {
   const clearManual = async () => {
     setBusyQueue(true);
     try {
-      await api.admin.queue.clearManual();
-      toast.notify('success', 'Ручные вставки удалены из очереди');
+      const result = await api.admin.queue.clearManual();
+      toast.notify(
+        result.engineSynced === false ? 'info' : 'success',
+        result.engineSynced === false
+          ? 'Очистка сохранена, применяется движком…'
+          : 'Ручные добавления удалены из очереди',
+      );
       setClearManualOpen(false);
       await queue.reload(true);
     } catch (caught) {
@@ -290,6 +363,16 @@ export function OverviewPage() {
     } finally {
       setBusyQueue(false);
     }
+  };
+
+  const dropAt = (index: number) => {
+    const from = dragFrom;
+    setDragFrom(null);
+    setDropIndex(null);
+    if (from === null || from === index) return;
+    const item = queueItems[from];
+    if (!item) return;
+    void moveItem(item.id, index);
   };
 
   if (loading && !now) {
@@ -317,34 +400,18 @@ export function OverviewPage() {
         subtitle={
           <span className="page-header__status">
             <StatusPill status={station?.status ?? 'unknown'} reason={station?.reason} />
-            <span className="muted" title={statusView.detail}>
-              {statusView.detail}
-            </span>
+            {statusView.tone === 'error' && <span className="muted">{statusView.detail}</span>}
           </span>
         }
         actions={
-          <>
-            <Button variant="secondary" icon={RefreshCw} onClick={reloadAll}>
-              Обновить
-            </Button>
-            <Link className="btn btn--ghost btn--md" to="/">
-              Публичный плеер
-            </Link>
-          </>
+          <Link className="btn btn--ghost btn--md" to="/">
+            Публичный плеер
+          </Link>
         }
       />
 
       <ManualOverrideBanner />
-
-      {engineError && (
-        <div className="banner banner--danger" role="alert">
-          <AlertTriangle size={16} aria-hidden="true" />
-          <div>
-            <strong>Движок сообщил об ошибке</strong>
-            <p>{engineError}</p>
-          </div>
-        </div>
-      )}
+      <SourceControl />
 
       <Panel className="np-hero">
         <div className="np-hero__cover">
@@ -373,12 +440,6 @@ export function OverviewPage() {
 
           <MetaRow>
             <Chip tone="accent">{track ? 'Трек в эфире' : 'Нет трека'}</Chip>
-            {now?.source && now.source.kind !== 'none' && sourceLabel && (
-              <span className="meta-item">
-                Источник: {sourceLabel}
-                {sourceDetail ? ` · ${sourceDetail}` : ''}
-              </span>
-            )}
             {station?.bitrate ? <span className="meta-item">{station.bitrate} кбит/с</span> : null}
             {track?.startedAt && (
               <span className="meta-item">Начало: {formatTime(track.startedAt, timeZone)}</span>
@@ -440,13 +501,8 @@ export function OverviewPage() {
         <Panel className="queue-panel">
           <div className="panel-head">
             <div>
-              <h2 className="panel-title">Ближайшая очередь</h2>
-              <p className="panel-subtitle">
-                Следующие треки эфира
-                {queueItems.some((item) => item.prepared)
-                  ? ' · подготовленные движком не редактируются'
-                  : ''}
-              </p>
+              <h2 className="panel-title">Следующие треки эфира</h2>
+              <p className="panel-subtitle">Порядок будущих позиций; ручные вставки сохраняются</p>
             </div>
             <div className="panel-head__actions">
               <Button
@@ -454,13 +510,18 @@ export function OverviewPage() {
                 size="sm"
                 icon={Shuffle}
                 onClick={() => void shuffleQueue()}
-                disabled={busyQueue}
+                disabled={busyQueue || repeatOne}
+                title={
+                  repeatOne
+                    ? 'При повторе трека разовое перемешивание недоступно'
+                    : 'Перемешать ближайшие автоматические треки один раз'
+                }
               >
                 Перемешать
               </Button>
               {hasManual && (
                 <Button variant="ghost" size="sm" onClick={() => setClearManualOpen(true)} disabled={busyQueue}>
-                  Убрать ручные
+                  Очистить ручные добавления
                 </Button>
               )}
             </div>
@@ -472,7 +533,7 @@ export function OverviewPage() {
             <ErrorState message={queue.error} onRetry={() => void queue.reload()} />
           ) : queue.data && (queue.data.current || queueItems.length > 0) ? (
             <div className="queue-list">
-              {queue.data.current && station?.desired === 'playing' && station.status !== 'off' && (
+              {queue.data.current && station?.status !== 'off' && (
                 <QueueRow
                   item={queue.data.current}
                   index={0}
@@ -480,8 +541,14 @@ export function OverviewPage() {
                   current
                   timeZone={timeZone}
                   onMove={moveItem}
+                  onMoveNext={moveNext}
                   onRemove={removeItem}
                   busy
+                  dragFrom={dragFrom}
+                  onDragFrom={setDragFrom}
+                  onDropAt={dropAt}
+                  dropIndex={dropIndex}
+                  setDropIndex={setDropIndex}
                 />
               )}
               {queueItems.map((item, index) => (
@@ -492,8 +559,14 @@ export function OverviewPage() {
                   total={queueItems.length}
                   timeZone={timeZone}
                   onMove={moveItem}
+                  onMoveNext={moveNext}
                   onRemove={removeItem}
                   busy={busyQueue}
+                  dragFrom={dragFrom}
+                  onDragFrom={setDragFrom}
+                  onDropAt={dropAt}
+                  dropIndex={dropIndex}
+                  setDropIndex={setDropIndex}
                 />
               ))}
             </div>
@@ -546,9 +619,9 @@ export function OverviewPage() {
 
       <ConfirmDialog
         open={clearManualOpen}
-        title="Убрать ручные вставки?"
-        description="Из будущей очереди будут удалены все треки, добавленные вручную. Дальнейшая очередь будет собрана движком."
-        confirmLabel="Убрать"
+        title="Очистить ручные добавления?"
+        description="Из будущей очереди будут удалены все треки, добавленные вручную. Текущий трек продолжит играть."
+        confirmLabel="Очистить"
         danger
         busy={busyQueue}
         onConfirm={() => void clearManual()}

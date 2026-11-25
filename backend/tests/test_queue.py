@@ -20,11 +20,14 @@ def _upload(env, name: str, title: str | None = None) -> dict:
 
 
 def _use_playlist(env, playlist_id: str, depth: int | None = None, start: bool = False) -> None:
-    payload = {"default_playlist_id": playlist_id}
-    if depth is not None:
-        payload["queue_depth"] = depth
-    response = env.client.put("/api/admin/settings", json=payload)
+    response = env.client.put(
+        "/api/admin/station/mode",
+        json={"mode": "playlist", "playlist_id": playlist_id},
+    )
     assert response.status_code == 200, response.text
+    if depth is not None:
+        settings = env.client.put("/api/admin/settings", json={"queue_depth": depth})
+        assert settings.status_code == 200, settings.text
     if start:
         started = env.client.post("/api/admin/station/start")
         assert started.status_code == 200, started.text
@@ -54,7 +57,8 @@ def test_engine_sync_file_and_prepared_prefix(env, admin):
     lines = [line for line in content.splitlines() if line]
     assert len(lines) == queue_engine.ENGINE_PREFETCH
     prepared_ids = [item["id"] for item in prepared]
-    link_paths = [Path(line) for line in lines]
+    link_paths = [Path(line.split("\t", 1)[1]) for line in lines]
+    assert [line.split("\t", 1)[0] for line in lines] == prepared_ids
     assert [path.stem for path in link_paths] == prepared_ids
     for path in link_paths:
         assert path.is_absolute()
@@ -226,7 +230,7 @@ def test_play_now_skips_when_station_playing(env, admin):
     assert env.engine.skip_calls == 1
 
 
-def test_prepared_positions_are_locked(env, admin):
+def test_prepared_positions_are_editable(env, admin):
     tracks = [_upload(env, f"lock{i}", f"Lock {i}") for i in range(6)]
     playlist = make_playlist(env.client, "Lock", [track["id"] for track in tracks])
     _use_playlist(env, playlist["id"], start=True)
@@ -234,34 +238,30 @@ def test_prepared_positions_are_locked(env, admin):
     prepared = [item for item in items if item["prepared"]]
     assert prepared
 
-    blocked = env.client.patch(
+    moved = env.client.patch(
         f"/api/admin/queue/{prepared[0]['id']}", json={"move_to": 3}
     )
-    assert blocked.status_code == 409
-    assert blocked.json()["detail"]["code"] == "position_locked"
-    assert env.client.delete(f"/api/admin/queue/{prepared[0]['id']}").status_code == 409
+    assert moved.status_code == 200, moved.text
+    moved_items = moved.json()["items"]
+    assert moved_items[3]["id"] == prepared[0]["id"]
 
-    pending = [item for item in items if not item["prepared"]]
-    moved = env.client.patch(f"/api/admin/queue/{pending[-1]['id']}", json={"move_to": 0})
-    assert moved.status_code == 200
-    after = moved.json()["items"]
-    assert after[0]["id"] == pending[-1]["id"]
-    assert after[1]["prepared"] is True
-    assert after[1]["id"] == prepared[0]["id"]
+    moved_next = env.client.post(
+        f"/api/admin/queue/{prepared[0]['id']}/move-next"
+    )
+    assert moved_next.status_code == 200, moved_next.text
+    assert moved_next.json()["items"][0]["id"] == prepared[0]["id"]
 
-    deleted = env.client.delete(f"/api/admin/queue/{pending[0]['id']}")
-    assert deleted.status_code == 200
-    assert pending[0]["id"] not in [item["id"] for item in deleted.json()["items"]]
+    deleted = env.client.delete(f"/api/admin/queue/{prepared[0]['id']}")
+    assert deleted.status_code == 200, deleted.text
+    assert prepared[0]["id"] not in [item["id"] for item in deleted.json()["items"]]
 
 
-def test_shuffle_future_keeps_prepared_and_moves_pending(env, admin, monkeypatch):
+def test_shuffle_future_includes_prepared(env, admin, monkeypatch):
     tracks = [_upload(env, f"fsh{i}", f"Future {i}") for i in range(6)]
     playlist = make_playlist(env.client, "Future", [track["id"] for track in tracks])
     _use_playlist(env, playlist["id"], start=True)
     items = env.client.get("/api/admin/queue").json()["items"]
-    prepared_ids = [item["id"] for item in items if item["prepared"]]
-    pending_ids = [item["id"] for item in items if not item["prepared"]]
-    assert len(pending_ids) >= 2
+    assert len(items) >= 3
 
     class ReversingRandom:
         def shuffle(self, values):
@@ -275,10 +275,9 @@ def test_shuffle_future_keeps_prepared_and_moves_pending(env, admin, monkeypatch
 
     monkeypatch.setattr(queue_engine.random, "SystemRandom", ReversingRandom)
     shuffled = env.client.post("/api/admin/queue/shuffle").json()
-    assert shuffled["shuffled"] == len(pending_ids)
+    assert shuffled["shuffled"] == len(items)
     new_ids = [item["id"] for item in shuffled["items"]]
-    assert new_ids[: len(prepared_ids)] == prepared_ids
-    assert new_ids[len(prepared_ids):] == list(reversed(pending_ids))
+    assert new_ids == list(reversed([item["id"] for item in items]))
 
 
 def test_source_change_keeps_manual_items(env, admin):
@@ -310,13 +309,16 @@ def test_track_start_is_idempotent_and_unknown_is_safe(env, admin):
     first = env.client.post(url, data={"vd": position["id"], "ts": "1700000000.5"}, headers=headers)
     second = env.client.post(url, data={"vd": position["id"], "ts": "1700000003.5"}, headers=headers)
     assert first.status_code == second.status_code == 200
+    assert first.json()["status"] == "ok"
+    assert second.json()["status"] == "duplicate"
     history = _history(env)
     assert len(history) == 1
     assert history[0]["position_id"] == position["id"]
+    assert history[0]["started_at"].startswith("2023-11-14T22:13:20")
 
     unknown = env.client.post(url, data={"vd": "nope", "ts": "1700000004"}, headers=headers)
     assert unknown.status_code == 200
-    assert unknown.json()["ok"] is True
+    assert unknown.json()["status"] == "unknown"
     conn = db.open_db(env.settings)
     try:
         warnings = conn.execute(
@@ -366,14 +368,14 @@ def test_engine_track_start_accepts_symlink_path(env, admin):
         for line in env.settings.engine_queue_file.read_text(encoding="utf-8").splitlines()
         if line
     ]
-    link = lines[0]
-    position_id = Path(link).stem
+    position_id, link = lines[0].split("\t", 1)
     response = env.client.post(
         "/api/internal/engine/track-start",
         data={"f": link, "ts": f"{env.clock.now().timestamp():.3f}"},
         headers={"X-Internal-Token": env.internal_token},
     )
     assert response.status_code == 200
+    assert response.json()["status"] == "ok"
     history = _history(env)
     assert history[-1]["position_id"] == position_id
 

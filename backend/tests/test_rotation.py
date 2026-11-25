@@ -2,8 +2,20 @@
 
 from __future__ import annotations
 
+import pytest
+
 from app import db, queue_engine
 from tests.helpers import make_playlist, play_next, upload_and_get, write_mp3
+
+
+@pytest.fixture(autouse=True)
+def _auto_mode(env):
+    conn = db.open_db(env.settings)
+    try:
+        db.set_setting(conn, "playback_mode", "auto")
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _upload(env, name: str) -> dict:
@@ -37,18 +49,8 @@ def test_sequential_rotation_cycles_playlists(env, admin):
     env.app.state.scheduler.tick()
 
     items = env.client.get("/api/admin/queue").json()["items"]
-    assert [item["track"]["id"] for item in items][:4] == [
-        a_tracks[0]["id"],
-        a_tracks[1]["id"],
-        b_tracks[0]["id"],
-        b_tracks[1]["id"],
-    ]
-    assert [item["source"]["playlist_id"] for item in items][:4] == [
-        playlist_a["id"],
-        playlist_a["id"],
-        playlist_b["id"],
-        playlist_b["id"],
-    ]
+    assert items
+    assert all(item["source"]["playlist_id"] == playlist_a["id"] for item in items)
     assert items[0]["source"]["kind"] == "rotation"
 
     started = []
@@ -78,12 +80,6 @@ def test_by_count_rotation_respects_track_counts(env, admin):
     )
     env.app.state.scheduler.tick()
 
-    first_three = env.client.get("/api/admin/queue").json()["items"][:3]
-    assert [item["source"]["playlist_id"] for item in first_three] == [
-        playlist_a["id"],
-        playlist_a["id"],
-        playlist_b["id"],
-    ]
     started = [play_next(env)["source"]["playlist_id"] for _ in range(3)]
     assert started == [playlist_a["id"], playlist_a["id"], playlist_b["id"]]
 
@@ -206,8 +202,8 @@ def test_rotation_ignores_playlist_repeat_all(env, admin):
         ],
     )
     env.app.state.scheduler.tick()
-    sources = [item["source"]["playlist_id"] for item in env.client.get("/api/admin/queue").json()["items"]]
-    assert sources[:3] == [playlist_a["id"], playlist_a["id"], playlist_b["id"]]
+    started = [play_next(env)["source"]["playlist_id"] for _ in range(3)]
+    assert started == [playlist_a["id"], playlist_a["id"], playlist_b["id"]]
 
 
 def test_schedule_takes_priority_over_rotation(env, admin):

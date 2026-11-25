@@ -11,10 +11,8 @@ import type { LucideIcon } from 'lucide-react';
 import { Logo } from '../components/Logo';
 import { useAuth } from '../lib/auth';
 import { useLive } from '../lib/live';
-import { useResource } from '../lib/hooks';
-import { api } from '../lib/api';
+import { usePlaylistSettings } from '../lib/playlist-settings';
 import { describeStationStatus, statusDotClass } from '../lib/status';
-import { useDataChanged } from '../lib/refresh';
 import { PlayerBar } from './PlayerBar';
 import { ExportIndicator } from './ExportIndicator';
 
@@ -36,8 +34,7 @@ const navItems: NavItem[] = [
 export function AdminLayout() {
   const { logout } = useAuth();
   const { now } = useLive();
-  const playlists = useResource(() => api.admin.playlists.list(), [], { pollMs: 60000 });
-  useDataChanged(() => void playlists.reload(true));
+  const playlists = usePlaylistSettings();
 
   const statusView = describeStationStatus(now?.station.status, now?.station.reason);
 
@@ -75,16 +72,16 @@ export function AdminLayout() {
               Все
             </Link>
           </div>
-          {playlists.loading && !playlists.data ? (
+          {playlists.loading && !playlists.playlists ? (
             <div className="sidebar__skeleton" aria-hidden="true">
               <span className="skeleton" />
               <span className="skeleton" />
             </div>
           ) : playlists.error ? (
             <p className="sidebar__note">Список недоступен</p>
-          ) : playlists.data && playlists.data.length > 0 ? (
+          ) : playlists.playlists && playlists.playlists.length > 0 ? (
             <ul className="sidebar__playlists">
-              {playlists.data.slice(0, 8).map((playlist) => (
+              {playlists.playlists.slice(0, 8).map((playlist) => (
                 <li key={playlist.id}>
                   <NavLink
                     to={`/admin/playlists/${playlist.id}`}

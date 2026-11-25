@@ -15,6 +15,7 @@ import re
 import shutil
 import sqlite3
 import tempfile
+import time
 import unicodedata
 import uuid
 from contextlib import contextmanager
@@ -343,26 +344,16 @@ def find_duplicate_matches(
 # ---------------------------------------------------------------------------
 
 
-def _create_track(
-    conn: sqlite3.Connection,
+def _stage_track_file(
     settings: Settings,
     source_path: Path,
-    base_name: str,
     ext: str,
-    sha256: str,
-    size: int,
-    meta: dict,
     cover_bytes: bytes | None,
-    now: datetime,
-    duplicate_kind: str | None = None,
-    duplicate_of: str | None = None,
-) -> sqlite3.Row:
-    """Copy a finished file to a brand-new ``music/<track_id><ext>`` path.
-
-    ``O_EXCL`` guarantees an existing physical file is never overwritten.
-    """
+) -> dict:
+    """Copy the file (and cover) outside any DB transaction."""
 
     track_id = ""
+    target = None
     for _attempt in range(5):
         candidate = uuid.uuid4().hex
         target = settings.music_dir / f"{candidate}{ext}"
@@ -380,59 +371,94 @@ def _create_track(
             raise
         track_id = candidate
         break
-    if not track_id:
+    if not track_id or target is None:
         raise ApiError(
             500,
             "storage_conflict",
             "Не удалось выделить уникальный путь для файла. Повторите загрузку.",
         )
-
     cover_name = None
-    tags = meta["tags"]
-    title = tags.get("title") or Path(base_name).stem.strip() or "Без названия"
     try:
         if cover_bytes:
             cover_name = media.write_cover(settings, track_id, cover_bytes)
-        relative = str(target.relative_to(settings.music_dir))
-        stamp = to_iso(now)
-        conn.execute(
-            "INSERT INTO tracks(id, sha256, path, ext, title, artist, album, genre, year, "
-            "duration, bitrate, size, cover_path, custom_cover_path, source_title, "
-            "source_artist, source_album, source_genre, source_filename, duplicate_of, "
-            "duplicate_kind, duplicate_confirmed_at, play_count, pending_delete, created_at, "
-            "updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, "
-            "?, ?, 0, 0, ?, ?)",
-            (
-                track_id,
-                sha256,
-                relative,
-                ext,
-                title,
-                tags.get("artist"),
-                tags.get("album"),
-                tags.get("genre"),
-                tags.get("year"),
-                meta.get("duration"),
-                meta.get("bitrate"),
-                size,
-                cover_name,
-                tags.get("title"),
-                tags.get("artist"),
-                tags.get("album"),
-                tags.get("genre"),
-                base_name,
-                duplicate_of,
-                duplicate_kind,
-                to_iso(now) if duplicate_of else None,
-                stamp,
-                stamp,
-            ),
-        )
     except BaseException:
         target.unlink(missing_ok=True)
-        if cover_name:
-            media.cover_path_for(settings, track_id).unlink(missing_ok=True)
         raise
+    return {
+        "track_id": track_id,
+        "target": target,
+        "relative": str(target.relative_to(settings.music_dir)),
+        "cover_name": cover_name,
+    }
+
+
+def _discard_staged_file(settings: Settings, staged: dict | None) -> None:
+    if not staged:
+        return
+    try:
+        staged["target"].unlink(missing_ok=True)
+    except OSError:
+        pass
+    cover_name = staged.get("cover_name")
+    if cover_name:
+        try:
+            media.cover_path_for(settings, staged["track_id"]).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _insert_track(
+    conn: sqlite3.Connection,
+    staged: dict,
+    base_name: str,
+    ext: str,
+    sha256: str,
+    size: int,
+    meta: dict,
+    now: datetime,
+    duplicate_kind: str | None = None,
+    duplicate_of: str | None = None,
+) -> sqlite3.Row:
+    """Insert a previously staged file and its cover reference."""
+
+    track_id = staged["track_id"]
+    cover_name = staged.get("cover_name")
+    tags = meta["tags"]
+    title = tags.get("title") or Path(base_name).stem.strip() or "Без названия"
+    stamp = to_iso(now)
+    conn.execute(
+        "INSERT INTO tracks(id, sha256, path, ext, title, artist, album, genre, year, "
+        "duration, bitrate, size, cover_path, custom_cover_path, source_title, "
+        "source_artist, source_album, source_genre, source_filename, duplicate_of, "
+        "duplicate_kind, duplicate_confirmed_at, play_count, pending_delete, created_at, "
+        "updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, "
+        "?, ?, 0, 0, ?, ?)",
+        (
+            track_id,
+            sha256,
+            staged["relative"],
+            ext,
+            title,
+            tags.get("artist"),
+            tags.get("album"),
+            tags.get("genre"),
+            tags.get("year"),
+            meta.get("duration"),
+            meta.get("bitrate"),
+            size,
+            cover_name,
+            tags.get("title"),
+            tags.get("artist"),
+            tags.get("album"),
+            tags.get("genre"),
+            base_name,
+            duplicate_of,
+            duplicate_kind,
+            to_iso(now) if duplicate_of else None,
+            stamp,
+            stamp,
+        ),
+    )
     return conn.execute("SELECT * FROM tracks WHERE id = ?", (track_id,)).fetchone()
 
 
@@ -469,6 +495,9 @@ def receive_upload(
     ext = None
     temp_path: Path | None = None
     cover_temp: Path | None = None
+    staged: dict | None = None
+    stable_path: Path | None = None
+    track = None
     size = 0
     try:
         base_name, ext = media._normalise_filename(filename)
@@ -515,60 +544,127 @@ def receive_upload(
             cover_temp.write_bytes(cover_bytes)
 
         metadata = _metadata_payload(base_name, ext, size, meta)
-        kind, best_id, matches = find_duplicate_matches(conn, meta["tags"], sha256)
         stamp = to_iso(now)
-        if kind is None:
-            track = _create_track(
-                conn,
-                settings,
-                temp_path,
-                base_name,
-                ext,
-                sha256,
-                size,
-                meta,
-                cover_bytes,
-                now,
-            )
+        conn.commit()
+
+        # File copy, hashing and cover encoding stay outside any transaction.
+        staged = _stage_track_file(settings, temp_path, ext, cover_bytes)
+        pending_id = uuid.uuid4().hex
+        stable_path = settings.pending_dir / f"{pending_id}{ext}"
+        os.replace(temp_path, stable_path)
+        temp_path = stable_path
+        if cover_temp is not None:
+            stable_cover = settings.pending_dir / f"{pending_id}.cover"
+            os.replace(cover_temp, stable_cover)
+            cover_temp = stable_cover
+
+        track = None
+        pending_row = None
+        final_kind = None
+        discard_staged = False
+        for attempt, delay in enumerate((0.0, 0.05, 0.15, 0.4)):
+            if delay:
+                time.sleep(delay)
             try:
-                conn.execute(
-                    "INSERT INTO pending_uploads(id, batch_id, filename, temp_path, ext, sha256, "
-                    "size, metadata, cover_temp, reason, match_track_id, matches, state, decision, "
-                    "created_at, updated_at) VALUES(?, ?, ?, NULL, ?, ?, ?, ?, NULL, NULL, NULL, "
-                    "'[]', 'added', 'save', ?, ?)",
-                    (
-                        track["id"],
-                        resolved_batch,
-                        base_name,
-                        ext,
-                        sha256,
-                        size,
-                        json.dumps(metadata, ensure_ascii=False),
-                        stamp,
-                        stamp,
-                    ),
-                )
-                _refresh_batch(conn, resolved_batch, now)
-                db.log_event(
-                    conn, "info", "media", "Трек загружен", {"track_id": track["id"]}, at=stamp
-                )
-                conn.commit()
-            except BaseException:
-                conn.rollback()
-                (settings.music_dir / str(track["path"])).unlink(missing_ok=True)
-                if track["cover_path"]:
-                    (settings.cover_dir / str(track["cover_path"])).unlink(missing_ok=True)
+                with _write_txn(conn):
+                    # Final availability check and insert are serialized by
+                    # BEGIN IMMEDIATE, so parallel identical uploads cannot both
+                    # create a stored track. No file I/O happens here.
+                    final_kind, best_id, matches = find_duplicate_matches(
+                        conn, meta["tags"], sha256
+                    )
+                    if final_kind is None:
+                        track = _insert_track(
+                            conn,
+                            staged,
+                            base_name,
+                            ext,
+                            sha256,
+                            size,
+                            meta,
+                            now,
+                        )
+                        conn.execute(
+                            "INSERT INTO pending_uploads(id, batch_id, filename, temp_path, ext, "
+                            "sha256, size, metadata, cover_temp, reason, match_track_id, matches, "
+                            "state, decision, created_at, updated_at) VALUES(?, ?, ?, NULL, ?, ?, "
+                            "?, ?, NULL, NULL, NULL, '[]', 'added', 'save', ?, ?)",
+                            (
+                                track["id"],
+                                resolved_batch,
+                                base_name,
+                                ext,
+                                sha256,
+                                size,
+                                json.dumps(metadata, ensure_ascii=False),
+                                stamp,
+                                stamp,
+                            ),
+                        )
+                        _refresh_batch(conn, resolved_batch, now)
+                        db.log_event(
+                            conn,
+                            "info",
+                            "media",
+                            "???? ????????",
+                            {"track_id": track["id"]},
+                            at=stamp,
+                        )
+                        conn.commit()
+                    else:
+                        discard_staged = True
+                        conn.execute(
+                            "INSERT INTO pending_uploads(id, batch_id, filename, temp_path, ext, "
+                            "sha256, size, metadata, cover_temp, reason, match_track_id, matches, "
+                            "state, decision, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                            "?, ?, ?, 'pending', NULL, ?, ?)",
+                            (
+                                pending_id,
+                                resolved_batch,
+                                base_name,
+                                str(stable_path),
+                                ext,
+                                sha256,
+                                size,
+                                json.dumps(metadata, ensure_ascii=False),
+                                str(cover_temp) if cover_temp else None,
+                                final_kind,
+                                best_id,
+                                json.dumps(
+                                    [
+                                        {"track_id": item["track_id"], "kind": item["kind"]}
+                                        for item in matches
+                                    ],
+                                    ensure_ascii=False,
+                                ),
+                                stamp,
+                                stamp,
+                            ),
+                        )
+                        _refresh_batch(conn, resolved_batch, now)
+                        conn.commit()
+                break
+            except sqlite3.OperationalError as exc:
+                track = None
+                discard_staged = False
+                if (
+                    ("locked" in str(exc).lower() or "busy" in str(exc).lower())
+                    and attempt < 3
+                ):
+                    continue
                 raise
-            try:
-                temp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-            if cover_temp is not None:
-                try:
-                    cover_temp.unlink(missing_ok=True)
-                except OSError:
-                    pass
-                cover_temp = None
+        if discard_staged:
+            _discard_staged_file(settings, staged)
+            staged = None
+        if track is not None:
+            for leftover in (stable_path, cover_temp):
+                if leftover is not None:
+                    try:
+                        leftover.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+            temp_path = None
+            cover_temp = None
             item = conn.execute(
                 "SELECT * FROM pending_uploads WHERE id = ?", (track["id"],)
             ).fetchone()
@@ -578,50 +674,17 @@ def receive_upload(
                 "upload": pending_payload(conn, settings, item),
                 "batch_id": resolved_batch,
             }
-
-        pending_id = uuid.uuid4().hex
-        stable_path = settings.pending_dir / f"{pending_id}{ext}"
-        os.replace(temp_path, stable_path)
-        temp_path = stable_path
-        if cover_temp is not None:
-            stable_cover = settings.pending_dir / f"{pending_id}.cover"
-            os.replace(cover_temp, stable_cover)
-            cover_temp = stable_cover
-        conn.execute(
-            "INSERT INTO pending_uploads(id, batch_id, filename, temp_path, ext, sha256, size, "
-            "metadata, cover_temp, reason, match_track_id, matches, state, decision, created_at, "
-            "updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?, ?)",
-            (
-                pending_id,
-                resolved_batch,
-                base_name,
-                str(stable_path),
-                ext,
-                sha256,
-                size,
-                json.dumps(metadata, ensure_ascii=False),
-                str(cover_temp) if cover_temp else None,
-                kind,
-                best_id,
-                json.dumps(
-                    [{"track_id": item["track_id"], "kind": item["kind"]} for item in matches],
-                    ensure_ascii=False,
-                ),
-                stamp,
-                stamp,
-            ),
-        )
-        _refresh_batch(conn, resolved_batch, now)
-        conn.commit()
-        row = conn.execute(
+        pending_row = conn.execute(
             "SELECT * FROM pending_uploads WHERE id = ?", (pending_id,)
         ).fetchone()
         return {
             "status": "pending",
-            "pending": pending_payload(conn, settings, row),
+            "pending": pending_payload(conn, settings, pending_row),
             "batch_id": resolved_batch,
         }
     except ApiError as exc:
+        if track is None:
+            _discard_staged_file(settings, staged)
         if temp_path is not None:
             try:
                 temp_path.unlink(missing_ok=True)
@@ -648,6 +711,8 @@ def receive_upload(
             conn.rollback()
         raise
     except OSError as exc:
+        if track is None:
+            _discard_staged_file(settings, staged)
         if temp_path is not None:
             try:
                 temp_path.unlink(missing_ok=True)
@@ -675,6 +740,8 @@ def receive_upload(
             conn.rollback()
         raise ApiError(507, "not_enough_space", message) from exc
     except BaseException:
+        if track is None:
+            _discard_staged_file(settings, staged)
         if temp_path is not None:
             try:
                 temp_path.unlink(missing_ok=True)
@@ -733,15 +800,43 @@ def decide(
     action: str,
     now: datetime,
 ) -> dict:
+    for attempt, delay in enumerate((0.0, 0.05, 0.15, 0.4)):
+        if delay:
+            time.sleep(delay)
+        try:
+            return _decide_impl(conn, settings, pending_id, action, now)
+        except sqlite3.OperationalError as exc:
+            if (
+                ("locked" in str(exc).lower() or "busy" in str(exc).lower())
+                and attempt < 3
+            ):
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                continue
+            raise
+    raise ApiError(503, "upload_busy", "Не удалось применить решение. Повторите попытку.")
+
+
+def _decide_impl(
+    conn: sqlite3.Connection,
+    settings: Settings,
+    pending_id: str,
+    action: str,
+    now: datetime,
+) -> dict:
     if action not in ("save", "skip"):
-        raise ApiError(422, "invalid_action", "Решение должно быть save или skip.")
+        raise ApiError(422, "invalid_action", "??????? ?????? ???? save ??? skip.")
 
     result: dict | None = None
     error: ApiError | None = None
+    stage_info: tuple | None = None
+    row = None
     with _write_txn(conn):
         row = _pending_row(conn, pending_id)
         if row is None:
-            raise ApiError(404, "upload_not_found", "Загрузка не найдена.")
+            raise ApiError(404, "upload_not_found", "???????? ?? ???????.")
         if row["state"] != "pending":
             result = _terminal_result(conn, settings, row, action)
         elif action == "skip":
@@ -764,7 +859,7 @@ def decide(
             ):
                 metadata = _json_loads(row["metadata"], {})
                 metadata["error"] = (
-                    "Файл ожидает решения, но был удалён. Загрузите его снова."
+                    "???? ??????? ???????, ?? ??? ??????. ????????? ??? ?????."
                 )
                 conn.execute(
                     "UPDATE pending_uploads SET state = 'error', reason = 'pending_file_missing', "
@@ -776,7 +871,7 @@ def decide(
                 error = ApiError(
                     409,
                     "pending_file_missing",
-                    "Файл ожидает решения, но был удалён. Загрузите его снова.",
+                    "???? ??????? ???????, ?? ??? ??????. ????????? ??? ?????.",
                 )
             else:
                 metadata = _json_loads(row["metadata"], {})
@@ -787,42 +882,72 @@ def decide(
                     "genre": metadata.get("source_genre"),
                     "year": metadata.get("year"),
                 }
-                cover_bytes = None
                 cover_value = row["cover_temp"]
-                if cover_value:
-                    cover_path = Path(str(cover_value))
-                    if is_relative_to(cover_path, settings.pending_dir) and cover_path.exists():
-                        try:
-                            cover_bytes = cover_path.read_bytes()
-                        except OSError:
-                            cover_bytes = None
-                media._check_upload_limits(conn, settings, int(row["size"] or 0))
+                size = int(row["size"] or 0)
                 meta = {
                     "tags": tags,
                     "duration": metadata.get("duration"),
                     "bitrate": metadata.get("bitrate"),
                 }
-                try:
-                    track = _create_track(
-                        conn,
-                        settings,
-                        temp_path,
-                        str(row["filename"] or ""),
-                        str(row["ext"] or ""),
-                        str(row["sha256"] or ""),
-                        int(row["size"] or 0),
-                        meta,
-                        cover_bytes,
-                        now,
-                        duplicate_kind=row["reason"],
-                        duplicate_of=row["match_track_id"],
-                    )
-                except OSError as exc:
-                    raise ApiError(
-                        507,
-                        "not_enough_space",
-                        "Недостаточно свободного места на диске для сохранения файла.",
-                    ) from exc
+                stage_info = (
+                    temp_path,
+                    str(row["ext"] or ""),
+                    cover_value,
+                    metadata,
+                    tags,
+                    meta,
+                    size,
+                    str(row["sha256"] or ""),
+                    str(row["filename"] or ""),
+                )
+
+    if error is not None:
+        raise error
+    if result is not None:
+        return result
+    assert stage_info is not None
+
+    (
+        temp_path,
+        ext,
+        cover_value,
+        metadata,
+        tags,
+        meta,
+        size,
+        sha256,
+        filename,
+    ) = stage_info
+    media._check_upload_limits(conn, settings, size)
+    cover_bytes = None
+    if cover_value:
+        cover_path = Path(str(cover_value))
+        if is_relative_to(cover_path, settings.pending_dir) and cover_path.exists():
+            try:
+                cover_bytes = cover_path.read_bytes()
+            except OSError:
+                cover_bytes = None
+    staged = _stage_track_file(settings, temp_path, ext, cover_bytes)
+    try:
+        with _write_txn(conn):
+            row = _pending_row(conn, pending_id)
+            if row is None:
+                raise ApiError(404, "upload_not_found", "???????? ?? ???????.")
+            if row["state"] != "pending":
+                result = _terminal_result(conn, settings, row, action)
+            else:
+                track = _insert_track(
+                    conn,
+                    staged,
+                    filename,
+                    ext,
+                    sha256,
+                    size,
+                    meta,
+                    now,
+                    duplicate_kind=row["reason"],
+                    duplicate_of=row["match_track_id"],
+                )
                 try:
                     metadata["saved_track_id"] = track["id"]
                     conn.execute(
@@ -835,27 +960,27 @@ def decide(
                         conn,
                         "info",
                         "media",
-                        "Сохранена копия трека",
+                        "????????? ????? ?????",
                         {"track_id": track["id"], "duplicate_of": row["match_track_id"]},
                         at=to_iso(now),
                     )
                     conn.commit()
                 except BaseException:
-                    (settings.music_dir / str(track["path"])).unlink(missing_ok=True)
-                    if track["cover_path"]:
-                        (settings.cover_dir / str(track["cover_path"])).unlink(missing_ok=True)
+                    _discard_staged_file(settings, staged)
                     raise
-                _remove_pending_files(settings, row)
-                row = _pending_row(conn, pending_id)
-                result = {
-                    "status": "saved",
-                    "track": track_payload(track, settings),
-                    "pending": pending_payload(conn, settings, row),
-                }
-    if error is not None:
-        raise error
-    assert result is not None
-    return result
+        if result is not None:
+            _discard_staged_file(settings, staged)
+            return result
+        _remove_pending_files(settings, row)
+        updated_row = _pending_row(conn, pending_id)
+        return {
+            "status": "saved",
+            "track": track_payload(track, settings),
+            "pending": pending_payload(conn, settings, updated_row),
+        }
+    except BaseException:
+        _discard_staged_file(settings, staged)
+        raise
 
 
 def _batch_rows(conn: sqlite3.Connection, batch_id: str, scope: str, query: str) -> list:

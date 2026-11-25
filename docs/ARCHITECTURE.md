@@ -60,6 +60,44 @@ not an estimate, and it survives renames inside the music directory. (The
 non-root user.) Positions the engine has already received (`prepared`) cannot be
 reordered in the UI; only `pending` positions can.
 
+## Station modes (1.2.0)
+
+The station has one explicit mode. `playlist` mode plays the permanently selected
+playlist (`selected_playlist_id`, «Вся медиатека» on a fresh install); `auto` mode
+resolves the source from the schedule, then rotation, then the default playlist,
+then the system playlist. A normal playlist choice changes the mode and the
+selected playlist — it does not create a manual override. Overrides exist only for
+an explicit temporary action (one track, until a time, until the next schedule
+change, until cancelled) and never replace the mode.
+
+A switch writes the new state, rebuilds and confirms the engine queue, and only
+then moves the playback (`now`) or schedules it for the end of the current track
+(`next`, stored as `pending_source`). Every state change bumps `state_revision`, so
+a late result cannot roll the station back to an older selection.
+
+The engine instance is identified by the liquidsoap unit's start timestamp: a
+backend-only restart keeps `prepared` positions, an engine restart resets them and
+resyncs. `vd_sync` names every accepted and rejected position, so the backend never
+reports an unplayable request as prepared.
+
+## Cycles, shuffle and repeat
+
+Each source keeps its cycle in `settings` (`_cycle:<source key>`): the ordered
+track ids of the pass, the not-yet-played remainder, the cycle number, the last
+track of the previous pass and the Repeat One target. A pass is never restarted
+by a settings change: enabling shuffle reorders the remainder, disabling restores
+the saved order of the remainder, `all → none` only drops positions of a future
+pass, and Repeat One keeps the ordinary progress. `shuffle` and `repeat_mode` are
+plain playlist columns and the only source of truth for the playlist page, the
+player bar and the playlist cards.
+
+Membership changes use the same cycle: new tracks join the remaining part of the
+current pass (appended in saved order, or mixed into the unplanned remainder when
+shuffle is on); already played tracks never return, and a request that adds no new
+track does not rebuild or sync anything. An empty active source resumes with the
+first available track; an exhausted `repeat=none` source plays only newly added
+tracks and then goes silent again.
+
 ## Sources and the system playlist
 
 The station always has a source decision, made in the backend:

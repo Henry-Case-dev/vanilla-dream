@@ -64,6 +64,7 @@ interface IconButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
   size?: 'sm' | 'md' | 'lg';
   tone?: 'default' | 'accent' | 'danger';
   active?: boolean;
+  loading?: boolean;
 }
 
 export function IconButton({
@@ -72,6 +73,7 @@ export function IconButton({
   size = 'md',
   tone = 'default',
   active = false,
+  loading = false,
   className = '',
   type = 'button',
   ...rest
@@ -83,9 +85,14 @@ export function IconButton({
       aria-label={label}
       title={label}
       aria-pressed={active || undefined}
+      aria-busy={loading || undefined}
       {...rest}
     >
-      <Icon size={size === 'lg' ? 20 : size === 'sm' ? 14 : 17} aria-hidden="true" />
+      <Icon
+        size={size === 'lg' ? 20 : size === 'sm' ? 14 : 17}
+        className={loading ? 'spin' : undefined}
+        aria-hidden="true"
+      />
     </button>
   );
 }

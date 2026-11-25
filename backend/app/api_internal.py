@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import sqlite3
-from datetime import timedelta
+import time
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, Request
@@ -34,7 +34,8 @@ async def engine_track_start(request: Request, conn: sqlite3.Connection = Depend
     file_value = form.get("f")
     position_id = ""
     if file_value:
-        link = Path(str(file_value))
+        # Accept either the path alone or a full `<id>\t<path>` engine line.
+        link = Path(str(file_value).split("\t")[-1])
         try:
             in_link_dir = link.is_absolute() and link.parent.resolve() == Path(
                 settings.queue_link_dir
@@ -49,15 +50,41 @@ async def engine_track_start(request: Request, conn: sqlite3.Connection = Depend
         position_id = str(form.get("vd") or "")
     now = request.app.state.clock.now()
     started_at = epoch_to_dt(form.get("ts"))
-    if started_at is None or started_at > now + timedelta(seconds=5):
-        started_at = now
-    if started_at < now - timedelta(hours=1):
-        started_at = now
+    if started_at is None:
+        raise ApiError(422, "invalid_timestamp", "Не удалось прочитать время начала трека.")
     result = await asyncio.to_thread(
-        queue_engine.handle_track_start, conn, settings, position_id, started_at, now
+        _handle_with_retry, conn, settings, position_id, started_at, now
     )
     request.app.state.scheduler.wake()
-    return {"ok": True, "duplicate": bool(result.get("duplicate"))}
+    return {"status": result.get("status", "ok"), "track_id": result.get("track_id")}
+
+
+def _handle_with_retry(conn, settings, position_id, started_at, now):
+    result = None
+    last_error: Exception | None = None
+    for delay in (0.0, 0.05, 0.15, 0.4):
+        if delay:
+            time.sleep(delay)
+        try:
+            result = queue_engine.handle_track_start(
+                conn, settings, position_id, started_at, now
+            )
+            break
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                raise
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            last_error = exc
+    if result is None:
+        raise ApiError(
+            503,
+            "engine_callback_busy",
+            "Не удалось сохранить событие движка. Повторите отправку.",
+        ) from last_error
+    return result
 
 @router.get("/health")
 def internal_health(request: Request):

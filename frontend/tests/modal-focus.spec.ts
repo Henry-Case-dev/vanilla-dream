@@ -78,7 +78,8 @@ async function clearField(page: Page, target: Locator, field: string): Promise<v
 
 test.describe.configure({ mode: 'serial' });
 
-test.beforeEach(async ({ context, baseURL }) => {
+test.beforeEach(async ({ context, baseURL, request }) => {
+  await request.get('http://127.0.0.1:4199/api/mock/reset');
   await context.addCookies([
     { name: 'mock_session', value: '1', url: baseURL ?? 'http://127.0.0.1:4199' },
   ]);

@@ -170,12 +170,16 @@ export function AddTracksDialog({
     setBusy(true);
     try {
       const result = await api.admin.playlists.addTracks(playlistId, Array.from(selected));
-      const parts = [
-        `Добавлено: ${result.added}`,
-        `пропущено: ${result.skipped}`,
-        `недоступно: ${result.unavailable}`,
-      ];
-      toast.notify(result.added > 0 ? 'success' : 'info', parts.join(' · '));
+      if (result.added > 0) {
+        toast.notify('success', `Добавлено треков: ${result.added}`);
+      } else if (result.skipped > 0 && result.unavailable === 0) {
+        toast.notify('info', 'Все выбранные треки уже в плейлисте');
+      } else {
+        toast.notify(
+          'info',
+          `Добавлено: ${result.added} · пропущено: ${result.skipped} · недоступно: ${result.unavailable}`,
+        );
+      }
       notifyDataChanged();
       onAdded(result);
       onClose();

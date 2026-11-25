@@ -115,6 +115,11 @@ def _archive_name(scope_name: str | None, now: datetime) -> str:
 
 
 def _cover_bytes(settings: Settings, row) -> bytes | None:
+    if isinstance(row, dict) and row.get("cover_data"):
+        try:
+            return base64.b64decode(row["cover_data"])
+        except (TypeError, ValueError):
+            return None
     path = media.effective_cover_path(settings, row)
     if path is None:
         return None
@@ -242,6 +247,17 @@ def single_download(
     settings.export_dir.mkdir(parents=True, exist_ok=True)
     temp_dir = settings.export_dir / "tmp"
     temp_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        free = shutil.disk_usage(temp_dir).free
+        incoming = source.stat().st_size
+    except OSError:
+        free, incoming = 0, 0
+    if settings.min_free_bytes and free - incoming < settings.min_free_bytes:
+        raise ApiError(
+            507,
+            "not_enough_space",
+            "Недостаточно свободного места для подготовки файла с тегами.",
+        )
     fd, temp_name = tempfile.mkstemp(
         prefix="tagged-", suffix=str(row["ext"] or ""), dir=str(temp_dir)
     )
@@ -303,6 +319,58 @@ def _existing_rows(conn: sqlite3.Connection, ids: list[str]) -> list:
     return rows
 
 
+ACTIVE_EXPORT_STATES = ("queued", "preparing", "ready", "downloading")
+
+
+def track_is_exported(conn: sqlite3.Connection, track_id: str) -> bool:
+    placeholders = ",".join("?" for _ in ACTIVE_EXPORT_STATES)
+    rows = conn.execute(
+        f"SELECT track_ids FROM export_jobs WHERE state IN ({placeholders})",
+        ACTIVE_EXPORT_STATES,
+    ).fetchall()
+    for row in rows:
+        try:
+            ids = json.loads(row["track_ids"] or "[]")
+        except (TypeError, ValueError):
+            continue
+        if track_id in {str(value) for value in ids}:
+            return True
+    return False
+
+
+def _snapshot_track(settings: Settings, row) -> dict:
+    source = media.resolve_track_path(settings, row)
+    cover_path = media.effective_cover_path(settings, row)
+    cover_data = None
+    if cover_path is not None:
+        try:
+            cover_data = base64.b64encode(cover_path.read_bytes()).decode("ascii")
+        except OSError:
+            cover_data = None
+    return {
+        "track_id": str(row["id"]),
+        "title": row["title"],
+        "artist": row["artist"],
+        "album": row["album"],
+        "ext": row["ext"],
+        "duration": row["duration"],
+        "bitrate": row["bitrate"],
+        "size": row["size"],
+        "cover_path": media.effective_cover_name(row),
+        "cover_data": cover_data,
+        "path": str(source),
+    }
+
+
+def _snapshot_source(settings: Settings, snapshot: dict) -> Path:
+    path = Path(str(snapshot.get("path") or ""))
+    if not path.is_absolute():
+        path = settings.music_dir / path
+    if not is_relative_to(path, settings.music_dir):
+        raise ApiError(404, "file_not_found", "Файл трека не найден.")
+    return path
+
+
 def disk_free(settings: Settings) -> int:
     directory = settings.export_dir
     directory.mkdir(parents=True, exist_ok=True)
@@ -354,7 +422,11 @@ def create_export(
             total_bytes += source.stat().st_size
         except OSError:
             continue
-    required = int(total_bytes * 1.05) + int(settings.export_reserve_bytes or 0)
+    required = (
+        int(settings.min_free_bytes or 0)
+        + int(total_bytes * 1.05)
+        + int(settings.export_reserve_bytes or 0)
+    )
     free = disk_free(settings)
     if free < required:
         raise ApiError(
@@ -364,12 +436,14 @@ def create_export(
             "Освободите место и попробуйте снова.",
         )
 
+    snapshot = [_snapshot_track(settings, row) for row in rows]
     job_id = os.urandom(16).hex()
     stamp = to_iso(now)
     conn.execute(
         "INSERT INTO export_jobs(id, scope, scope_ref, track_ids, metadata_mode, format, state, "
-        "processed, total, archive_path, archive_name, size, error, created_at, updated_at, "
-        "expires_at) VALUES(?, ?, ?, ?, ?, 'zip', 'queued', 0, ?, NULL, NULL, NULL, NULL, ?, ?, NULL)",
+        "processed, total, archive_path, archive_name, size, error, snapshot, created_at, "
+        "updated_at, expires_at) VALUES(?, ?, ?, ?, ?, 'zip', 'queued', 0, ?, NULL, NULL, NULL, "
+        "NULL, ?, ?, ?, NULL)",
         (
             job_id,
             scope,
@@ -377,6 +451,7 @@ def create_export(
             json.dumps([str(row["id"]) for row in rows], ensure_ascii=False),
             metadata_mode,
             len(rows),
+            json.dumps(snapshot, ensure_ascii=False),
             stamp,
             stamp,
         ),
@@ -453,7 +528,34 @@ def process_job(settings: Settings, job_id: str, now: datetime | None = None) ->
             )
             conn.commit()
             ids = json.loads(row["track_ids"] or "[]")
+            snapshot = json.loads(row["snapshot"] or "[]") if row["snapshot"] else []
+            if not snapshot:
+                snapshot = []
+                for track_id in ids:
+                    track = conn.execute(
+                        "SELECT * FROM tracks WHERE id = ?", (track_id,)
+                    ).fetchone()
+                    if track is not None:
+                        snapshot.append(_snapshot_track(settings, track))
             metadata_mode = row["metadata_mode"] or "tags"
+            total_bytes = 0
+            for item in snapshot:
+                try:
+                    total_bytes += _snapshot_source(settings, item).stat().st_size
+                except OSError:
+                    continue
+            required = (
+                int(settings.min_free_bytes or 0)
+                + int(total_bytes * 1.05)
+                + int(settings.export_reserve_bytes or 0)
+            )
+            if disk_free(settings) < required:
+                raise ApiError(
+                    507,
+                    "export_not_enough_space",
+                    "Недостаточно свободного места для подготовки архива. "
+                    "Освободите место и попробуйте снова.",
+                )
             job_dir.mkdir(parents=True, exist_ok=True)
             tmp_dir.mkdir(parents=True, exist_ok=True)
             scope_name = None
@@ -477,23 +579,18 @@ def process_job(settings: Settings, job_id: str, now: datetime | None = None) ->
             with zipfile.ZipFile(
                 archive_path, "w", compression=zipfile.ZIP_STORED, allowZip64=True
             ) as archive:
-                for index, track_id in enumerate(ids, start=1):
+                for index, item in enumerate(snapshot, start=1):
                     current = _job_row(conn, job_id)
                     if current is None or current["state"] in ("cancelled", "error"):
                         raise _Cancelled()
-                    track = conn.execute(
-                        "SELECT * FROM tracks WHERE id = ?", (track_id,)
-                    ).fetchone()
-                    if track is None:
-                        raise ApiError(404, "track_not_found", "Трек не найден.")
-                    source = media.resolve_track_path(settings, track)
+                    source = _snapshot_source(settings, item)
                     if not source.exists():
                         raise ApiError(404, "file_not_found", "Файл трека не найден.")
-                    ext = str(track["ext"] or "")
-                    arcname = _entry_name(index, track, ext, used)
+                    ext = str(item.get("ext") or "")
+                    arcname = _entry_name(index, item, ext, used)
                     if metadata_mode == "tags":
                         prepared = tmp_dir / f"{index}{ext}"
-                        _rewrite_tags(settings, track, source, prepared)
+                        _rewrite_tags(settings, item, source, prepared)
                         archive.write(prepared, arcname)
                         prepared.unlink(missing_ok=True)
                     else:
@@ -518,13 +615,14 @@ def process_job(settings: Settings, job_id: str, now: datetime | None = None) ->
             )
             conn.execute(
                 "UPDATE export_jobs SET state = 'ready', processed = ?, archive_path = ?, "
-                "archive_name = ?, size = ?, error = NULL, updated_at = ?, expires_at = ? "
-                "WHERE id = ?",
+                "archive_name = ?, size = ?, error = NULL, updated_at = ?, finished_at = ?, "
+                "expires_at = ? WHERE id = ?",
                 (
-                    len(ids),
+                    len(snapshot),
                     str(archive_path),
                     archive_name,
                     size,
+                    to_iso(finished),
                     to_iso(finished),
                     to_iso(expires),
                     job_id,
@@ -615,9 +713,9 @@ def cancel_job(
     if state == "downloading":
         raise ApiError(409, "export_downloading", "Архив уже скачивается.")
     if state in ("cancelled", "error"):
-        return {"job": job_payload(row)}
-    if state == "ready":
         _cleanup_job_files(settings, job_id)
+        return {"job": job_payload(row)}
+    _cleanup_job_files(settings, job_id)
     conn.execute(
         "UPDATE export_jobs SET state = 'cancelled', archive_path = NULL, updated_at = ? "
         "WHERE id = ?",
@@ -625,6 +723,26 @@ def cancel_job(
     )
     conn.commit()
     return {"job": job_payload(_job_row(conn, job_id))}
+
+
+def retry_job(
+    conn: sqlite3.Connection, settings: Settings, job_id: str, now: datetime
+) -> dict:
+    row = _job_row(conn, job_id)
+    if row is None:
+        raise ApiError(404, "export_not_found", "Экспорт не найден.")
+    if str(row["state"] or "") != "error":
+        raise ApiError(409, "export_not_retryable", "Повторить можно только неудачный экспорт.")
+    _cleanup_job_files(settings, job_id)
+    conn.execute(
+        "UPDATE export_jobs SET state = 'queued', processed = 0, archive_path = NULL, "
+        "archive_name = NULL, size = NULL, error = NULL, finished_at = NULL, "
+        "expires_at = NULL, updated_at = ? WHERE id = ?",
+        (to_iso(now), job_id),
+    )
+    conn.commit()
+    return {"job": {"id": job_id, "state": "queued", "processed": 0, "total": int(row["total"] or 0), "progress": 0.0}}
+
 
 
 def archive_file(
@@ -650,7 +768,30 @@ def cleanup_exports(
         job_id = str(row["id"])
         state = str(row["state"] or "")
         expires = parse_iso(row["expires_at"])
+        if expires is None:
+            finished = parse_iso(row["finished_at"])
+            if finished is not None:
+                expires = finished + timedelta(
+                    hours=max(0.0, float(settings.export_ttl_hours or 6.0))
+                )
         expired = expires is not None and expires <= now
+        if state == "downloading":
+            # Never delete an archive while a response is streaming it.
+            if not row["archive_path"] or not Path(str(row["archive_path"])).exists():
+                _cleanup_job_files(settings, job_id)
+                conn.execute(
+                    "UPDATE export_jobs SET state = 'error', error = ?, updated_at = ? "
+                    "WHERE id = ?",
+                    ("Файл архива не найден.", to_iso(now), job_id),
+                )
+            else:
+                updated = parse_iso(row["updated_at"])
+                if updated is not None and now - updated > timedelta(minutes=30):
+                    conn.execute(
+                        "UPDATE export_jobs SET state = 'ready', updated_at = ? WHERE id = ?",
+                        (to_iso(now), job_id),
+                    )
+            continue
         if expired or state in ("cancelled", "error"):
             _cleanup_job_files(settings, job_id)
             if expired:
@@ -664,22 +805,6 @@ def cleanup_exports(
                     "WHERE id = ?",
                     ("Файл архива не найден.", to_iso(now), job_id),
                 )
-        elif state == "downloading":
-            if not row["archive_path"] or not Path(str(row["archive_path"])).exists():
-                _cleanup_job_files(settings, job_id)
-                conn.execute(
-                    "UPDATE export_jobs SET state = 'error', error = ?, updated_at = ? "
-                    "WHERE id = ?",
-                    ("Файл архива не найден.", to_iso(now), job_id),
-                )
-            else:
-                updated = parse_iso(row["updated_at"])
-                if updated is not None and now - updated > timedelta(minutes=30):
-                    # A broken/aborted response must not leave the archive locked.
-                    conn.execute(
-                        "UPDATE export_jobs SET state = 'ready', updated_at = ? WHERE id = ?",
-                        (to_iso(now), job_id),
-                    )
         elif state in ("queued", "preparing"):
             created = parse_iso(row["created_at"])
             ttl = timedelta(hours=max(0.0, float(settings.export_ttl_hours or 6.0)))
@@ -731,7 +856,21 @@ def startup_cleanup(conn: sqlite3.Connection, settings: Settings, now: datetime)
                 "UPDATE export_jobs SET state = 'error', error = ?, updated_at = ? WHERE id = ?",
                 ("Экспорт прерван перезапуском сервиса.", to_iso(now), job_id),
             )
-        elif state in ("ready", "downloading"):
+        elif state == "downloading":
+            missing = not row["archive_path"] or not Path(str(row["archive_path"])).exists()
+            if missing:
+                _cleanup_job_files(settings, job_id)
+                conn.execute(
+                    "UPDATE export_jobs SET state = 'error', error = ?, updated_at = ? "
+                    "WHERE id = ?",
+                    ("Файл архива не найден.", to_iso(now), job_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE export_jobs SET state = 'ready', updated_at = ? WHERE id = ?",
+                    (to_iso(now), job_id),
+                )
+        elif state == "ready":
             expires = parse_iso(row["expires_at"])
             missing = not row["archive_path"] or not Path(str(row["archive_path"])).exists()
             if (expires is not None and expires <= now) or missing:

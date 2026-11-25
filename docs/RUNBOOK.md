@@ -45,6 +45,19 @@ the schedule/rotation/default source, use «Вернуться к автомат
 Playlist covers live in `/srv/vanilla-dream-radio/covers/playlists` and are
 removed together with their playlist; track covers are never touched.
 
+### Switching sources (1.2.0)
+
+- «В эфир» on a playlist = immediate switch in `playlist` mode; the button menu
+  has «После текущего трека» and «Начать сначала».
+- The overview source block has two modes, `Плейлист` and `Автоматически`; the
+  dropdown selects the permanent playlist. Switching modes never starts a stopped
+  station.
+- A temporary switch appears as a banner with «Завершить переключение» and
+  disappears with the override, not with the next track.
+- To recover from a stuck switch: check `GET /api/admin/station/state`
+  (`mode`, `selected_playlist_id`, `effective_source`, `pending_source`), then use
+  the UI actions; manual SQL edits are not required.
+
 ### Database backup
 
 ```bash

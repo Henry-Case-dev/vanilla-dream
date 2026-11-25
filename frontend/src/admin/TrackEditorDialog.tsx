@@ -53,7 +53,7 @@ export function TrackEditorDialog({ open, track, onClose, onSaved }: TrackEditor
 
   if (!track) return null;
 
-  const preview = coverPreview ?? (resetCover ? null : track.coverUrl);
+  const preview = coverPreview ?? (resetCover ? track.originalCoverUrl : track.coverUrl);
   const canReset = !resetCover && (Boolean(coverFile) || track.canRevertCover);
 
   const chooseCover = (file: File) => {
@@ -85,16 +85,13 @@ export function TrackEditorDialog({ open, track, onClose, onSaved }: TrackEditor
     setBusy(true);
     setError(null);
     try {
-      let updated = await api.admin.tracks.update(track.id, {
+      const updated = await api.admin.tracks.update(track.id, {
         title: title.trim(),
         artist: artist.trim() || null,
         album: album.trim() || null,
+        coverAction: coverFile ? 'replace' : resetCover ? 'revert' : 'keep',
+        cover: coverFile,
       });
-      if (coverFile) {
-        updated = await api.admin.tracks.uploadCover(track.id, coverFile);
-      } else if (resetCover) {
-        updated = await api.admin.tracks.resetCover(track.id);
-      }
       onSaved(updated);
     } catch (caught) {
       // Форма и введённые значения остаются на месте.

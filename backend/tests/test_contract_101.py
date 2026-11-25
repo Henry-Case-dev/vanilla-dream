@@ -295,6 +295,7 @@ def test_engine_restart_resets_prepared_and_resyncs(env, admin):
     tracks = [_upload(env, f"restart-{i}") for i in range(3)]
     playlist = make_playlist(env.client, "Restart", [track["id"] for track in tracks])
     env.client.put("/api/admin/settings", json={"default_playlist_id": playlist["id"]})
+    env.client.put("/api/admin/station/mode", json={"mode": "auto"})
     _start(env)
     env.app.state.scheduler.tick()
     syncs = env.engine.sync_calls
@@ -312,6 +313,7 @@ def test_short_and_single_track_playlists_repeat(env, admin):
         env.client, "Single", [track["id"]], repeat_mode="all"
     )
     env.client.put("/api/admin/settings", json={"default_playlist_id": playlist["id"]})
+    env.client.put("/api/admin/station/mode", json={"mode": "auto"})
     _start(env)
     started = [play_next(env) for _ in range(3)]
     assert all(item and item["track"]["id"] == track["id"] for item in started)
@@ -340,6 +342,7 @@ def test_membership_removal_drops_prepared_position(env, admin):
     tracks = [_upload(env, f"member-{i}") for i in range(4)]
     playlist = make_playlist(env.client, "Members", [track["id"] for track in tracks])
     env.client.put("/api/admin/settings", json={"default_playlist_id": playlist["id"]})
+    env.client.put("/api/admin/station/mode", json={"mode": "auto"})
     _start(env)
     env.app.state.scheduler.tick()
     items = env.client.get("/api/admin/queue").json()["items"]
@@ -362,6 +365,7 @@ def test_system_playlist_allowed_in_rotation_and_schedule(env, admin):
         json={"mode": "sequential", "items": [{"playlist_id": "library", "position": 0}]},
     )
     assert rotation.status_code == 200
+    env.client.put("/api/admin/station/mode", json={"mode": "auto"})
     env.app.state.scheduler.tick()
     items = env.client.get("/api/admin/queue").json()["items"]
     assert items and items[0]["source"]["kind"] == "rotation"
@@ -436,7 +440,7 @@ def test_migration_is_idempotent_and_preserves_system_settings(settings):
         version = conn.execute("PRAGMA user_version").fetchone()[0]
     finally:
         conn.close()
-    assert version == db.SCHEMA_VERSION == 3
+    assert version == db.SCHEMA_VERSION == 4
     assert row["shuffle"] == 0
     assert row["repeat_mode"] == "none"
     assert row["system"] == 1
@@ -447,6 +451,7 @@ def test_user_source_exhaustion_is_not_replaced_by_library(env, admin):
     _upload(env, "library-extra")
     playlist = make_playlist(env.client, "Once", [track["id"]], repeat_mode="none")
     env.client.put("/api/admin/settings", json={"default_playlist_id": playlist["id"]})
+    env.client.put("/api/admin/station/mode", json={"mode": "auto"})
     _start(env)
     env.icecast.payload = {
         "available": True,
@@ -477,13 +482,14 @@ def test_explicit_play_resets_exhausted_source(env, admin):
     track = _upload(env, "reset-play")
     playlist = make_playlist(env.client, "Reset", [track["id"]], repeat_mode="none")
     env.client.put("/api/admin/settings", json={"default_playlist_id": playlist["id"]})
+    env.client.put("/api/admin/station/mode", json={"mode": "auto"})
     _start(env)
     assert play_next(env)
     env.app.state.scheduler.tick()
     assert env.client.get("/api/admin/queue").json()["items"] == []
     played = env.client.post(f"/api/admin/playlists/{playlist['id']}/play", json={"mode": "now"})
     assert played.status_code == 200
-    assert played.json()["started"] is True
+    assert played.json()["status"] in ("applied", "switching")
     assert env.client.get("/api/admin/queue").json()["items"]
 
 
@@ -517,11 +523,19 @@ def test_engine_sync_unresolved_requests_are_not_prepared(env, admin):
         _upload(env, f"sync-fail-{index}")
     _start(env)
     env.app.state.scheduler.tick()
+    lines = [
+        line
+        for line in env.settings.engine_queue_file.read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    ids = [line.split("\t", 1)[0] for line in lines]
     env.engine.sync_report_result = {
         "ok": True,
         "resolved": 1,
         "failed": 1,
-        "reply": "OK 1 1",
+        "reply": "\n".join(
+            ["OK", f"ok {ids[0]}", f"fail {ids[1]}", "END"]
+        ),
     }
     conn = db.open_db(env.settings)
     try:
@@ -544,8 +558,10 @@ def test_engine_sync_unresolved_requests_are_not_prepared(env, admin):
     env.engine.sync_report_result = {
         "ok": True,
         "resolved": 0,
-        "failed": 2,
-        "reply": "OK 0 2",
+        "failed": len(ids),
+        "reply": "\n".join(
+            ["OK"] + [f"fail {identifier}" for identifier in ids] + ["END"]
+        ),
     }
     conn = db.open_db(env.settings)
     try:
@@ -595,6 +611,7 @@ def test_schedule_skips_empty_rule_to_next_rule(env, admin):
         json={**base, "name": "Valid second", "playlist_id": valid["id"], "priority": 10},
     )
     assert first.status_code == 201 and second.status_code == 201
+    env.client.put("/api/admin/station/mode", json={"mode": "auto"})
     env.app.state.scheduler.tick()
     items = env.client.get("/api/admin/queue").json()["items"]
     assert items
@@ -606,6 +623,7 @@ def test_empty_default_user_playlist_reports_reason_without_library_fallback(env
     _upload(env, "empty-default-extra")
     empty = env.client.post("/api/admin/playlists", json={"name": "Empty default"}).json()["playlist"]
     env.client.put("/api/admin/settings", json={"default_playlist_id": empty["id"]})
+    env.client.put("/api/admin/station/mode", json={"mode": "auto"})
     _start(env)
     env.icecast.payload = {
         "available": True,
@@ -697,6 +715,7 @@ def test_failed_sync_is_retried_and_clears_last_error(env, admin):
     tracks = [_upload(env, f"retry-{i}") for i in range(3)]
     playlist = make_playlist(env.client, "Retry", [track["id"] for track in tracks])
     env.client.put("/api/admin/settings", json={"default_playlist_id": playlist["id"]})
+    env.client.put("/api/admin/station/mode", json={"mode": "auto"})
     _start(env)
     conn = db.open_db(env.settings)
     try:
@@ -725,8 +744,8 @@ def test_empty_library_start_and_upload_recovery(env, admin):
     env.engine.sync_ok = False  # socket not ready yet, like a just-started unit
     _start(env)
     status = env.client.get("/api/admin/station/status").json()
-    assert status["state"] == "no_music"
-    assert status["reason"] == "library_empty"
+    assert status["state"] == "starting"
+    assert status["reason"] == "engine_starting"
     assert status["status"] == status["state"]
     assert status["unit_active"] is True
     starts = len(
@@ -734,7 +753,7 @@ def test_empty_library_start_and_upload_recovery(env, admin):
     )
     conn = db.open_db(env.settings)
     try:
-        assert not db.get_setting(conn, "_engine_sync_error")
+        assert db.get_setting(conn, "_engine_sync_error")
     finally:
         conn.close()
 
@@ -891,7 +910,7 @@ def test_migration_v1_keeps_data_and_clears_library_cycle(settings):
         }
     finally:
         conn.close()
-    assert version == db.SCHEMA_VERSION == 3
+    assert version == db.SCHEMA_VERSION == 4
     assert "system" in system_column
     assert system is not None and system["system"] == 1
     assert system["shuffle"] == 1 and system["repeat_mode"] == "all"

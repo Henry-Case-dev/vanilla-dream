@@ -42,11 +42,31 @@ def _value(row: sqlite3.Row | dict[str, Any], key: str, default: Any = None) -> 
     return row.get(key, default)
 
 
+def playlist_membership_counts(
+    conn: sqlite3.Connection, track_ids
+) -> dict[str, int]:
+    """Count user playlists (not «Вся медиатека») containing each track."""
+
+    ids = [str(track_id) for track_id in track_ids if track_id]
+    if not ids:
+        return {}
+    placeholders = ",".join("?" for _ in ids)
+    rows = conn.execute(
+        "SELECT pt.track_id AS track_id, COUNT(*) AS count "
+        "FROM playlist_tracks pt JOIN playlists p ON p.id = pt.playlist_id "
+        f"WHERE p.system = 0 AND pt.playlist_id <> ? AND pt.track_id IN ({placeholders}) "
+        "GROUP BY pt.track_id",
+        (SYSTEM_PLAYLIST_ID, *ids),
+    ).fetchall()
+    return {str(row["track_id"]): int(row["count"] or 0) for row in rows}
+
+
 def track_payload(
     row: sqlite3.Row | dict[str, Any],
     settings: Settings,
     *,
     include_source: bool = False,
+    playlists_count: int | None = None,
 ) -> dict[str, Any]:
     track_id = _value(row, "id")
     cover_path = _value(row, "cover_path")
@@ -61,6 +81,13 @@ def track_payload(
     cover_url = (
         f"{settings.public_base_url}/api/public/cover/{track_id}"
         if effective_cover
+        else None
+    )
+    original_cover_url = (
+        f"{settings.public_base_url}/api/public/cover/{track_id}?source=original"
+        if custom_cover
+        and cover_path
+        and (settings.cover_dir / str(cover_path)).exists()
         else None
     )
     duplicate_of = _value(row, "duplicate_of")
@@ -88,6 +115,10 @@ def track_payload(
         "updated_at": _value(row, "updated_at"),
         "stream_url": f"/api/admin/tracks/{track_id}/stream",
     }
+    if original_cover_url:
+        payload["original_cover_url"] = original_cover_url
+    if playlists_count is not None:
+        payload["playlists_count"] = int(playlists_count)
     if include_source:
         payload["source_title"] = _value(row, "source_title")
         payload["source_artist"] = _value(row, "source_artist")
@@ -178,6 +209,7 @@ def playlist_payload(
     conn: sqlite3.Connection,
     row: sqlite3.Row | dict[str, Any],
     settings: Settings,
+    now=None,
 ) -> dict[str, Any]:
     from .util import parse_iso
 
@@ -203,6 +235,13 @@ def playlist_payload(
     if system:
         name = SYSTEM_PLAYLIST_NAME
         description = SYSTEM_PLAYLIST_DESCRIPTION
+    repeat_governed_by = None
+    try:
+        from . import queue_engine
+
+        repeat_governed_by = queue_engine.repeat_governed_by(conn, playlist_id, now)
+    except Exception:  # noqa: BLE001 - payload remains usable during startup
+        repeat_governed_by = None
     return {
         "id": playlist_id,
         "name": name,
@@ -210,6 +249,7 @@ def playlist_payload(
         "system": system,
         "shuffle": bool(_value(row, "shuffle", 0)),
         "repeat_mode": _value(row, "repeat_mode", "none") or "none",
+        "repeat_governed_by": repeat_governed_by,
         "cover_url": cover_url,
         "cover_kind": cover_kind,
         "track_count": stats["count"],

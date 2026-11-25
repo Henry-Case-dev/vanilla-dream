@@ -39,10 +39,14 @@
     <mount-name>/radio.mp3</mount-name>
     <max-listeners>200</max-listeners>
     <public>0</public>
-    <stream-name>Vanilla Dream Radio</stream-name>
-    <stream-description>Круглосуточный сиреневый эфир</stream-description>
-    <stream-url>https://vanilladream.duckdns.org</stream-url>
-    <genre>Eclectic</genre>
+    <!-- Rendered from the station settings (station_name, station_description,
+         public_base_url, station_genre) by install.sh / update.sh. The live
+         icy-name/icy-description/icy-genre/icy-url come from the Liquidsoap
+         source, which reads station.liq written by the backend. -->
+    <stream-name>__STATION_NAME__</stream-name>
+    <stream-description>__STATION_DESCRIPTION__</stream-description>
+    <stream-url>__STATION_URL__</stream-url>
+    <genre>__STATION_GENRE__</genre>
     <burst-size>65536</burst-size>
     <hidden>0</hidden>
     <no-yp>1</no-yp>

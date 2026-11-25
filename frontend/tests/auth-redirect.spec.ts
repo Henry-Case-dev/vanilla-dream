@@ -2,6 +2,10 @@ import { test, expect } from '@playwright/test';
 
 const BASE = 'http://127.0.0.1:4199';
 
+test.beforeEach(async ({ request }) => {
+  await request.get(`${BASE}/api/mock/reset`);
+});
+
 test('successful login navigates from /admin/login to the overview', async ({ page, context }) => {
   await context.clearCookies();
   await page.goto('/admin/login');

@@ -81,8 +81,8 @@ class LiquidsoapClient:
         ok, _ = self.command("vd_sync")
         return ok
 
-    def sync_report(self) -> dict:
-        """Return parsed ``OK <resolved> <failed>`` details for vd_sync."""
+    def sync_report(self, expected_ids=None) -> dict:
+        """Return the raw ``vd_sync`` reply plus legacy count details."""
 
         ok, reply = self.command("vd_sync")
         resolved: int | None = None
@@ -95,6 +95,11 @@ class LiquidsoapClient:
                     failed = int(parts[2])
                 except (TypeError, ValueError):
                     resolved = failed = None
+            elif len(parts) == 2:
+                try:
+                    resolved = int(parts[1])
+                except (TypeError, ValueError):
+                    resolved = None
         return {"ok": ok, "resolved": resolved, "failed": failed, "reply": reply}
 
     def skip(self) -> bool:

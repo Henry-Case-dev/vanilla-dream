@@ -12,6 +12,7 @@ from .models import (
     REPEAT_MODES,
     playlist_available_ids,
     playlist_available_rows,
+    playlist_membership_counts,
     playlist_payload,
     track_payload,
 )
@@ -73,13 +74,15 @@ def _validate_repeat(value: str | None, current: str = "none") -> str:
     return text
 
 
-def list_playlists(conn: sqlite3.Connection, settings: Settings) -> list[dict]:
+def list_playlists(
+    conn: sqlite3.Connection, settings: Settings, now=None
+) -> list[dict]:
     rows = conn.execute(
         "SELECT * FROM playlists ORDER BY CASE WHEN system = 1 OR id = ? THEN 0 ELSE 1 END, "
         "lower(name) ASC, created_at ASC",
         (SYSTEM_PLAYLIST_ID,),
     ).fetchall()
-    return [playlist_payload(conn, row, settings) for row in rows]
+    return [playlist_payload(conn, row, settings, now) for row in rows]
 
 
 def create_playlist(
@@ -108,7 +111,7 @@ def create_playlist(
     )
     conn.commit()
     row = require_playlist(conn, playlist_id)
-    return playlist_payload(conn, row, settings)
+    return playlist_payload(conn, row, settings, now)
 
 
 def update_playlist(
@@ -142,7 +145,7 @@ def update_playlist(
             (*updates.values(), playlist_id),
         )
         conn.commit()
-    return playlist_payload(conn, require_playlist(conn, playlist_id), settings)
+    return playlist_payload(conn, require_playlist(conn, playlist_id), settings, now)
 
 
 def delete_playlist(conn: sqlite3.Connection, settings: Settings, playlist_id: str, now: datetime) -> dict:
@@ -167,6 +170,16 @@ def delete_playlist(conn: sqlite3.Connection, settings: Settings, playlist_id: s
     )
     if db.get_setting(conn, "default_playlist_id") == playlist_id:
         db.set_setting(conn, "default_playlist_id", "")
+    if db.get_setting(conn, "selected_playlist_id") == playlist_id:
+        db.set_setting(conn, "selected_playlist_id", SYSTEM_PLAYLIST_ID)
+        db.log_event(
+            conn,
+            "warning",
+            "station",
+            "Выбранный плейлист удалён, включена «Вся медиатека»",
+            {"playlist_id": playlist_id},
+            at=to_iso(now),
+        )
     conn.execute("DELETE FROM playlists WHERE id = ?", (playlist_id,))
     db.delete_setting(conn, f"_cycle:playlist:{playlist_id}")
     conn.commit()
@@ -183,9 +196,12 @@ def playlist_tracks(
 ) -> list[dict]:
     require_playlist(conn, playlist_id)
     rows = playlist_available_rows(conn, playlist_id, limit=limit, offset=offset)
+    counts = playlist_membership_counts(conn, [row["id"] for row in rows])
     items = []
     for index, row in enumerate(rows):
-        item = track_payload(row, settings)
+        item = track_payload(
+            row, settings, playlists_count=counts.get(str(row["id"]), 0)
+        )
         stored_position = row["playlist_position"]
         item["position"] = (
             int(stored_position) if stored_position is not None else offset + index
@@ -201,9 +217,10 @@ def playlist_detail(
     *,
     tracks_limit: int = 500,
     tracks_offset: int = 0,
+    now=None,
 ) -> dict:
     row = require_playlist(conn, playlist_id)
-    payload = playlist_payload(conn, row, settings)
+    payload = playlist_payload(conn, row, settings, now)
     limit = max(0, min(int(tracks_limit), 2000))
     offset = max(0, int(tracks_offset))
     payload["tracks"] = playlist_tracks(
@@ -281,7 +298,7 @@ def add_tracks(
         "added": added,
         "skipped": skipped,
         "unavailable": unavailable,
-        "playlist": playlist_payload(conn, require_playlist(conn, playlist_id), settings),
+        "playlist": playlist_payload(conn, require_playlist(conn, playlist_id), settings, now),
     }
 
 
@@ -301,7 +318,7 @@ def remove_track(
     conn.commit()
     return {
         "removed": True,
-        "playlist": playlist_payload(conn, require_playlist(conn, playlist_id), settings),
+        "playlist": playlist_payload(conn, require_playlist(conn, playlist_id), settings, now),
     }
 
 
@@ -334,5 +351,5 @@ def reorder(
     conn.execute("UPDATE playlists SET updated_at = ? WHERE id = ?", (to_iso(now), playlist_id))
     conn.commit()
     return {
-        "playlist": playlist_payload(conn, require_playlist(conn, playlist_id), settings)
+        "playlist": playlist_payload(conn, require_playlist(conn, playlist_id), settings, now)
     }

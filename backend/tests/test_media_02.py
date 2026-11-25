@@ -1301,7 +1301,7 @@ def test_migration_v2_preserves_rows_relations_and_drops_unique(settings):
     finally:
         conn.close()
 
-    assert version == db.SCHEMA_VERSION == 3
+    assert version == db.SCHEMA_VERSION == 4
     assert track["path"] == "legacy.mp3"
     assert track["title"] == "Legacy"
     assert track["cover_path"] == "old-1.jpg"

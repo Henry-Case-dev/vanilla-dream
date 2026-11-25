@@ -269,7 +269,9 @@ class SchedulerLoop:
         self._stop.set()
 
     def tick(self) -> dict:
-        from . import db, queue_engine, uploads, exports
+        from datetime import timedelta
+
+        from . import db, media, queue_engine, uploads, exports
         from . import scheduler as schedule_module
         from .auth import purge_expired_sessions
         from .util import to_iso
@@ -281,14 +283,33 @@ class SchedulerLoop:
             uploads.cleanup_pending(conn, self.settings, now)
             exports.cleanup_exports(conn, self.settings, now)
             queue_engine.deactivate_expired_overrides(conn, now)
+            queue_engine.apply_pending_if_due(conn, self.settings, now)
             stats = self.icecast.stats() if self.icecast is not None else {"available": False}
             status = self.station.status(conn, now, stats)
             desired = status.get("desired")
-            rule = schedule_module.active_rule(conn, now)
+            if desired == "playing" and (
+                not status.get("mount_present")
+                or not status.get("has_current")
+                or status.get("state") in (
+                    "starting",
+                    "reconnecting",
+                    "no_music",
+                    "error",
+                )
+            ):
+                # A missing mount or a silent/errored engine is the only moment
+                # where a fresh systemctl instance query is worth its cost.
+                self.station.invalidate_engine_instance()
+            engine_instance_changed = self.station.reconcile_engine_instance(
+                conn, now, self._sync_state
+            )
+            mode = queue_engine.playback_mode(conn)
+            rule = schedule_module.active_rule(conn, now) if mode == "auto" else None
             new_rule_id = str(rule["id"]) if rule is not None else ""
-            if new_rule_id != db.get_setting(conn, "_active_rule"):
+            if mode == "auto" and new_rule_id != db.get_setting(conn, "_active_rule"):
                 db.set_setting(conn, "_active_rule", new_rule_id)
                 db.set_setting(conn, "last_schedule_change", to_iso(now) or "")
+                queue_engine.bump_state_revision(conn)
                 if new_rule_id:
                     # A new schedule block is a fresh pass even for repeat=none
                     # sources and even when the same rule returns the next day.
@@ -303,36 +324,69 @@ class SchedulerLoop:
                     rule is not None
                     and str(rule["transition"] or "after_track") == "immediate"
                     and desired == "playing"
-                    and self.engine is not None
                 ):
-                    self.engine.skip()
+                    # Do not skip before the new queue is confirmed below.
+                    db.set_setting(conn, "_pending_immediate_transition", new_rule_id)
+                else:
+                    db.delete_setting(conn, "_pending_immediate_transition")
+
+            synced = False
             if desired == "playing":
                 queue_engine.ensure_queue(conn, self.settings, now)
                 if self.engine is not None:
-                    queue_engine.sync_engine(
+                    synced = queue_engine.sync_engine(
                         conn,
                         self.settings,
                         self.engine,
                         now=now,
+                        force=engine_instance_changed,
                         sync_state=self._sync_state,
                     )
+                pending_immediate = db.get_setting(conn, "_pending_immediate_transition")
+                if synced and pending_immediate and self.engine is not None:
+                    if self.engine.skip():
+                        db.delete_setting(conn, "_pending_immediate_transition")
+                        db.log_event(
+                            conn,
+                            "info",
+                            "station",
+                            "Немедленный переход выполнен после подтверждения очереди",
+                            {"rule_id": pending_immediate},
+                            at=to_iso(now),
+                        )
                 if self.station.auto_start_if_needed(conn, now, status):
                     status = self.station.status(conn, now, stats)
             else:
                 queue_engine.ensure_queue(conn, self.settings, now)
+            playback = conn.execute(
+                "SELECT track_id FROM playback_state WHERE singleton = 1"
+            ).fetchone()
             # Status is computed after queue/engine work so reason and
             # playback_stalled reflect the actual queue state of this tick.
             status = self.station.status(conn, now, stats)
+            if (
+                desired == "playing"
+                and status.get("mount_present")
+                and not status.get("has_current")
+                and status.get("state") == "no_music"
+            ):
+                if queue_engine.finish_silence(conn, now):
+                    status = self.station.status(conn, now, stats)
+            media.delete_pending_after_change(conn, self.settings)
+            conn.commit()
             change_at, rule_name = schedule_module.next_schedule_change(conn, now)
             self.app_state.station_status = status
             self.app_state.stats = stats
             self.app_state.next_schedule_change = (
                 {"at": change_at.isoformat(), "rule_name": rule_name} if change_at else None
             )
-            conn.execute(
-                "DELETE FROM history WHERE id NOT IN "
-                "(SELECT id FROM history ORDER BY id DESC LIMIT 1000)"
-            )
+            retention = int(getattr(self.settings, "history_retention_days", 0) or 0)
+            if retention > 0:
+                cutoff = now - timedelta(days=retention)
+                conn.execute(
+                    "DELETE FROM history WHERE started_at IS NOT NULL AND started_at < ?",
+                    (to_iso(cutoff),),
+                )
             conn.execute(
                 "DELETE FROM events WHERE id NOT IN "
                 "(SELECT id FROM events ORDER BY id DESC LIMIT 2000)"

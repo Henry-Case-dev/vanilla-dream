@@ -6,7 +6,8 @@
 set -Eeuo pipefail
 
 ROOT=/srv/vdr-e2e
-APP=/opt/vanilla-dream-radio/current
+APP="${VDR_E2E_APP:-/opt/vanilla-dream-radio/current}"
+DIST="${VDR_E2E_DIST:-/opt/vanilla-dream-radio/frontend-dist}"
 PORT_API=8301
 PORT_ICE=8401
 PORT_WEB=8300
@@ -19,6 +20,22 @@ pkill -f "uvicorn app.main:app --host 127.0.0.1 --port $PORT_API" 2>/dev/null ||
 systemctl stop "$UNIT" vanilla-dream-radio-e2e-icecast.service 2>/dev/null || true
 rm -rf "$ROOT"
 install -d -o vdradio -g vdradio -m 0755 "$ROOT"/{music,covers,covers/playlists,state,log,run,etc}
+install -d -m 0755 "$ROOT/fixtures"
+
+# Short distinguishable tones: twelve seconds each, one frequency per track, so
+# a real playback sequence can be verified by ear and by the stream metadata
+# while manual queue edits still have time to be observed.
+log "Test tones"
+frequencies=(220 262 330 392 440 523 659 784)
+index=0
+for frequency in "${frequencies[@]}"; do
+  index=$((index + 1))
+  ffmpeg -loglevel error -y -f lavfi -i "sine=frequency=$frequency:duration=12" \
+    -ac 2 -ar 44100 -b:a 128k \
+    -metadata title="Tone $index" -metadata artist="E2E" -metadata album="Core03" \
+    "$ROOT/fixtures/tone-$index.mp3"
+done
+ls "$ROOT/fixtures"
 
 log "Icecast config"
 cat > "$ROOT/etc/icecast.xml" <<EOF
@@ -150,8 +167,8 @@ curl -fsS --max-time 5 http://127.0.0.1:$PORT_API/api/public/now-playing >/dev/n
 log "Front door (static + proxy)"
 pkill -f harness_proxy.py 2>/dev/null || true
 sleep 1
-cd /opt/vanilla-dream-radio/current
-nohup setsid env VDR_E2E_DIST=/opt/vanilla-dream-radio/frontend-dist \
+cd "$APP"
+nohup setsid env VDR_E2E_DIST="$DIST" \
   VDR_E2E_API_PORT=$PORT_API VDR_E2E_ICECAST_PORT=$PORT_ICE VDR_E2E_PROXY_PORT=$PORT_WEB \
   python3 tests/e2e/harness_proxy.py > "$ROOT/log/proxy.log" 2>&1 < /dev/null &
 sleep 2

@@ -40,49 +40,84 @@ pending = ref([])
 failed = ref([])
 
 # A real track start is reported by the engine, not guessed from durations.
-queue.on_track(fun (m) -> pending := list.append(pending(), [(m["filename"] ?? "")]))
+# The original engine timestamp is stored with the path so a retried event keeps
+# the real start time instead of the retry time.
+queue.on_track(fun (m) -> pending := list.append(pending(), [((m["filename"] ?? ""), time())]))
 
-note_failure = fun (path) -> begin
-  failed := list.append(failed(), [path])
-  log("track-start post failed for #{path}")
+note_failure = fun (item) -> begin
+  failed := list.append(failed(), [item])
+  log("track-start post failed for #{fst(item)}")
 end
 
-post = fun (path) -> try
-  ignore(http.post(radio_internal_url,
-    data="f=#{path}&ts=#{string_of(time())}",
+post = fun (item) -> try
+  let path = fst(item)
+  let stamp = snd(item)
+  let response = http.post(radio_internal_url,
+    data="f=#{path}&ts=#{string_of(stamp)}",
     headers=[("X-Internal-Token", radio_internal_token),
              ("Content-Type", "application/x-www-form-urlencoded")],
-    timeout=2.))
+    timeout=2.)
+  # Liquidsoap returns a response record for every HTTP status. A temporary
+  # failure (5xx, timeout, throttling) is retried with the original timestamp;
+  # a permanent 4xx is logged and dropped instead of spinning every 0.5 s.
+  let code = response.status_code
+  let retry = (code >= 500) or (code == 408) or (code == 429)
+  if retry then note_failure(item) end
+  let permanent = (code >= 400) and (code < 500) and not retry
+  if permanent then
+    log("track-start rejected with #{string(code)} for #{path}")
+  end
 catch _err do
-  note_failure(path)
+  note_failure(item)
 end
 
-nonempty = fun (path) -> path != ""
+nonempty = fun (item) -> fst(item) != ""
 
 # One short-lived thread; a failed post is retried on the next tick.
 flush = fun () -> begin
-  let paths = list.filter(nonempty, list.append(failed(), pending()))
+  let items = list.filter(nonempty, list.append(failed(), pending()))
   failed := []
   pending := []
-  list.iter(post, paths)
+  list.iter(post, items)
 end
 
 thread.run(every=0.5, fast=false, flush)
 
-# Replace the prepared queue. The reply reports how many requests Liquidsoap
-# could actually resolve, so the backend never marks an unplayable file as
-# prepared: "OK <resolved> <failed>".
-sync_counts = fun (flags) -> begin
-  let ok = list.length(list.filter(fun (flag) -> flag, flags))
-  "OK #{string(ok)} #{string(list.length(flags) - ok)}"
-end
+# Replace the prepared queue. Each line in the backend file is
+# "<position_id>\t<absolute path>"; the reply names every request that could be
+# resolved so the engine never marks an unplayable file as prepared:
+#
+#   OK
+#   ok <position_id>
+#   fail <position_id>
+#   END
+#
+# An empty file is a valid clear ("OK" alone).
+has_tab = fun (line) -> 1 < list.length(string.split(separator="\t", line))
+tab_field = fun (line) -> string.split(separator="\t", line)
+tab_id = fun (line) -> list.nth(default="", tab_field(line), 0)
+tab_path = fun (line) -> list.nth(default="", tab_field(line), 1)
 
 sync_apply = fun (lines) -> begin
-  let reqs = list.map(fun (line) -> request.create(line), lines)
+  let clean = list.filter(has_tab, lines)
+  let ids = list.map(tab_id, clean)
+  let reqs = list.map(fun (line) -> request.create(tab_path(line)), clean)
   let flags = list.map(fun (request_item) -> request.resolve(request_item), reqs)
   queue.set_queue(reqs)
-  log("vd_sync: #{sync_counts(flags)} of #{string(list.length(reqs))} request(s), queue length #{string(queue.length())}")
-  sync_counts(flags)
+  let pos = ref(0)
+  let mark = fun (vid) -> begin
+    let idx = pos()
+    pos := idx + 1
+    (vid, list.nth(default=false, flags, idx))
+  end
+  let marked = list.map(mark, ids)
+  let ok_lines = list.map(fun (video_id) -> "ok " ^ video_id,
+    list.map(fun (pair) -> fst(pair), list.filter(fun (pair) -> snd(pair), marked)))
+  let fail_lines = list.map(fun (video_id) -> "fail " ^ video_id,
+    list.map(fun (pair) -> fst(pair), list.filter(fun (pair) -> not snd(pair), marked)))
+  let reply = string.concat(separator="\n", list.append(["OK"], list.append(ok_lines, fail_lines)))
+  log("vd_sync: #{string(list.length(ok_lines))} ok, #{string(list.length(fail_lines))} fail of #{string(list.length(clean))} request(s), queue length #{string(queue.length())}")
+  reply
 end
 
 server.register(description="Replace the prepared queue from the backend file", "vd_sync", fun (_) ->

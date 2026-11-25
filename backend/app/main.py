@@ -14,7 +14,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from . import __version__, api_admin, api_internal, api_public, auth, db, exports, queue_engine, uploads
+from . import __version__, api_admin, api_internal, api_public, auth, db, exports, media, queue_engine, uploads
 from .config import Settings
 from .icecast import IcecastClient
 from .liquidsoap import LiquidsoapClient
@@ -85,9 +85,15 @@ async def lifespan(app: FastAPI):
             app.state.settings = settings
             app.state.station.settings = settings
             app.state.scheduler.settings = settings
-        # Positions handed to the engine before restart are unknown to a fresh
-        # Liquidsoap process; keep them as editable pending items.
-        conn.execute("UPDATE queue_positions SET state = 'pending' WHERE state = 'prepared'")
+        # A backend-only restart must not disturb a running engine. The helper
+        # compares the systemd instance (plus socket inode) before touching
+        # prepared positions and is also used by the scheduler at runtime.
+        app.state.station.invalidate_engine_instance()
+        engine_instance_changed = app.state.station.reconcile_engine_instance(
+            conn,
+            app.state.clock.now(),
+            sync_state=app.state.sync_state,
+        )
         playback = conn.execute("SELECT * FROM playback_state WHERE singleton = 1").fetchone()
         if playback is not None and playback["position_id"]:
             conn.execute(
@@ -130,6 +136,19 @@ async def lifespan(app: FastAPI):
                     )
                     conn.commit()
         queue_engine.ensure_queue(conn, settings, now)
+        media.delete_pending_after_change(conn, settings)
+        if engine_instance_changed and db.get_setting(conn, "desired_state") == "playing":
+            try:
+                queue_engine.sync_engine(
+                    conn,
+                    settings,
+                    app.state.engine,
+                    now=now,
+                    force=True,
+                    sync_state=app.state.sync_state,
+                )
+            except Exception:  # noqa: BLE001 - sync failure is reported by state
+                LOGGER.exception("startup engine resync failed")
         if db.get_setting(conn, "desired_state") == "playing" and db.library_totals(conn)["count"]:
             db.delete_setting(conn, "_last_auto_start")
             conn.commit()

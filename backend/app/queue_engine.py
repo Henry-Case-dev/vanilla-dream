@@ -26,7 +26,7 @@ from .models import (
     source_payload,
     track_payload,
 )
-from .util import ApiError, parse_iso, to_iso
+from .util import ApiError, parse_iso, to_iso, utcnow
 
 LOGGER = logging.getLogger("vdradio.queue")
 
@@ -34,6 +34,7 @@ ENGINE_PREFETCH = 2
 ENGINE_SYNC_MIN_INTERVAL = 5.0
 ROTATION_ID = "default"
 LIVE_STATES = ("pending", "prepared")
+STATE_MODES = ("playlist", "auto")
 
 # One backend process owns programming; this lock keeps the scheduler thread and
 # request threads from generating or syncing the same queue concurrently.
@@ -113,6 +114,621 @@ def parse_override_id(ref: str | None) -> str | None:
     if parts and parts[0] == "override" and len(parts) > 1:
         return parts[1]
     return None
+
+
+# ---------------------------------------------------------------------------
+# Playback mode / state revision
+# ---------------------------------------------------------------------------
+
+
+def state_revision(conn: sqlite3.Connection) -> int:
+    try:
+        return int(db.get_setting(conn, "state_revision", "0") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def bump_state_revision(conn: sqlite3.Connection) -> int:
+    revision = state_revision(conn) + 1
+    db.set_setting(conn, "state_revision", str(revision))
+    return revision
+
+
+def queue_revision(conn: sqlite3.Connection) -> int:
+    try:
+        return int(db.get_setting(conn, "queue_revision", "0") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def bump_queue_revision(conn: sqlite3.Connection) -> int:
+    revision = queue_revision(conn) + 1
+    db.set_setting(conn, "queue_revision", str(revision))
+    return revision
+
+
+def history_revision(conn: sqlite3.Connection) -> int:
+    try:
+        return int(db.get_setting(conn, "history_revision", "0") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def bump_history_revision(conn: sqlite3.Connection) -> int:
+    revision = history_revision(conn) + 1
+    db.set_setting(conn, "history_revision", str(revision))
+    return revision
+
+
+def playback_mode(conn: sqlite3.Connection) -> str:
+    mode = db.get_setting(conn, "playback_mode", "playlist") or "playlist"
+    return mode if mode in STATE_MODES else "playlist"
+
+
+def selected_playlist_id(conn: sqlite3.Connection) -> str:
+    value = db.get_setting(conn, "selected_playlist_id", SYSTEM_PLAYLIST_ID)
+    return value or SYSTEM_PLAYLIST_ID
+
+
+def effective_selected_playlist(conn: sqlite3.Connection) -> tuple[str, bool]:
+    """Return (playlist id, fallback_used). A deleted selection falls back."""
+
+    selected = selected_playlist_id(conn)
+    if selected == SYSTEM_PLAYLIST_ID or get_playlist(conn, selected) is not None:
+        return selected, False
+    return SYSTEM_PLAYLIST_ID, True
+
+
+def pending_source(conn: sqlite3.Connection) -> dict | None:
+    value = db.get_json_setting(conn, "pending_source", None)
+    return value if isinstance(value, dict) and value.get("playlist_id") else None
+
+
+def pending_head_position_id(conn: sqlite3.Connection) -> str | None:
+    pending = pending_source(conn)
+    if pending is None:
+        return None
+    head_id = str(pending.get("head_position_id") or "")
+    return head_id or None
+
+
+def pending_head_state(conn: sqlite3.Connection) -> str | None:
+    head_id = pending_head_position_id(conn)
+    if not head_id:
+        return None
+    row = conn.execute(
+        "SELECT state FROM queue_positions WHERE id = ?", (head_id,)
+    ).fetchone()
+    return str(row["state"]) if row is not None else None
+
+
+def set_pending_source(
+    conn: sqlite3.Connection,
+    playlist_id: str,
+    mode: str,
+    now: datetime,
+    head_position_id: str | None = None,
+) -> int:
+    payload = {
+        "playlist_id": playlist_id,
+        "mode": mode if mode in STATE_MODES else "playlist",
+        "requested_at": to_iso(now),
+    }
+    if head_position_id:
+        payload["head_position_id"] = head_position_id
+    db.set_json_setting(conn, "pending_source", payload)
+    return bump_state_revision(conn)
+
+
+def clear_pending_source(conn: sqlite3.Connection) -> bool:
+    had_pending = bool(db.get_setting(conn, "pending_source"))
+    if not had_pending:
+        return False
+    db.set_setting(conn, "pending_source", "")
+    bump_state_revision(conn)
+    return True
+
+
+def _pending_target_cycle_setting() -> str:
+    return "_pending_target_cycle"
+
+
+def _save_pending_target_cycle(conn: sqlite3.Connection, source: Source) -> None:
+    db.set_json_setting(
+        conn,
+        _pending_target_cycle_setting(),
+        {
+            "key": source.key,
+            "state": db.get_json_setting(conn, _cycle_setting_key(source.key), None),
+        },
+    )
+
+
+def _restore_pending_target_cycle(conn: sqlite3.Connection) -> None:
+    data = db.get_json_setting(conn, _pending_target_cycle_setting(), None)
+    if not isinstance(data, dict) or not data.get("key"):
+        db.delete_setting(conn, _pending_target_cycle_setting())
+        return
+    key = str(data["key"])
+    state = data.get("state")
+    if state is None:
+        db.delete_setting(conn, _cycle_setting_key(key))
+    else:
+        db.set_json_setting(conn, _cycle_setting_key(key), state)
+    db.delete_setting(conn, _pending_target_cycle_setting())
+
+
+def _unpop_future_automatic(
+    conn: sqlite3.Connection, *, restore: bool = True
+) -> None:
+    """Return scheduled-but-unplayed automatic tracks to their cycle tails.
+
+    The old source's cycle had already consumed these tracks when the queue was
+    filled. Keeping them unplayed preserves the pass if the pending switch is
+    cancelled or the same playlist is selected again later.
+    """
+
+    grouped: dict[str, list[str]] = {}
+    for row in future_positions(conn):
+        if row["manual"]:
+            continue
+        key = key_of(row["source_ref"])
+        if key:
+            grouped.setdefault(key, []).append(str(row["track_id"]))
+        conn.execute("DELETE FROM queue_positions WHERE id = ?", (row["id"],))
+        bump_queue_revision(conn)
+    for key, track_ids in grouped.items():
+        if not restore:
+            continue
+        state = db.get_json_setting(conn, _cycle_setting_key(key), None)
+        if not state or not state.get("started") or state.get("repeat_one"):
+            continue
+        remaining = [str(item) for item in state.get("remaining") or []]
+        restored: list[str] = []
+        for track_id in track_ids:
+            if track_id not in remaining and track_id not in restored:
+                restored.append(track_id)
+        if restored:
+            state["remaining"] = restored + remaining
+            db.set_json_setting(conn, _cycle_setting_key(key), state)
+    _renumber(conn)
+
+
+def _program_source_for_playlist(
+    conn: sqlite3.Connection, playlist_id: str
+) -> Source | None:
+    key = (
+        SYSTEM_PLAYLIST_ID
+        if playlist_id == SYSTEM_PLAYLIST_ID
+        else f"playlist:{playlist_id}"
+    )
+    return _playlist_source(
+        conn,
+        playlist_id,
+        "playlist",
+        key,
+        allow_empty=True,
+        fallback_allowed=False,
+    )
+
+
+def prepare_pending_source(
+    conn: sqlite3.Connection,
+    settings: Settings,
+    playlist_id: str,
+    now: datetime,
+    *,
+    should_reset: bool,
+) -> str:
+    """Put the first track of the requested source at the head of the queue."""
+
+    source = _program_source_for_playlist(conn, playlist_id)
+    if source is None:
+        raise ApiError(404, "playlist_not_found", "Плейлист не найден.")
+    _save_pending_target_cycle(conn, source)
+    if should_reset:
+        reset_source_cycle(conn, playlist_id)
+    _unpop_future_automatic(
+        conn,
+        restore=not (
+            should_reset
+            and playback_mode(conn) == "playlist"
+            and selected_playlist_id(conn) == playlist_id
+        ),
+    )
+    choice = next_track(conn, source, now, set())
+    if not choice.track_id:
+        if should_reset:
+            raise ApiError(
+                409,
+                "playlist_exhausted",
+                "В плейлисте нет доступных треков для переключения.",
+            )
+        reset_source_cycle(conn, playlist_id)
+        choice = next_track(conn, source, now, set())
+    if not choice.track_id:
+        raise ApiError(
+            409,
+            "playlist_exhausted",
+            "В плейлисте нет доступных треков для переключения.",
+        )
+    head_id = _insert_position(
+        conn,
+        choice.track_id,
+        source.kind,
+        source.ref(choice.cycle),
+        manual=False,
+        now=now,
+        at_head=True,
+    )
+    _place_first_automatic_before_manual(conn)
+    set_pending_source(
+        conn,
+        playlist_id,
+        "playlist",
+        now,
+        head_position_id=head_id,
+    )
+    conn.commit()
+    return head_id
+
+
+def cancel_pending_source(conn: sqlite3.Connection) -> bool:
+    """Cancel a prepared transition and restore the current source's queue."""
+
+    if pending_source(conn) is None:
+        return False
+    if conn.execute(
+        "DELETE FROM queue_positions WHERE state IN ('pending', 'prepared') "
+        "AND manual = 0"
+    ).rowcount:
+        bump_queue_revision(conn)
+    _renumber(conn)
+    _restore_pending_target_cycle(conn)
+    clear_pending_source(conn)
+    conn.commit()
+    return True
+
+
+def commit_pending_source_state(
+    conn: sqlite3.Connection,
+    settings: Settings,
+    now: datetime,
+    *,
+    fill: bool = False,
+) -> bool:
+    """Commit the prepared source without rebuilding the prepared queue."""
+
+    pending = pending_source(conn)
+    if pending is None:
+        return False
+    playlist_id = str(pending.get("playlist_id") or SYSTEM_PLAYLIST_ID)
+    mode = str(pending.get("mode") or "playlist")
+    if mode not in STATE_MODES:
+        mode = "playlist"
+    head_id = pending.get("head_position_id")
+    db.set_setting(conn, "playback_mode", mode)
+    db.set_setting(conn, "selected_playlist_id", playlist_id)
+    db.set_setting(conn, "pending_source", "")
+    db.delete_setting(conn, _pending_target_cycle_setting())
+    conn.execute("UPDATE overrides SET active = 0 WHERE active = 1")
+    bump_state_revision(conn)
+    db.log_event(
+        conn,
+        "info",
+        "station",
+        "Источник переключён после текущего трека",
+        {"playlist_id": playlist_id, "mode": mode, "head_position_id": head_id},
+        at=to_iso(now),
+    )
+    conn.commit()
+    if fill:
+        ensure_queue(conn, settings, now)
+        conn.commit()
+    return True
+
+
+def active_override(conn: sqlite3.Connection) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM overrides WHERE active = 1 "
+        "ORDER BY created_at DESC, id DESC LIMIT 1"
+    ).fetchone()
+
+
+def override_payload(conn: sqlite3.Connection) -> dict | None:
+    row = active_override(conn)
+    if row is None:
+        return None
+    playlist = (
+        conn.execute(
+            "SELECT name FROM playlists WHERE id = ?", (row["playlist_id"],)
+        ).fetchone()
+        if row["playlist_id"]
+        else None
+    )
+    return {
+        "id": row["id"],
+        "kind": row["kind"],
+        "playlist_id": row["playlist_id"],
+        "playlist_name": playlist["name"] if playlist else None,
+        "scope": row["scope"],
+        "expires_at": row["expires_at"],
+        "active": bool(row["active"]),
+        "created_at": row["created_at"],
+        "note": row["note"],
+    }
+
+
+def _cycle_is_exhausted(conn: sqlite3.Connection, key: str) -> bool:
+    state = db.get_json_setting(conn, _cycle_setting_key(key), None)
+    if not (
+        state
+        and state.get("started")
+        and not state.get("remaining")
+        and state.get("cycle", 0)
+    ):
+        return False
+    return not any(
+        key_of(row["source_ref"]) == key for row in future_positions(conn)
+    )
+
+
+def reset_source_cycle(conn: sqlite3.Connection, playlist_id: str) -> None:
+    key = SYSTEM_PLAYLIST_ID if playlist_id == SYSTEM_PLAYLIST_ID else f"playlist:{playlist_id}"
+    db.delete_setting(conn, _cycle_setting_key(key))
+    clear_source_exclusions(conn, key)
+
+
+def _place_first_automatic_before_manual(conn: sqlite3.Connection) -> None:
+    future = future_positions(conn)
+    automatic = [row for row in future if not row["manual"]]
+    if not automatic:
+        return
+    first = automatic[0]
+    manual_before = [
+        row for row in future if row["manual"] and int(row["seq"]) < int(first["seq"])
+    ]
+    if not manual_before:
+        return
+    head = min(int(row["seq"]) for row in future) - 1
+    conn.execute("UPDATE queue_positions SET seq = ? WHERE id = ?", (head, first["id"]))
+    _renumber(conn)
+
+
+def rebuild_source_queue(
+    conn: sqlite3.Connection,
+    settings: Settings,
+    now: datetime,
+    *,
+    reset_playlist_cycle: str | None = None,
+) -> list[str]:
+    """Drop automatic future positions and build the newly resolved source."""
+
+    dropped = {
+        key_of(row["source_ref"])
+        for row in future_positions(conn)
+        if not row["manual"]
+    }
+    dropped_positions = conn.execute(
+        "DELETE FROM queue_positions WHERE state IN ('pending', 'prepared') AND manual = 0"
+    ).rowcount
+    if dropped_positions:
+        bump_queue_revision(conn)
+    for key in dropped:
+        if key:
+            db.delete_setting(conn, _cycle_setting_key(key))
+    if reset_playlist_cycle:
+        reset_source_cycle(conn, reset_playlist_cycle)
+    _renumber(conn)
+    conn.commit()
+    created = ensure_queue(conn, settings, now)
+    _place_first_automatic_before_manual(conn)
+    conn.commit()
+    return created
+
+
+def apply_pending_source(conn: sqlite3.Connection, settings: Settings, now: datetime) -> bool:
+    """Compatibility wrapper: commit the prepared source and fill the queue."""
+
+    return commit_pending_source_state(conn, settings, now, fill=True)
+
+
+def apply_pending_if_due(conn: sqlite3.Connection, settings: Settings, now: datetime) -> bool:
+    """Commit a prepared switch only if its head already started.
+
+    The prepared queue is never rebuilt here: the head position and the manual
+    positions are already the new source. The track-start callback normally
+    commits first; this is the durable fallback for a missed callback.
+    """
+
+    pending = pending_source(conn)
+    if pending is None:
+        return False
+    head_id = str(pending.get("head_position_id") or "")
+    if not head_id:
+        return False
+    playback = conn.execute(
+        "SELECT position_id FROM playback_state WHERE singleton = 1"
+    ).fetchone()
+    head_state = pending_head_state(conn)
+    started = bool(
+        (playback is not None and playback["position_id"] == head_id)
+        or head_state == "current"
+    )
+    if started:
+        return commit_pending_source_state(conn, settings, now, fill=False)
+    if head_state not in ("pending", "prepared"):
+        # The prepared head was deleted or invalidated. Do not wait for a
+        # callback that can no longer arrive; cancel and let the tick rebuild.
+        cancel_pending_source(conn)
+        return True
+    return False
+
+
+def select_playlist(
+    conn: sqlite3.Connection,
+    settings: Settings,
+    playlist_id: str,
+    mode: str,
+    restart: bool,
+    now: datetime,
+) -> dict:
+    """Prepare a permanent playlist selection; the caller starts/syncs/skips."""
+
+    if mode not in ("now", "next"):
+        raise ApiError(422, "invalid_mode", "Режим запуска должен быть now или next.")
+    playlist = get_playlist(conn, playlist_id)
+    if playlist is None:
+        raise ApiError(404, "playlist_not_found", "Плейлист не найден.")
+    if not playlist_track_ids(conn, playlist_id):
+        raise ApiError(422, "playlist_empty", "Плейлист пуст: добавьте треки перед запуском.")
+
+    current = conn.execute(
+        "SELECT * FROM playback_state WHERE singleton = 1"
+    ).fetchone()
+    has_current = bool(current is not None and current["track_id"])
+    desired_playing = db.get_setting(conn, "desired_state", "stopped") == "playing"
+    diagnostic = source_diagnostic(conn, now)
+    source = diagnostic.get("source")
+    target_is_current = bool(
+        playback_mode(conn) == "playlist"
+        and selected_playlist_id(conn) == playlist_id
+        and source is not None
+        and source.playlist_id == playlist_id
+        and diagnostic.get("reason") is None
+    )
+    effective_active = bool(desired_playing and target_is_current)
+    pending = pending_source(conn)
+    if pending is not None:
+        # Any explicit selection supersedes the prepared transition. This also
+        # restores the current source's unplayed queue when the owner cancels.
+        cancel_pending_source(conn)
+        if target_is_current and not restart:
+            return {
+                "status": "applied",
+                "pending": False,
+                "skip": False,
+                "need_start": False,
+            }
+    elif effective_active and not restart:
+        return {
+            "status": "already_active",
+            "pending": False,
+            "skip": False,
+            "need_start": False,
+        }
+
+    cycle_key = SYSTEM_PLAYLIST_ID if playlist_id == SYSTEM_PLAYLIST_ID else f"playlist:{playlist_id}"
+    exhausted = _cycle_is_exhausted(conn, cycle_key)
+    should_reset = bool(restart or exhausted)
+
+    if mode == "next" and has_current:
+        prepare_pending_source(
+            conn,
+            settings,
+            playlist_id,
+            now,
+            should_reset=should_reset,
+        )
+        return {
+            "status": "switching",
+            "pending": True,
+            "skip": False,
+            "need_start": False,
+        }
+
+    db.set_setting(conn, "playback_mode", "playlist")
+    db.set_setting(conn, "selected_playlist_id", playlist_id)
+    db.set_setting(conn, "pending_source", "")
+    conn.execute("UPDATE overrides SET active = 0 WHERE active = 1")
+    bump_state_revision(conn)
+    if should_reset:
+        reset_source_cycle(conn, playlist_id)
+    rebuild_source_queue(conn, settings, now)
+    conn.commit()
+    return {
+        "status": "switching" if has_current else "applied",
+        "pending": False,
+        "skip": has_current,
+        "need_start": False,
+    }
+
+
+def set_playback_mode(
+    conn: sqlite3.Connection,
+    mode: str,
+    playlist_id: str | None = None,
+) -> None:
+    if mode not in STATE_MODES:
+        raise ApiError(422, "invalid_mode", "Режим должен быть playlist или auto.")
+    if mode == "playlist":
+        selected = playlist_id or selected_playlist_id(conn) or SYSTEM_PLAYLIST_ID
+        if selected != SYSTEM_PLAYLIST_ID and get_playlist(conn, selected) is None:
+            if playlist_id:
+                raise ApiError(404, "playlist_not_found", "Плейлист не найден.")
+            selected = SYSTEM_PLAYLIST_ID
+        db.set_setting(conn, "selected_playlist_id", selected)
+    db.set_setting(conn, "playback_mode", mode)
+    bump_state_revision(conn)
+
+
+def _effective_source_payload(
+    conn: sqlite3.Connection, now: datetime
+) -> tuple[dict | None, str | None, str | None]:
+    diagnostic = source_diagnostic(conn, now)
+    source = diagnostic.get("source")
+    if source is None:
+        return None, diagnostic.get("reason"), None
+    governed_by = (
+        "rotation" if source.rotation_id or source.rotation_item_id else "playlist"
+    )
+    return (
+        {
+            "kind": source.kind,
+            "playlist_id": source.playlist_id,
+            "name": source.name,
+            "reason": diagnostic.get("reason"),
+        },
+        None,
+        governed_by,
+    )
+
+
+def station_state(
+    conn: sqlite3.Connection,
+    settings: Settings,
+    now: datetime,
+    *,
+    status: dict | None = None,
+    engine_instance: str = "",
+    public: bool = False,
+) -> dict:
+    mode = playback_mode(conn)
+    selected = selected_playlist_id(conn)
+    effective, diagnostic_reason, repeat_governed = _effective_source_payload(conn, now)
+    fallback_selected, fallback_used = effective_selected_playlist(conn)
+    notice = None
+    if mode == "playlist" and fallback_used:
+        notice = "Выбранный плейлист не найден, включена «Вся медиатека»."
+    if fallback_used:
+        selected = fallback_selected
+    payload = {
+        "mode": mode,
+        "selected_playlist_id": selected,
+        "program_playlist_id": effective.get("playlist_id") if effective else None,
+        "repeat_governed_by": repeat_governed,
+        "effective_source": effective,
+        "pending_source": pending_source(conn),
+        "override": None if public else override_payload(conn),
+        "desired": (status or {}).get("desired", "stopped"),
+        "status": (status or {}).get("state"),
+        "reason": (status or {}).get("reason"),
+        "engine_instance": engine_instance,
+        "state_revision": state_revision(conn),
+        "notice": notice if not public else None,
+        "diagnostic_reason": diagnostic_reason,
+    }
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -274,8 +890,12 @@ def _source_key_valid(conn: sqlite3.Connection, key: str, now: datetime) -> bool
         return False
     if parts[0] == "playlist" and len(parts) > 1:
         playlist_id = parts[1]
+        configured = {
+            selected_playlist_id(conn),
+            db.get_setting(conn, "default_playlist_id"),
+        }
         return (
-            db.get_setting(conn, "default_playlist_id") == playlist_id
+            playlist_id in configured
             and bool(playlist_track_ids(conn, playlist_id))
         )
     if parts[0] == "override" and len(parts) > 1:
@@ -465,7 +1085,7 @@ def _rotation_source(
         repeat_mode="none",
         shuffle=bool(playlist["shuffle"]),
         by_count=(rotation["mode"] or "sequential") == "by_count",
-        fallback_allowed=kind in ("schedule", "rotation"),
+        fallback_allowed=False,
         is_system=str(item["playlist_id"]) == SYSTEM_PLAYLIST_ID,
     )
 
@@ -502,6 +1122,31 @@ def resolve_source(
             )
             if source is not None and source.key not in excluded:
                 return source
+
+    mode = playback_mode(conn)
+    if mode == "playlist":
+        selected, fallback_used = effective_selected_playlist(conn)
+        if fallback_used:
+            _warn_once(
+                conn,
+                f"selected-playlist:{selected_playlist_id(conn)}",
+                "Выбранный плейлист не найден, включена «Вся медиатека»",
+                {"playlist_id": selected_playlist_id(conn)},
+            )
+        if selected == SYSTEM_PLAYLIST_ID:
+            source = _system_source(conn)
+            return source if source.key not in excluded else None
+        key = f"playlist:{selected}"
+        if key in excluded:
+            return None
+        return _playlist_source(
+            conn,
+            selected,
+            "playlist",
+            key,
+            allow_empty=True,
+            fallback_allowed=False,
+        )
 
     for rule in scheduler.active_rules(conn, now):
         source = None
@@ -562,14 +1207,6 @@ def resolve_source(
 
 def _cycle_setting_key(key: str) -> str:
     return f"_cycle:{key}"
-
-
-def _last_played_for_key(conn: sqlite3.Connection, key: str) -> str | None:
-    row = conn.execute(
-        "SELECT track_id FROM history WHERE source_ref LIKE ? ORDER BY started_at DESC, id DESC LIMIT 1",
-        (key + ":cycle:%",),
-    ).fetchone()
-    return str(row["track_id"]) if row and row["track_id"] else None
 
 
 def _source_signature(conn: sqlite3.Connection, source: Source) -> dict:
@@ -648,31 +1285,319 @@ def invalidate_playlist_sources(conn: sqlite3.Connection, playlist_id: str) -> i
     return removed
 
 
+def rebuild_active_future(
+    conn: sqlite3.Connection, settings: Settings, now: datetime, source_key: str
+) -> list[str]:
+    """Rebuild only the active source's automatic future, keeping its cycle."""
+
+    for row in future_positions(conn):
+        if row["manual"]:
+            continue
+        if key_of(row["source_ref"]) == source_key:
+            conn.execute("DELETE FROM queue_positions WHERE id = ?", (row["id"],))
+    _renumber(conn)
+    conn.commit()
+    created = ensure_queue(conn, settings, now)
+    conn.commit()
+    return created
+
+
+def _ordinary_unplayed(
+    conn: sqlite3.Connection, key: str, state: dict, ids: list[str]
+) -> list[str]:
+    if state.get("repeat_one"):
+        values = list(
+            state.get("repeat_saved_remaining")
+            or state.get("remaining")
+            or []
+        )
+    else:
+        values = [
+            str(row["track_id"])
+            for row in future_positions(conn)
+            if not row["manual"] and key_of(row["source_ref"]) == key
+        ] + list(state.get("remaining") or [])
+    valid = set(ids)
+    result: list[str] = []
+    for track_id in values:
+        if track_id in valid and track_id not in result:
+            result.append(track_id)
+    return result
+
+
+def reconcile_playlist_settings(
+    conn: sqlite3.Connection,
+    playlist_id: str,
+    *,
+    shuffle: bool,
+    repeat: str,
+    shuffle_changed: bool,
+    repeat_changed: bool,
+    now: datetime,
+    cycle_key: str | None = None,
+) -> bool:
+    """Reorder the remaining pass without resetting it; never starts a new pass."""
+
+    key = cycle_key or (
+        SYSTEM_PLAYLIST_ID
+        if playlist_id == SYSTEM_PLAYLIST_ID
+        else f"playlist:{playlist_id}"
+    )
+    state = db.get_json_setting(conn, _cycle_setting_key(key), None)
+    if not state or not state.get("started"):
+        return False
+    ids = playlist_track_ids(conn, playlist_id)
+    order = [item for item in state.get("order") or [] if item in set(ids)]
+    for track_id in ids:
+        if track_id not in order:
+            order.append(track_id)
+    ordinary = _ordinary_unplayed(conn, key, state, ids)
+
+    if repeat_changed:
+        if repeat == "none":
+            current_cycle = int(state.get("cycle") or 0)
+            for row in future_positions(conn):
+                if row["manual"] or key_of(row["source_ref"]) != key:
+                    continue
+                parts = str(row["source_ref"]).rsplit(":cycle:", 1)
+                try:
+                    cycle = int(parts[1]) if len(parts) == 2 else current_cycle
+                except (TypeError, ValueError):
+                    cycle = current_cycle
+                if cycle > current_cycle:
+                    conn.execute("DELETE FROM queue_positions WHERE id = ?", (row["id"],))
+            _renumber(conn)
+            ordinary = _ordinary_unplayed(conn, key, state, ids)
+    if shuffle_changed:
+        if shuffle:
+            random.SystemRandom().shuffle(ordinary)
+        else:
+            remaining_set = set(ordinary)
+            ordinary = [track_id for track_id in order if track_id in remaining_set]
+    if repeat_changed:
+        if repeat == "one":
+            state_row = conn.execute(
+                "SELECT * FROM playback_state WHERE singleton = 1"
+            ).fetchone()
+            target = None
+            if (
+                state_row is not None
+                and state_row["track_id"]
+                and key_of(state_row["source_ref"]) == key
+                and str(state_row["track_id"]) in ids
+            ):
+                target = str(state_row["track_id"])
+            if target is None and ids:
+                target = ids[0]
+            state["repeat_one"] = True
+            state["repeat_saved_remaining"] = ordinary
+            state["repeat_target_id"] = target
+        else:
+            state.pop("repeat_one", None)
+            state.pop("repeat_saved_remaining", None)
+            state.pop("repeat_target_id", None)
+    state["order"] = order
+    state["remaining"] = ordinary
+    if state.get("repeat_one"):
+        state["repeat_saved_remaining"] = ordinary
+    db.set_json_setting(conn, _cycle_setting_key(key), state)
+    return True
+
+
+def reorder_cycle_to_playlist(
+    conn: sqlite3.Connection, playlist_id: str, cycle_key: str | None = None
+) -> bool:
+    key = cycle_key or (
+        SYSTEM_PLAYLIST_ID
+        if playlist_id == SYSTEM_PLAYLIST_ID
+        else f"playlist:{playlist_id}"
+    )
+    state = db.get_json_setting(conn, _cycle_setting_key(key), None)
+    if not state or not state.get("started"):
+        return False
+    ids = playlist_track_ids(conn, playlist_id)
+    remaining_set = {str(item) for item in state.get("remaining") or []}
+    state["order"] = list(ids)
+    state["remaining"] = [track_id for track_id in ids if track_id in remaining_set]
+    if state.get("repeat_one"):
+        saved_set = {str(item) for item in state.get("repeat_saved_remaining") or []}
+        state["repeat_saved_remaining"] = [
+            track_id for track_id in ids if track_id in saved_set
+        ]
+    db.set_json_setting(conn, _cycle_setting_key(key), state)
+    return True
+
+
+def program_playlist_id(conn: sqlite3.Connection, now: datetime | None = None) -> str | None:
+    diagnostic = source_diagnostic(conn, now or utcnow())
+    source = diagnostic.get("source")
+    return source.playlist_id if source is not None else None
+
+
+def repeat_governed_by(
+    conn: sqlite3.Connection, playlist_id: str, now: datetime | None = None
+) -> str | None:
+    diagnostic = source_diagnostic(conn, now or utcnow())
+    source = diagnostic.get("source")
+    if source is None or source.playlist_id != playlist_id:
+        return None
+    if source.rotation_id or source.rotation_item_id:
+        return "rotation"
+    return "playlist"
+
+
+def finish_silence(conn: sqlite3.Connection, now: datetime) -> bool:
+    """Close the current track when the engine has transitioned to silence."""
+
+    state = conn.execute("SELECT * FROM playback_state WHERE singleton = 1").fetchone()
+    if state is None or not state["track_id"]:
+        return False
+    stamp = to_iso(now)
+    if state["position_id"]:
+        ended = conn.execute(
+            "UPDATE history SET ended_at = ? WHERE position_id = ? AND ended_at IS NULL",
+            (stamp, state["position_id"]),
+        ).rowcount
+        if ended:
+            bump_history_revision(conn)
+        if conn.execute(
+            "DELETE FROM queue_positions WHERE id = ?", (state["position_id"],)
+        ).rowcount:
+            bump_queue_revision(conn)
+    conn.execute("DELETE FROM playback_state WHERE singleton = 1")
+    bump_state_revision(conn)
+    conn.commit()
+    return True
+
+
+def advance_repeat_target(conn: sqlite3.Connection, now: datetime) -> bool:
+    diagnostic = source_diagnostic(conn, now)
+    source = diagnostic.get("source")
+    if source is None or source.repeat_mode != "one" or source.rotation_item_id:
+        return False
+    ids = playlist_track_ids(conn, source.playlist_id) if source.playlist_id else []
+    if not ids:
+        return False
+    state = db.get_json_setting(conn, _cycle_setting_key(source.key), None) or {
+        "cycle": 0,
+        "order": list(ids),
+        "remaining": list(ids),
+        "started": True,
+        "tail": None,
+    }
+    order = [item for item in state.get("order") or [] if item in set(ids)] or list(ids)
+    saved = [
+        item
+        for item in (
+            state.get("repeat_saved_remaining")
+            or state.get("remaining")
+            or order
+        )
+        if item in set(ids)
+    ]
+    old_target = state.get("repeat_target_id")
+    target = old_target
+    alternatives = [item for item in saved if item != target]
+    if alternatives:
+        target = alternatives[0]
+    elif target in order:
+        index = order.index(target)
+        target = order[(index + 1) % len(order)]
+    else:
+        target = order[0]
+    state["repeat_target_id"] = target
+    if state.get("repeat_one"):
+        state["repeat_saved_remaining"] = [
+            item for item in saved if item != old_target
+        ]
+    db.set_json_setting(conn, _cycle_setting_key(source.key), state)
+    return True
+
+
+def _remove_cycle_tracks(
+    conn: sqlite3.Connection, source: Source, removed_ids: set[str]
+) -> None:
+    if not removed_ids:
+        return
+    for row in future_positions(conn):
+        if row["manual"]:
+            continue
+        if key_of(row["source_ref"]) == source.key and str(row["track_id"]) in removed_ids:
+            conn.execute("DELETE FROM queue_positions WHERE id = ?", (row["id"],))
+    state = db.get_json_setting(conn, _cycle_setting_key(source.key), None)
+    if state:
+        order = [item for item in state.get("order") or [] if item not in removed_ids]
+        remaining = [item for item in state.get("remaining") or [] if item not in removed_ids]
+        if state.get("repeat_target_id") in removed_ids:
+            # The repeat object is gone: the next unplayed composition becomes
+            # the target, otherwise the first remaining one. Never replay a
+            # composition that was already part of this pass.
+            fallback = remaining or order
+            state["repeat_target_id"] = fallback[0] if fallback else None
+        state["order"] = order
+        state["remaining"] = remaining
+        if state.get("repeat_one"):
+            state["repeat_saved_remaining"] = [
+                item for item in state.get("repeat_saved_remaining") or []
+                if item not in removed_ids
+            ]
+        db.set_json_setting(conn, _cycle_setting_key(source.key), state)
+    _renumber(conn)
+
+
+def replenish_cycle(
+    conn: sqlite3.Connection, source: Source, added_ids: list[str]
+) -> None:
+    """Add new playlist members to the unplayed part of the current cycle."""
+
+    if not added_ids:
+        return
+    state = db.get_json_setting(conn, _cycle_setting_key(source.key), None)
+    if not state or not state.get("started"):
+        return
+    order = list(state.get("order") or [])
+    remaining = list(state.get("remaining") or [])
+    saved = list(state.get("repeat_saved_remaining") or [])
+    for track_id in added_ids:
+        if track_id not in order:
+            order.append(track_id)
+        if track_id not in remaining:
+            remaining.append(track_id)
+        if state.get("repeat_one") and track_id not in saved:
+            saved.append(track_id)
+    if source.shuffle and remaining:
+        tail = state.get("tail")
+        random.SystemRandom().shuffle(remaining)
+        if len(remaining) > 1 and tail and remaining[0] == tail:
+            index = random.SystemRandom().randrange(1, len(remaining))
+            remaining[0], remaining[index] = remaining[index], remaining[0]
+    if source.shuffle and saved:
+        random.SystemRandom().shuffle(saved)
+    state["order"] = order
+    state["remaining"] = remaining
+    if state.get("repeat_one"):
+        state["repeat_saved_remaining"] = saved
+    if remaining:
+        state["tail"] = remaining[-1]
+    db.set_json_setting(conn, _cycle_setting_key(source.key), state)
+
+
 def _apply_source_signature(conn: sqlite3.Connection, source: Source) -> None:
     signature = _source_signature(conn, source)
     stored = db.get_json_setting(conn, _source_setting_key(source.key), None)
-    if stored is not None and stored != signature:
-        if source.is_system and (
-            bool(stored.get("shuffle")) != signature["shuffle"]
-            or stored.get("repeat") != signature["repeat"]
-        ):
-            _invalidate_source_key(conn, source.key)
-        elif source.is_system:
-            removed_ids = set(stored.get("ids") or []) - set(signature["ids"])
-            if removed_ids:
-                for row in future_positions(conn):
-                    if (
-                        not row["manual"]
-                        and key_of(row["source_ref"]) == source.key
-                        and str(row["track_id"]) in removed_ids
-                    ):
-                        conn.execute(
-                            "DELETE FROM queue_positions WHERE id = ?", (row["id"],)
-                        )
-        else:
-            _invalidate_source_key(conn, source.key)
+    if stored is not None:
+        old_ids = [str(item) for item in stored.get("ids") or []]
+        new_ids = [str(item) for item in signature.get("ids") or []]
+        old_set, new_set = set(old_ids), set(new_ids)
+        removed = old_set - new_set
+        added = [track_id for track_id in new_ids if track_id not in old_set]
+        if removed:
+            _remove_cycle_tracks(conn, source, removed)
+        if added:
+            replenish_cycle(conn, source, added)
     if stored != signature:
         db.set_json_setting(conn, _source_setting_key(source.key), signature)
+
 
 
 def source_diagnostic(conn: sqlite3.Connection, now: datetime) -> dict:
@@ -727,110 +1652,84 @@ def _cycle_next(
 ) -> Choice:
     state = db.get_json_setting(conn, _cycle_setting_key(key), None)
     valid = set(ids)
-
     for attempt in range(2):
-        if state is None:
-            cycle = 0
-            previous_tail = None
-            remaining: list[str] = []
-            finished = False
-        else:
-            cycle = int(state.get("cycle") or 0)
-            remaining = [item for item in state.get("remaining") or [] if item in valid]
+        if not state or not state.get("started"):
+            state = {
+                "cycle": 0,
+                "order": [],
+                "remaining": [],
+                "started": False,
+                "tail": None,
+            }
+        cycle = int(state.get("cycle") or 0)
+        order = [item for item in state.get("order") or [] if item in valid]
+        for track_id in ids:
+            if track_id not in order:
+                order.append(track_id)
+        remaining = [item for item in state.get("remaining") or [] if item in valid]
+        finished = bool(state.get("started")) and not remaining
+
+        if not state.get("started") or finished:
+            if finished and repeat == "none":
+                return Choice(None, cycle, "exhausted")
+            if finished and not allow_duplicates and _cycle_positions(
+                conn, key, cycle, ("pending", "prepared")
+            ):
+                return Choice(None, cycle, "blocked")
+            pass_order = list(ids)
+            pass_remaining = list(pass_order)
             previous_tail = state.get("tail")
-            finished = bool(state.get("started")) and not remaining
-
-        if state is None or finished:
-            if finished:
-                if not allow_duplicates and _cycle_positions(
-                    conn, key, cycle, ("pending", "prepared")
-                ):
-                    return Choice(None, cycle, "blocked")
-                if repeat == "none":
-                    return Choice(None, cycle, "exhausted")
-            order = list(ids)
-            if shuffle:
-                random.SystemRandom().shuffle(order)
-            if len(order) > 1 and previous_tail and order[0] == previous_tail:
-                swap_index = random.SystemRandom().randrange(1, len(order))
-                order[0], order[swap_index] = order[swap_index], order[0]
-            remaining = order
+            if shuffle and len(pass_remaining) > 1:
+                random.SystemRandom().shuffle(pass_remaining)
+                if previous_tail and pass_remaining[0] == previous_tail:
+                    index = random.SystemRandom().randrange(1, len(pass_remaining))
+                    pass_remaining[0], pass_remaining[index] = (
+                        pass_remaining[index],
+                        pass_remaining[0],
+                    )
             cycle += 1
-            previous_tail = order[-1] if order else None
-            state = {"cycle": cycle, "remaining": remaining, "started": True, "tail": previous_tail}
+            clear_source_exclusions(conn, key)
+            state = {
+                "cycle": cycle,
+                "order": pass_order,
+                "remaining": pass_remaining,
+                "started": True,
+                "tail": previous_tail,
+                "repeat_target_id": state.get("repeat_target_id"),
+            }
+            remaining = pass_remaining
 
+        excluded_now = excluded_tracks_for_ref(conn, f"{key}:cycle:{cycle}")
         while remaining:
             candidate = remaining[0]
             if candidate not in valid:
+                remaining.pop(0)
+                continue
+            if candidate in excluded_now:
                 remaining.pop(0)
                 continue
             if not allow_duplicates and candidate in exclude_ids:
                 remaining.pop(0)
                 continue
             remaining.pop(0)
-            db.set_json_setting(
-                conn,
-                _cycle_setting_key(key),
-                {
-                    "cycle": cycle,
-                    "remaining": remaining,
-                    "started": True,
-                    "tail": state.get("tail"),
-                },
-            )
+            state["order"] = order
+            state["remaining"] = remaining
+            state["tail"] = candidate
+            db.set_json_setting(conn, _cycle_setting_key(key), state)
             return Choice(candidate, cycle, "ok")
 
-        db.set_json_setting(
-            conn,
-            _cycle_setting_key(key),
-            {"cycle": cycle, "remaining": [], "started": True, "tail": state.get("tail")},
-        )
+        state["order"] = order
+        state["remaining"] = []
+        state["started"] = True
+        db.set_json_setting(conn, _cycle_setting_key(key), state)
+        if repeat == "all" and attempt == 0:
+            continue
         if not allow_duplicates and _cycle_positions(
             conn, key, cycle, ("pending", "prepared")
         ):
             return Choice(None, cycle, "blocked")
-        if repeat == "all" and attempt == 0:
-            continue
         return Choice(None, cycle, "blocked")
     return Choice(None, 0, "blocked")
-
-
-def _append_library_tracks(conn: sqlite3.Connection, key: str, ids: list[str]) -> None:
-    """Append new library tracks to the remaining part of the current cycle."""
-
-    state = db.get_json_setting(conn, _cycle_setting_key(key), None)
-    if not state or not state.get("started"):
-        return
-    valid = set(ids)
-    cycle = int(state.get("cycle") or 0)
-    remaining = [item for item in state.get("remaining") or [] if item in valid]
-    played = {
-        str(row["track_id"])
-        for row in conn.execute(
-            "SELECT track_id FROM history WHERE source_ref LIKE ?",
-            (f"{key}:cycle:{cycle}",),
-        ).fetchall()
-        if row["track_id"]
-    }
-    queued = _all_queued_track_ids(conn)
-    appended = False
-    for track_id in ids:
-        if (
-            track_id not in remaining
-            and track_id not in played
-            and track_id not in queued
-        ):
-            remaining.append(track_id)
-            appended = True
-    db.set_json_setting(
-        conn,
-        _cycle_setting_key(key),
-        {
-            **state,
-            "remaining": remaining,
-            "tail": remaining[-1] if appended and remaining else state.get("tail"),
-        },
-    )
 
 
 def next_track(
@@ -839,39 +1738,36 @@ def next_track(
     now: datetime,
     exclude_ids: set[str],
 ) -> Choice:
-    if source.playlist_id == SYSTEM_PLAYLIST_ID and not source.rotation_item_id:
-        ids = playlist_track_ids(conn, SYSTEM_PLAYLIST_ID)
-        if not ids:
-            return Choice(None, reason="empty")
-        _append_library_tracks(conn, source.key, ids)
-        return _cycle_next(
-            conn,
-            source.key,
-            ids,
-            shuffle=source.shuffle,
-            repeat=source.repeat_mode,
-            exclude_ids=exclude_ids,
-            allow_duplicates=source.repeat_mode == "one",
-        )
-
     if not source.playlist_id:
         return Choice(None, reason="exhausted")
     ids = playlist_track_ids(conn, source.playlist_id)
     if not ids:
-        return Choice(None, reason="exhausted")
-    if source.playlist_id == SYSTEM_PLAYLIST_ID:
-        _append_library_tracks(conn, source.key, ids)
+        return Choice(None, reason="empty" if source.is_system else "exhausted")
+
+    state = db.get_json_setting(conn, _cycle_setting_key(source.key), None) or {}
+
+    if source.repeat_mode == "one" and not source.rotation_item_id:
+        if not state.get("started"):
+            state = {
+                "cycle": int(state.get("cycle") or 1),
+                "order": list(ids),
+                "remaining": list(ids),
+                "started": True,
+                "tail": state.get("tail"),
+                "repeat_one": True,
+                "repeat_saved_remaining": list(ids),
+            }
+        target = state.get("repeat_target_id")
+        if target not in ids:
+            target = ids[0]
+        state["repeat_one"] = True
+        state.setdefault("repeat_saved_remaining", list(state.get("remaining") or ids))
+        state["repeat_target_id"] = target
+        db.set_json_setting(conn, _cycle_setting_key(source.key), state)
+        return Choice(target, int(state.get("cycle") or 0), "ok")
 
     if source.rotation_item_id:
-        rotation = get_rotation(conn)
-        if source.by_count:
-            count = max(1, _item_track_count(conn, source))
-            if _played(conn, source.rotation_item_id) + _queued_for_item(
-                conn, source.rotation_item_id
-            ) >= count:
-                _advance_rotation(conn, rotation, source.rotation_item_id)
-                return Choice(None, reason="advanced")
-        choice = _cycle_next(
+        return _cycle_next(
             conn,
             source.key,
             ids,
@@ -880,40 +1776,6 @@ def next_track(
             exclude_ids=exclude_ids,
             allow_duplicates=source.by_count,
         )
-        if choice.reason == "ok":
-            return choice
-        if choice.reason == "blocked" and not source.by_count:
-            # The current playlist pass is scheduled; plan the next rotation item.
-            advanced = _advance_rotation(conn, rotation, source.rotation_item_id)
-            if advanced is not None and str(advanced["id"]) != source.rotation_item_id:
-                return Choice(None, reason="advanced")
-            return choice
-        if choice.reason == "blocked":
-            return choice
-        advanced = _advance_rotation(conn, rotation, source.rotation_item_id)
-        if advanced is None:
-            return Choice(None, reason="exhausted")
-        if str(advanced["id"]) == source.rotation_item_id:
-            # Single item rotation: restart the playlist cycle immediately.
-            db.delete_setting(conn, _cycle_setting_key(source.key))
-            return _cycle_next(
-                conn,
-                source.key,
-                ids,
-                shuffle=source.shuffle,
-                repeat="all",
-                exclude_ids=exclude_ids,
-                allow_duplicates=True,
-            )
-        return Choice(None, reason="advanced")
-
-    if source.repeat_mode == "one":
-        last = _last_played_for_key(conn, source.key) or ids[0]
-        if last not in ids:
-            last = ids[0]
-        state = db.get_json_setting(conn, _cycle_setting_key(source.key), None) or {}
-        cycle = int(state.get("cycle") or 0)
-        return Choice(last, cycle, "ok")
 
     repeat = source.repeat_mode
     return _cycle_next(
@@ -923,18 +1785,8 @@ def next_track(
         shuffle=source.shuffle,
         repeat=repeat,
         exclude_ids=exclude_ids,
-        allow_duplicates=repeat == "one",
+        allow_duplicates=False,
     )
-
-
-def _item_track_count(conn: sqlite3.Connection, source: Source) -> int:
-    row = conn.execute(
-        "SELECT track_count FROM rotation_items WHERE id = ?", (source.rotation_item_id,)
-    ).fetchone()
-    try:
-        return max(1, int(row["track_count"])) if row else 1
-    except (TypeError, ValueError):
-        return 1
 
 
 # ---------------------------------------------------------------------------
@@ -961,6 +1813,27 @@ def _renumber(conn: sqlite3.Connection) -> None:
     ).fetchall()
     for index, row in enumerate(rows):
         conn.execute("UPDATE queue_positions SET seq = ? WHERE id = ?", (index, row["id"]))
+
+
+def _queue_excluded_key(source_ref: str) -> str:
+    return f"_queue_excluded:{source_ref}"
+
+
+def excluded_tracks_for_ref(conn: sqlite3.Connection, source_ref: str) -> set[str]:
+    values = db.get_json_setting(conn, _queue_excluded_key(source_ref), [])
+    return {str(value) for value in values} if isinstance(values, list) else set()
+
+
+def exclude_track_for_ref(conn: sqlite3.Connection, source_ref: str, track_id: str) -> None:
+    values = excluded_tracks_for_ref(conn, source_ref)
+    values.add(str(track_id))
+    db.set_json_setting(conn, _queue_excluded_key(source_ref), sorted(values))
+
+
+def clear_source_exclusions(conn: sqlite3.Connection, key: str) -> None:
+    conn.execute(
+        "DELETE FROM settings WHERE key LIKE ?", (f"_queue_excluded:{key}:%",)
+    )
 
 
 def _insert_position(
@@ -995,6 +1868,7 @@ def _insert_position(
         ),
     )
     _renumber(conn)
+    bump_queue_revision(conn)
     return position_id
 
 
@@ -1003,6 +1877,18 @@ def ensure_queue(conn: sqlite3.Connection, settings: Settings, now: datetime) ->
     """Fill future positions to ``queue_depth`` and keep the current source stable."""
 
     depth = max(1, db.get_int_setting(conn, "queue_depth", 6))
+    pending = pending_source(conn)
+    if pending is not None and pending.get("head_position_id"):
+        head_state = pending_head_state(conn)
+        if head_state in ("pending", "prepared", "current"):
+            # The transition queue is already prepared: its first automatic
+            # position belongs to the new source. Keep it (and the manual order)
+            # until the head actually starts; never refill from the old source.
+            return []
+        # The prepared head disappeared (queue deletion, track/playlist
+        # removal). Cancel the armed switch and rebuild the current source
+        # instead of leaving the station with an empty queue.
+        cancel_pending_source(conn)
     source = resolve_source(conn, now)
     if source is None:
         conn.execute(
@@ -1031,9 +1917,10 @@ def ensure_queue(conn: sqlite3.Connection, settings: Settings, now: datetime) ->
             for row in future
             if row["state"] in ("pending", "prepared") and not row["manual"]
         }
-        conn.execute(
+        if conn.execute(
             "DELETE FROM queue_positions WHERE state IN ('pending', 'prepared') AND manual = 0"
-        )
+        ).rowcount:
+            bump_queue_revision(conn)
         for key in dropped_keys:
             if key:
                 db.delete_setting(conn, f"_cycle:{key}")
@@ -1052,6 +1939,7 @@ def ensure_queue(conn: sqlite3.Connection, settings: Settings, now: datetime) ->
                 conn.execute("DELETE FROM queue_positions WHERE id = ?", (row["id"],))
             if extras:
                 _renumber(conn)
+                bump_queue_revision(conn)
             break
         if len(generated) >= depth:
             break
@@ -1088,13 +1976,6 @@ def ensure_queue(conn: sqlite3.Connection, settings: Settings, now: datetime) ->
     return created
 
 
-def _all_queued_track_ids(conn: sqlite3.Connection) -> set[str]:
-    rows = conn.execute(
-        "SELECT track_id FROM queue_positions WHERE state IN ('pending', 'prepared', 'current')"
-    ).fetchall()
-    return {str(row["track_id"]) for row in rows}
-
-
 @_locked
 def enqueue_manual(
     conn: sqlite3.Connection,
@@ -1119,6 +2000,7 @@ def enqueue_manual(
         now=now,
         at_head=mode in ("play-now", "play-next"),
     )
+    bump_state_revision(conn)
     conn.commit()
     return position_id
 
@@ -1128,12 +2010,14 @@ def move_position(conn: sqlite3.Connection, position_id: str, move_to: int) -> N
     row = conn.execute("SELECT * FROM queue_positions WHERE id = ?", (position_id,)).fetchone()
     if row is None:
         raise ApiError(404, "position_not_found", "Позиция очереди не найдена.")
-    if row["state"] != "pending":
+    if row["state"] == "current":
         raise ApiError(
             409,
-            "position_locked",
-            "Позиция уже подготовлена движком и не может быть изменена.",
+            "position_started",
+            "Этот трек уже начал играть и не может быть перемещён.",
         )
+    if row["state"] not in ("pending", "prepared"):
+        raise ApiError(409, "position_started", "Позиция уже недоступна для изменения.")
     ordered = [
         str(item["id"])
         for item in conn.execute(
@@ -1148,55 +2032,81 @@ def move_position(conn: sqlite3.Connection, position_id: str, move_to: int) -> N
     ordered.insert(target, position_id)
     for index, identifier in enumerate(ordered):
         conn.execute("UPDATE queue_positions SET seq = ? WHERE id = ?", (index, identifier))
+    bump_state_revision(conn)
+    bump_queue_revision(conn)
     conn.commit()
+
+
+@_locked
+def move_position_next(conn: sqlite3.Connection, position_id: str) -> None:
+    row = conn.execute("SELECT * FROM queue_positions WHERE id = ?", (position_id,)).fetchone()
+    if row is None:
+        raise ApiError(404, "position_not_found", "Позиция очереди не найдена.")
+    if row["state"] == "current":
+        raise ApiError(
+            409,
+            "position_started",
+            "Этот трек уже начал играть и не может быть перемещён.",
+        )
+    if row["state"] not in ("pending", "prepared"):
+        raise ApiError(409, "position_started", "Позиция уже недоступна для изменения.")
+    move_position(conn, position_id, 0)
 
 
 @_locked
 def delete_position(conn: sqlite3.Connection, settings: Settings, position_id: str) -> None:
     row = conn.execute("SELECT * FROM queue_positions WHERE id = ?", (position_id,)).fetchone()
+    if pending_head_position_id(conn) == position_id and (
+        row is None or row["state"] in ("pending", "prepared")
+    ):
+        # Removing the prepared head cancels the armed switch and restores the
+        # current source's queue; the caller rebuilds and syncs afterwards.
+        cancel_pending_source(conn)
+        return
     if row is None:
         raise ApiError(404, "position_not_found", "Позиция очереди не найдена.")
-    if row["state"] != "pending":
+    if row["state"] == "current":
         raise ApiError(
             409,
-            "position_locked",
-            "Позиция уже подготовлена движком и не может быть удалена.",
+            "position_started",
+            "Этот трек уже начал играть и не может быть убран из текущего прохода.",
         )
+    if row["state"] not in ("pending", "prepared"):
+        raise ApiError(409, "position_started", "Позиция уже недоступна для удаления.")
+    if not row["manual"] and key_of(row["source_ref"]):
+        exclude_track_for_ref(conn, str(row["source_ref"]), str(row["track_id"]))
     conn.execute("DELETE FROM queue_positions WHERE id = ?", (position_id,))
     _renumber(conn)
+    bump_state_revision(conn)
+    bump_queue_revision(conn)
     conn.commit()
-    from .util import remove_queue_link
-
-    remove_queue_link(settings, position_id)
+    # The runtime symlink is released only after a confirmed sync.
 
 
 @_locked
 def shuffle_pending(conn: sqlite3.Connection) -> int:
-    prepared = conn.execute(
-        "SELECT id FROM queue_positions WHERE state = 'prepared' ORDER BY seq ASC"
-    ).fetchall()
-    pending = conn.execute(
-        "SELECT id FROM queue_positions WHERE state = 'pending' AND manual = 0 ORDER BY seq ASC"
-    ).fetchall()
-    manual = conn.execute(
-        "SELECT id FROM queue_positions WHERE state = 'pending' AND manual = 1 ORDER BY seq ASC"
-    ).fetchall()
-    pending_ids = [str(item["id"]) for item in pending]
-    random.SystemRandom().shuffle(pending_ids)
-    manual_ids = [str(item["id"]) for item in manual]
-    ordered = [str(item["id"]) for item in prepared] + manual_ids + pending_ids
+    future = future_positions(conn)
+    manual_ids = [str(row["id"]) for row in future if row["manual"]]
+    automatic_ids = [str(row["id"]) for row in future if not row["manual"]]
+    random.SystemRandom().shuffle(automatic_ids)
+    ordered = manual_ids + automatic_ids
     for index, identifier in enumerate(ordered):
         conn.execute("UPDATE queue_positions SET seq = ? WHERE id = ?", (index, identifier))
+    bump_state_revision(conn)
+    bump_queue_revision(conn)
     conn.commit()
-    return len(pending_ids)
+    return len(automatic_ids)
 
 
 @_locked
 def clear_manual(conn: sqlite3.Connection) -> int:
     cursor = conn.execute(
-        "DELETE FROM queue_positions WHERE state = 'pending' AND manual = 1"
+        "DELETE FROM queue_positions WHERE state IN ('pending', 'prepared') AND manual = 1"
     )
     _renumber(conn)
+    bump_state_revision(conn)
+    if cursor.rowcount:
+        bump_queue_revision(conn)
     conn.commit()
     return cursor.rowcount or 0
 
@@ -1207,7 +2117,7 @@ def clear_manual(conn: sqlite3.Connection) -> int:
 
 
 def build_engine_lines(conn: sqlite3.Connection, settings: Settings) -> list[str]:
-    """Prepare symlinks and return the absolute link paths for Liquidsoap."""
+    """Prepare symlinks and return ``<position_id>\\t<absolute link path>`` lines."""
 
     from .util import ensure_queue_link
 
@@ -1225,7 +2135,7 @@ def build_engine_lines(conn: sqlite3.Connection, settings: Settings) -> list[str
         if not path.exists():
             continue
         link = ensure_queue_link(settings, str(row["id"]), path)
-        lines.append(str(link))
+        lines.append(f"{row['id']}\t{link}")
     return lines
 
 
@@ -1266,9 +2176,6 @@ def _drop_unplayable_positions(conn: sqlite3.Connection, settings: Settings) -> 
         if playable:
             continue
         conn.execute("DELETE FROM queue_positions WHERE id = ?", (row["id"],))
-        from .util import remove_queue_link
-
-        remove_queue_link(settings, str(row["id"]))
         removed += 1
         _warn_once(
             conn,
@@ -1308,8 +2215,16 @@ def sync_engine(
             and isinstance(last_at, datetime)
             and 0 <= (now - last_at).total_seconds() < ENGINE_SYNC_MIN_INTERVAL
         ):
+            # Nothing changed since the last confirmed queue. Treat the current
+            # state as applied so the UI does not wait forever for a command
+            # that was never needed.
+            current_revision = state_revision(conn)
+            sync_state["applied_revision"] = current_revision
+            db.set_setting(conn, "applied_revision", str(current_revision))
+            conn.commit()
             return True
     lines = build_engine_lines(conn, settings)
+    expected_ids = [line.split("\t", 1)[0] for line in lines]
     content = "\n".join(lines)
     if content:
         content += "\n"
@@ -1320,36 +2235,26 @@ def sync_engine(
         and diagnostic.get("reason") is None
         and playlist_track_ids(conn, source.playlist_id)
     )
-    empty_valid = False
-    if not lines:
-        if playable_source:
-            db.set_setting(conn, "_engine_sync_error", to_iso(now) or "")
-            db.log_event(
-                conn,
-                "error",
-                "engine",
-                "Пустая синхронизация при наличии источника отклонена",
-                None,
-            )
-            if sync_state is not None:
-                sync_state["failed"] = True
-                sync_state.pop("signature", None)
-                sync_state.pop("at", None)
-            conn.commit()
-            return False
-        # No playable source (empty library, empty/exhausted user source):
-        # an empty queue is the correct state, not a sync failure.
-        empty_valid = True
-    current = current_position(conn)
-    keep_ids = [Path(line).stem for line in lines]
-    if current is not None:
-        keep_ids.append(str(current["id"]))
+    if not lines and playable_source:
+        db.set_setting(conn, "_engine_sync_error", to_iso(now) or "")
+        db.log_event(
+            conn,
+            "error",
+            "engine",
+            "Пустая синхронизация при наличии источника отклонена",
+            None,
+        )
+        if sync_state is not None:
+            sync_state["failed"] = True
+            sync_state.pop("signature", None)
+            sync_state.pop("at", None)
+        conn.commit()
+        return False
     try:
         settings.ensure_directories()
         from .util import atomic_write_text
 
         atomic_write_text(settings.engine_queue_file, content)
-        _cleanup_stale_links(settings, keep_ids)
     except OSError:
         db.log_event(conn, "error", "engine", "Не удалось записать файл очереди движка", None)
         if sync_state is not None:
@@ -1358,67 +2263,99 @@ def sync_engine(
             sync_state.pop("at", None)
         conn.commit()
         return False
+
+    revision = state_revision(conn)
     if hasattr(engine, "sync_report"):
-        report = engine.sync_report()
-        ok = bool(report.get("ok"))
-        resolved = report.get("resolved")
-        failed = report.get("failed")
+        try:
+            report = engine.sync_report(expected_ids)
+        except TypeError:
+            report = engine.sync_report()
     else:
-        ok = bool(engine and engine.sync())
-        resolved = len(lines)
-        failed = 0
-    engine_ok = ok
-    if ok and resolved is None:
-        resolved = len(lines)
-    if ok and lines and (resolved or 0) == 0:
-        ok = False
-        db.set_setting(conn, "_engine_sync_error", to_iso(now) or "")
+        engine_ok = bool(engine and engine.sync())
+        report = {
+            "ok": engine_ok,
+            "reply": "\n".join(
+                ["OK"] + [f"ok {identifier}" for identifier in expected_ids] + ["END"]
+            )
+            if engine_ok
+            else "",
+            "resolved": len(expected_ids) if engine_ok else None,
+            "failed": 0,
+        }
+
+    statuses: dict[str, str] | None = None
+    reply = str(report.get("reply") or "")
+    reply_lines = [line.strip() for line in reply.splitlines() if line.strip()]
+    header_ok = bool(report.get("ok")) and bool(reply_lines) and reply_lines[0].upper().startswith("OK")
+    ended = "END" in reply_lines
+    if header_ok and ended:
+        parsed: dict[str, str] = {}
+        malformed = False
+        for line in reply_lines[1:]:
+            if line == "END":
+                break
+            parts = line.split(maxsplit=1)
+            if len(parts) != 2 or parts[0] not in ("ok", "fail"):
+                malformed = True
+                break
+            parsed[parts[1]] = parts[0]
+        if not malformed and all(identifier in parsed for identifier in expected_ids):
+            statuses = parsed
+    if state_revision(conn) != revision:
+        # A newer state change superseded this sync; never apply stale confirmation.
         db.log_event(
             conn,
-            "error",
+            "info",
             "engine",
-            "Движок не разрешил ни одной позиции очереди",
-            {"lines": len(lines), "failed": failed},
+            "Устаревшее подтверждение синхронизации проигнорировано",
+            {"revision": revision, "current": state_revision(conn)},
         )
-    if empty_valid:
-        # A failed command while there is legitimately no playable source does
-        # not make the station unhealthy; the engine will start silence or keep
-        # its empty state. Clear the failure and wait for a real source/track.
-        ok = True
-        resolved = 0
-        failed = 0
+        conn.commit()
+        return False
+    ok_ids = {identifier for identifier, status in (statuses or {}).items() if status == "ok"}
+    fail_ids = {identifier for identifier, status in (statuses or {}).items() if status == "fail"}
+    ok = statuses is not None and (not expected_ids or bool(ok_ids))
     if ok:
+        current = current_position(conn)
+        keep_ids = expected_ids + ([str(current["id"])] if current is not None else [])
+        _cleanup_stale_links(settings, keep_ids)
         if sync_state is not None:
             sync_state["signature"] = signature
             sync_state["at"] = now
             sync_state["failed"] = False
-        ids = [Path(line).stem for line in lines]
-        prepared_ids = ids[: int(resolved or 0)] if resolved is not None else ids
-        if prepared_ids:
-            placeholders = ",".join("?" for _ in prepared_ids)
-            conn.execute(
-                f"UPDATE queue_positions SET state = 'prepared' WHERE id IN ({placeholders})",
-                prepared_ids,
-            )
+            sync_state["applied_revision"] = revision
+        db.set_setting(conn, "applied_revision", str(revision))
+        if expected_ids:
+            placeholders = ",".join("?" for _ in expected_ids)
             conn.execute(
                 f"UPDATE queue_positions SET state = 'pending' WHERE state = 'prepared' "
                 f"AND id NOT IN ({placeholders})",
-                prepared_ids,
+                expected_ids,
             )
         else:
             conn.execute("UPDATE queue_positions SET state = 'pending' WHERE state = 'prepared'")
-        if failed:
+        if ok_ids:
+            placeholders = ",".join("?" for _ in ok_ids)
+            conn.execute(
+                f"UPDATE queue_positions SET state = 'prepared' WHERE id IN ({placeholders})",
+                list(ok_ids),
+            )
+        if fail_ids:
+            placeholders = ",".join("?" for _ in fail_ids)
+            conn.execute(
+                f"UPDATE queue_positions SET state = 'pending' WHERE id IN ({placeholders})",
+                list(fail_ids),
+            )
             db.log_event(
                 conn,
                 "warning",
                 "engine",
                 "Движок не подготовил часть очереди",
-                {"failed": failed, "resolved": resolved, "positions": len(ids)},
+                {"failed": sorted(fail_ids), "positions": expected_ids},
             )
         db.delete_setting(conn, "_engine_sync_error")
         db.set_setting(conn, "engine_last_error", "")
-        if not empty_valid or engine_ok:
-            db.set_setting(conn, "_engine_start_synced", "1")
+        db.set_setting(conn, "_engine_start_synced", "1")
         if db.get_setting(conn, "_sync_warned") == "1":
             db.delete_setting(conn, "_sync_warned")
             db.log_event(conn, "info", "engine", "Синхронизация очереди с движком восстановлена", None)
@@ -1429,6 +2366,14 @@ def sync_engine(
             sync_state["failed"] = True
             sync_state.pop("signature", None)
             sync_state.pop("at", None)
+        if fail_ids:
+            db.log_event(
+                conn,
+                "warning",
+                "engine",
+                "Движок не подготовил очередь",
+                {"failed": sorted(fail_ids), "positions": expected_ids},
+            )
         if db.get_setting(conn, "_sync_warned") != "1":
             db.set_setting(conn, "_sync_warned", "1")
             db.log_event(
@@ -1467,19 +2412,27 @@ def handle_track_start(
             {"position_id": position_id},
         )
         conn.commit()
-        return {"ok": False, "reason": "unknown_position"}
+        return {"status": "unknown", "track_id": None}
 
+    stamp = to_iso(started_at)
+    previous = conn.execute("SELECT * FROM playback_state WHERE singleton = 1").fetchone()
+    previous_started = parse_iso(previous["started_at"]) if previous is not None else None
+    if previous is not None and previous["position_id"] == position_id:
+        if previous_started is not None and started_at < previous_started:
+            return {"status": "stale", "track_id": position["track_id"]}
+        return {"status": "duplicate", "track_id": position["track_id"]}
+    if previous_started is not None and started_at < previous_started:
+        return {"status": "stale", "track_id": position["track_id"]}
     if position["state"] == "current":
-        return {"ok": True, "duplicate": True, "track_id": position["track_id"]}
+        return {"status": "duplicate", "track_id": position["track_id"]}
 
     track = conn.execute("SELECT * FROM tracks WHERE id = ?", (position["track_id"],)).fetchone()
-    previous = conn.execute("SELECT * FROM playback_state WHERE singleton = 1").fetchone()
-    stamp = to_iso(started_at)
     if previous is not None and previous["position_id"]:
-        conn.execute(
+        if conn.execute(
             "UPDATE history SET ended_at = ? WHERE position_id = ? AND ended_at IS NULL",
             (stamp, previous["position_id"]),
-        )
+        ).rowcount:
+            bump_history_revision(conn)
         conn.execute(
             "DELETE FROM queue_positions WHERE id = ? AND state = 'current'",
             (previous["position_id"],),
@@ -1505,6 +2458,7 @@ def handle_track_start(
             album,
         ),
     )
+    bump_history_revision(conn)
     conn.execute(
         "INSERT INTO playback_state(singleton, position_id, track_id, started_at, source_kind, "
         "source_ref, updated_at) VALUES(1, ?, ?, ?, ?, ?, ?) "
@@ -1525,6 +2479,22 @@ def handle_track_start(
         "UPDATE tracks SET play_count = COALESCE(play_count, 0) + 1 WHERE id = ?",
         (position["track_id"],),
     )
+    if not position["manual"]:
+        cycle_key = key_of(position["source_ref"])
+        cycle_state = db.get_json_setting(conn, _cycle_setting_key(cycle_key), None)
+        if cycle_state and cycle_state.get("started"):
+            cycle_state["repeat_target_id"] = str(position["track_id"])
+            if cycle_state.get("repeat_one"):
+                target = str(position["track_id"])
+                cycle_state["remaining"] = [
+                    item for item in cycle_state.get("remaining") or [] if item != target
+                ]
+                cycle_state["repeat_saved_remaining"] = [
+                    item
+                    for item in cycle_state.get("repeat_saved_remaining") or []
+                    if item != target
+                ]
+            db.set_json_setting(conn, _cycle_setting_key(cycle_key), cycle_state)
 
     override_id = parse_override_id(position["source_ref"])
     if override_id:
@@ -1533,13 +2503,34 @@ def handle_track_start(
             conn.execute("UPDATE overrides SET active = 0 WHERE id = ?", (override_id,))
     item_id = parse_item_id(position["source_ref"])
     if item_id and position["source_kind"] in ("rotation", "schedule", "override"):
-        _set_played(conn, item_id, _played(conn, item_id) + 1)
+        played = _played(conn, item_id) + 1
+        _set_played(conn, item_id, played)
+        rotation = get_rotation(conn)
+        item = conn.execute(
+            "SELECT track_count FROM rotation_items WHERE id = ?", (item_id,)
+        ).fetchone()
+        if (
+            str(rotation["mode"] or "sequential") == "by_count"
+            and item is not None
+            and played >= max(1, int(item["track_count"] or 1))
+        ):
+            _advance_rotation(conn, rotation, item_id)
+        elif not _current_source_has_future(conn, key_of(position["source_ref"])) and (
+            _cycle_is_exhausted(conn, key_of(position["source_ref"]))
+        ):
+            _advance_rotation(conn, rotation, item_id)
 
     media.delete_pending_after_change(conn, settings)
+    pending = pending_source(conn)
+    if pending is not None and pending.get("head_position_id") == position_id:
+        # The prepared head actually started: commit the source and fill the
+        # queue from it without rebuilding away the prepared positions.
+        commit_pending_source_state(conn, settings, now, fill=True)
+    bump_queue_revision(conn)
+    bump_state_revision(conn)
     conn.commit()
     return {
-        "ok": True,
-        "duplicate": False,
+        "status": "ok",
         "track_id": position["track_id"],
         "source_kind": position["source_kind"],
         "source_ref": position["source_ref"],
@@ -1595,6 +2586,7 @@ def queue_snapshot(conn: sqlite3.Connection, settings: Settings, now: datetime) 
         "current": current,
         "items": items,
         "depth": db.get_int_setting(conn, "queue_depth", 6),
+        "state_revision": state_revision(conn),
     }
 
 

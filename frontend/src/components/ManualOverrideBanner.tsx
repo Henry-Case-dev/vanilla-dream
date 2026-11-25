@@ -1,34 +1,46 @@
 import { useState } from 'react';
 import { Hand } from 'lucide-react';
 import { Button } from './ui';
-import { useLive } from '../lib/live';
+import { useLive, effectiveControl } from '../lib/live';
 import { useToast } from './Toasts';
 import { api, errorMessage } from '../lib/api';
-import { sourceDisplayName } from '../lib/format';
+import { effectiveSourceName } from '../lib/format';
 import { notifyDataChanged } from '../lib/refresh';
 
 /**
- * Ручной выбор всегда виден в интерфейсе, пока активен override.
- * Возврат к автоматическому режиму — DELETE /api/admin/station/override.
+ * Показывается только при реальном override из station/state.
+ * Исчезает сразу после «Завершить переключение», не дожидаясь SSE.
  */
 export function ManualOverrideBanner({ compact = false }: { compact?: boolean }) {
-  const { now, reload } = useLive();
+  const { now, control, reload, reloadControl } = useLive();
   const toast = useToast();
   const [busy, setBusy] = useState(false);
-  const source = now?.source;
+  const [hiddenKey, setHiddenKey] = useState<string | null>(null);
+  const state = effectiveControl(control, now);
+  const override = state?.override ?? null;
 
-  if (!source || source.kind !== 'override') return null;
+  if (!override || !override.active) return null;
 
-  const name = sourceDisplayName(source);
+  const key = `${override.id || override.kind}:${override.playlistId ?? ''}:${override.createdAt ?? override.expiresAt ?? '1'}`;
+  if (hiddenKey === key) return null;
+
+  const name = override.playlistName ?? (state?.effectiveSource?.kind === 'override'
+    ? effectiveSourceName(state.effectiveSource)
+    : null);
+  const backLabel =
+    state?.mode === 'auto' ? 'Вернуться к расписанию' : 'Вернуться к плейлисту';
 
   const clear = async () => {
+    setHiddenKey(key);
     setBusy(true);
     try {
       await api.admin.station.clearOverride();
-      toast.notify('success', 'Снова работает автоматический выбор источника');
+      toast.notify('success', 'Временное переключение завершено');
       reload();
+      reloadControl();
       notifyDataChanged();
     } catch (caught) {
+      setHiddenKey(null);
       toast.notify('error', errorMessage(caught));
     } finally {
       setBusy(false);
@@ -39,11 +51,15 @@ export function ManualOverrideBanner({ compact = false }: { compact?: boolean })
     <div className={`banner banner--accent ${compact ? 'banner--compact' : ''}`.trim()} role="status">
       <Hand size={16} aria-hidden="true" />
       <div className="banner__body">
-        <strong>Ручной выбор{name ? `: ${name}` : ''}</strong>
-        <p>Эфир идёт по ручному переключению, а не по расписанию или ротации.</p>
+        <strong>Временное переключение{name ? `: ${name}` : ''}</strong>
+        <p>
+          {state?.mode === 'auto'
+            ? 'Сейчас играет временный источник вместо расписания.'
+            : 'Сейчас играет временный источник вместо выбранного плейлиста.'}
+        </p>
       </div>
       <Button variant="secondary" size="sm" onClick={() => void clear()} loading={busy}>
-        Вернуться к автоматическому
+        {backLabel}
       </Button>
     </div>
   );

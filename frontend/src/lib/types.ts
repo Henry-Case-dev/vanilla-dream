@@ -9,7 +9,59 @@ export type StationStatus =
 
 export type DesiredState = 'playing' | 'stopped';
 
+export type PlaybackMode = 'playlist' | 'auto';
+
 export type RepeatMode = 'none' | 'all' | 'one';
+
+export type RepeatGovernedBy = 'playlist' | 'rotation' | null;
+
+export type ApplicationState = 'saved' | 'applied' | 'pending';
+
+export interface EffectiveSource {
+  kind: string;
+  playlistId: string | null;
+  name: string | null;
+  reason: string | null;
+}
+
+export interface PendingSource {
+  playlistId: string;
+  mode: PlaybackMode;
+  requestedAt: string | null;
+}
+
+export interface OverrideInfo {
+  id: string;
+  kind: string;
+  playlistId: string | null;
+  playlistName: string | null;
+  scope: string;
+  expiresAt: string | null;
+  active: boolean;
+  createdAt: string | null;
+  note: string | null;
+}
+
+export interface StationState {
+  mode: PlaybackMode;
+  selectedPlaylistId: string | null;
+  /** Плейлист, чьими shuffle/repeat управляет нижняя панель. */
+  programPlaylistId: string | null;
+  effectiveSource: EffectiveSource | null;
+  pendingSource: PendingSource | null;
+  override: OverrideInfo | null;
+  desired: DesiredState;
+  status: StationStatus;
+  reason: string | null;
+  repeatGovernedBy: RepeatGovernedBy;
+  engineInstance: string | null;
+  revision: number;
+  appliedRevision: number | null;
+  notice: string | null;
+  diagnosticReason: string | null;
+}
+
+export type DeleteMode = 'after' | 'now';
 
 export type RotationMode = 'sequential' | 'by_count' | 'random';
 
@@ -46,6 +98,15 @@ export interface NowStation {
   plsUrl: string;
   baseUrl: string;
   bitrate: number | null;
+  mode: PlaybackMode;
+  programPlaylistId: string | null;
+  effectiveSource: EffectiveSource | null;
+  pendingSource: PendingSource | null;
+  override: OverrideInfo | null;
+  repeatGovernedBy: RepeatGovernedBy;
+  revision: number;
+  notice: string | null;
+  diagnosticReason: string | null;
 }
 
 export interface NextScheduleChange {
@@ -61,6 +122,8 @@ export interface NowPlaying {
   nextTrack: { id: string; title: string; artist: string | null; duration: number | null } | null;
   nextScheduleChange: NextScheduleChange | null;
   statsAvailable: boolean;
+  queueRevision: number | null;
+  historyRevision: number | null;
 }
 
 export type DuplicateKind = 'content' | 'tags' | 'possible';
@@ -83,6 +146,7 @@ export interface Track {
   duplicateKind: DuplicateKind | null;
   duplicateOf: string | null;
   canRevertCover: boolean;
+  originalCoverUrl: string | null;
   sourceFilename: string | null;
   createdAt: string | null;
   playlistsCount: number | null;
@@ -120,6 +184,7 @@ export interface Playlist {
   createdAt: string | null;
   updatedAt: string | null;
   pendingDeleteCount: number | null;
+  repeatGovernedBy: RepeatGovernedBy;
 }
 
 export interface PlaylistDetail {
@@ -133,6 +198,11 @@ export interface AddTracksResult {
   skipped: number;
   unavailable: number;
   playlist: Playlist;
+  application: ApplicationState | null;
+  inCurrentCycle: boolean;
+  engineSynced: boolean | null;
+  stateRevision: number | null;
+  appliedRevision: number | null;
 }
 
 export interface RemoveTrackResult {
@@ -193,6 +263,7 @@ export interface Rotation {
 
 export interface QueueItem {
   id: string;
+  position: number | null;
   track: Track | null;
   sourceKind: string | null;
   sourceLabel: string | null;
@@ -205,6 +276,11 @@ export interface QueueSnapshot {
   current: QueueItem | null;
   items: QueueItem[];
   depth: number | null;
+  stateRevision: number | null;
+  engineSynced: boolean | null;
+  appliedRevision: number | null;
+  shuffled: number | null;
+  removed: number | null;
 }
 
 export interface Settings {
@@ -220,8 +296,54 @@ export interface Settings {
   maxUploadMb: number;
   maxLibraryGb: number;
   desiredState: DesiredState;
+  playbackMode: PlaybackMode;
+  selectedPlaylistId: string | null;
   engineLastStart: string;
   engineLastError: string;
+}
+
+export interface PlaylistPlayResult {
+  status: 'switching' | 'applied' | 'already_active';
+  started: boolean;
+  engineSynced: boolean;
+  playlist: Playlist;
+  station: StationState | null;
+  stateRevision: number | null;
+  appliedRevision: number | null;
+}
+
+export interface PlaylistUpdateResult {
+  playlist: Playlist;
+  application: ApplicationState;
+  engineSynced: boolean;
+  stateRevision: number | null;
+  appliedRevision: number | null;
+}
+
+export interface StationModeResult {
+  state: StationState;
+  engineSynced: boolean;
+  appliedRevision: number | null;
+}
+
+export interface DeleteTrackResult {
+  deleted: boolean;
+  pending: boolean;
+  playlistsCount: number | null;
+  mode: DeleteMode | null;
+  current: boolean;
+  skipped: boolean;
+}
+
+export interface BulkDeleteResult {
+  marked: string[];
+  deleted: string[];
+  purged: string[];
+  pending: string[];
+  notFound: string[];
+  current: string[];
+  mode: DeleteMode;
+  skipped: boolean;
 }
 
 export interface StorageInfo {
@@ -358,8 +480,26 @@ export interface UploadBatch {
 }
 
 export type UploadResponse =
-  | { status: 'added'; track: Track; batchId: string }
-  | { status: 'pending'; pending: PendingUpload; batchId: string };
+  | {
+      status: 'added';
+      track: Track;
+      batchId: string;
+      application: ApplicationState | null;
+      inCurrentCycle: boolean;
+      engineSynced: boolean | null;
+      stateRevision: number | null;
+      appliedRevision: number | null;
+    }
+  | {
+      status: 'pending';
+      pending: PendingUpload;
+      batchId: string;
+      application: ApplicationState | null;
+      inCurrentCycle: boolean;
+      engineSynced: boolean | null;
+      stateRevision: number | null;
+      appliedRevision: number | null;
+    };
 
 /* ------------------------------------------------------------------ */
 /* Экспорт (VD-RADIO-MEDIA-02)                                          */

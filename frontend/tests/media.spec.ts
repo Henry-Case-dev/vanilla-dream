@@ -9,7 +9,8 @@ const PNG = Buffer.from(
 
 test.describe.configure({ mode: 'serial' });
 
-test.beforeEach(async ({ context }) => {
+test.beforeEach(async ({ context, request }) => {
+  await request.get(`${BASE}/api/mock/reset`);
   await context.clearCookies();
   await context.addCookies([{ name: 'mock_session', value: '1', url: BASE }]);
 });

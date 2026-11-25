@@ -27,20 +27,21 @@ import {
   TextField,
 } from '../components/ui';
 import { Cover } from '../components/Cover';
-import { ConfirmDialog, Modal } from '../components/Modal';
+import { Modal } from '../components/Modal';
 import { EmptyState, ErrorState, LoadingState } from '../components/States';
 import { MenuButton } from '../components/Menu';
 import { DuplicateBadge } from '../components/DuplicateBadge';
+import { TrackMenu } from '../components/TrackMenu';
+import { DeleteTrackDialog } from '../components/DeleteTrackDialog';
 import { useToast } from '../components/Toasts';
 import { useDebounced, useResource } from '../lib/hooks';
-import { useLive } from '../lib/live';
 import { useAudio } from '../lib/audio';
-import { api, errorMessage, trackDownloadUrl } from '../lib/api';
-import { formatBytes, formatCount, formatDuration, pluralRu, tracksLabel } from '../lib/format';
+import { useLive } from '../lib/live';
+import { api, errorMessage } from '../lib/api';
+import { formatBytes, formatCount, formatDuration, tracksLabel } from '../lib/format';
 import { isAcceptedAudioFile } from '../lib/upload';
 import { useUploads } from '../lib/uploads';
 import { notifyDataChanged, useDataChanged } from '../lib/refresh';
-import { triggerDownload } from '../lib/download';
 import { UploadDialog } from './UploadDialog';
 import { DecisionsDialog } from './DecisionsDialog';
 import { TrackEditorDialog } from './TrackEditorDialog';
@@ -75,9 +76,8 @@ function HeaderCheckbox({
 export function LibraryPage() {
   const toast = useToast();
   const [searchParams, setSearchParams] = useSearchParams();
-  const { now } = useLive();
   const audio = useAudio();
-  const desired = now?.station.desired ?? 'stopped';
+  const { now } = useLive();
 
   const [searchInput, setSearchInput] = useState('');
   const query = useDebounced(searchInput, 350);
@@ -112,8 +112,8 @@ export function LibraryPage() {
 
   const [editTrack, setEditTrack] = useState<Track | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<Track | null>(null);
-  const [deleteBusy, setDeleteBusy] = useState(false);
   const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false);
+  const [bulkMode, setBulkMode] = useState<'after' | 'now'>('after');
   const [bulkBusy, setBulkBusy] = useState(false);
   const [addToPlaylistOpen, setAddToPlaylistOpen] = useState(false);
   const [addTargetPlaylist, setAddTargetPlaylist] = useState('');
@@ -218,6 +218,7 @@ export function LibraryPage() {
   const allSelected = pageItems.length > 0 && pageItems.every((track) => selected.has(track.id));
   const someSelected = pageItems.some((track) => selected.has(track.id));
   const selectedIds = Array.from(selected);
+  const currentSelected = Boolean(now?.track?.id && selected.has(now.track.id));
 
   const openExport = (composition: ExportComposition) => {
     setExportComposition(composition);
@@ -243,34 +244,17 @@ export function LibraryPage() {
     };
   };
 
-  const confirmDelete = async () => {
-    if (!deleteTarget) return;
-    setDeleteBusy(true);
-    try {
-      const result = await api.admin.tracks.remove(deleteTarget.id);
-      toast.notify(
-        'success',
-        result.pending
-          ? 'Трек удалится после смены трека в эфире'
-          : 'Трек удалён из медиатеки и плейлистов',
-      );
-      setDeleteTarget(null);
-      void tracks.reload(true);
-      void playlists.reload(true);
-      notifyDataChanged();
-    } catch (caught) {
-      toast.notify('error', errorMessage(caught));
-    } finally {
-      setDeleteBusy(false);
-    }
-  };
-
   const confirmBulkDelete = async () => {
     if (selectedIds.length === 0) return;
     setBulkBusy(true);
     try {
-      await api.admin.tracks.bulkDelete(selectedIds);
-      toast.notify('success', `Удалено треков: ${selectedIds.length}`);
+      const result = await api.admin.tracks.bulkDelete(selectedIds, bulkMode);
+      toast.notify(
+        'success',
+        result.skipped
+          ? `Помечено на удаление: ${result.marked.length}. Эфир переключён на следующий трек`
+          : `Помечено на удаление: ${result.marked.length}. Файлы удалятся после освобождения движком`,
+      );
       setBulkDeleteOpen(false);
       setSelected(new Set());
       void tracks.reload(true);
@@ -286,8 +270,17 @@ export function LibraryPage() {
     if (!addTargetPlaylist || selectedIds.length === 0) return;
     setBulkBusy(true);
     try {
-      await api.admin.playlists.addTracks(addTargetPlaylist, selectedIds);
-      toast.notify('success', `Добавлено треков: ${selectedIds.length}`);
+      const result = await api.admin.playlists.addTracks(addTargetPlaylist, selectedIds);
+      if (result.added > 0) {
+        toast.notify('success', `Добавлено треков: ${result.added}`);
+      } else if (result.skipped > 0 && result.unavailable === 0) {
+        toast.notify('info', 'Все выбранные треки уже в плейлисте');
+      } else {
+        toast.notify(
+          'info',
+          `Добавлено: ${result.added} · пропущено: ${result.skipped} · недоступно: ${result.unavailable}`,
+        );
+      }
       setAddToPlaylistOpen(false);
       setSelected(new Set());
       void playlists.reload(true);
@@ -326,15 +319,6 @@ export function LibraryPage() {
     }
     setPreviewTrack(null);
     setPreviewPlaying(false);
-  };
-
-  const trackAction = async (action: () => Promise<void>, message: string) => {
-    try {
-      await action();
-      toast.notify('success', message);
-    } catch (caught) {
-      toast.notify('error', errorMessage(caught));
-    }
   };
 
   const sortHeader = (field: TrackSortField, label: string) => {
@@ -485,7 +469,15 @@ export function LibraryPage() {
             >
               Скачать
             </Button>
-            <Button variant="danger" size="sm" icon={Trash2} onClick={() => setBulkDeleteOpen(true)}>
+            <Button
+              variant="danger"
+              size="sm"
+              icon={Trash2}
+              onClick={() => {
+                setBulkMode('after');
+                setBulkDeleteOpen(true);
+              }}
+            >
               Удалить
             </Button>
             <Button variant="ghost" size="sm" onClick={() => setSelected(new Set())}>
@@ -606,67 +598,10 @@ export function LibraryPage() {
                         </td>
                         <td className="col-duration">{formatDuration(track.duration)}</td>
                         <td className="col-menu">
-                          <MenuButton
-                            label={`Действия с треком ${track.title}`}
-                            items={[
-                              {
-                                label: isPreview && previewPlaying ? 'Пауза' : 'Слушать',
-                                icon: isPreview && previewPlaying ? Pause : Play,
-                                onSelect: () => togglePreview(track),
-                              },
-                              {
-                                label: 'В эфир сейчас',
-                                icon: Music4,
-                                separatorBefore: true,
-                                disabled: desired !== 'playing',
-                                hint: 'Сначала запустите эфир',
-                                onSelect: () =>
-                                  void trackAction(
-                                    () => api.admin.tracks.playNow(track.id),
-                                    'Трек отправлен в эфир',
-                                  ),
-                              },
-                              {
-                                label: 'Следующим треком',
-                                disabled: desired !== 'playing',
-                                hint: 'Сначала запустите эфир',
-                                onSelect: () =>
-                                  void trackAction(
-                                    () => api.admin.tracks.playNext(track.id),
-                                    'Трек поставлен следующим',
-                                  ),
-                              },
-                              {
-                                label: 'В очередь',
-                                onSelect: () =>
-                                  void trackAction(
-                                    () => api.admin.tracks.enqueue(track.id),
-                                    'Трек добавлен в очередь',
-                                  ),
-                              },
-                              {
-                                label: 'Изменить трек',
-                                separatorBefore: true,
-                                onSelect: () => setEditTrack(track),
-                              },
-                              {
-                                label: 'Скачать трек',
-                                icon: Download,
-                                onSelect: () => triggerDownload(trackDownloadUrl(track.id, 'tags')),
-                              },
-                              {
-                                label: 'Скачать оригинал',
-                                icon: Download,
-                                onSelect: () =>
-                                  triggerDownload(trackDownloadUrl(track.id, 'original')),
-                              },
-                              {
-                                label: 'Удалить',
-                                danger: true,
-                                separatorBefore: true,
-                                onSelect: () => setDeleteTarget(track),
-                              },
-                            ]}
+                          <TrackMenu
+                            track={track}
+                            onEdit={setEditTrack}
+                            onDelete={setDeleteTarget}
                           />
                         </td>
                       </tr>
@@ -782,41 +717,60 @@ export function LibraryPage() {
         onClose={() => setExportComposition(null)}
       />
 
-      <ConfirmDialog
+      <DeleteTrackDialog
         open={deleteTarget !== null}
-        title="Удалить трек?"
-        description={
-          deleteTarget ? (
-            <>
-              Трек «{deleteTarget.title}» будет удалён из медиатеки и всех плейлистов
-              {deleteTarget.playlistsCount
-                ? ` (${deleteTarget.playlistsCount} ${pluralRu(deleteTarget.playlistsCount, [
-                    'плейлист',
-                    'плейлиста',
-                    'плейлистов',
-                  ])})`
-                : ''}
-              . Если трек сейчас в эфире, удаление произойдёт после смены трека.
-            </>
-          ) : null
-        }
-        confirmLabel="Удалить"
-        danger
-        busy={deleteBusy}
-        onConfirm={() => void confirmDelete()}
-        onCancel={() => setDeleteTarget(null)}
+        track={deleteTarget}
+        onClose={() => setDeleteTarget(null)}
+        onDeleted={() => {
+          void tracks.reload(true);
+          void playlists.reload(true);
+        }}
       />
 
-      <ConfirmDialog
+      <Modal
         open={bulkDeleteOpen}
+        onClose={() => (bulkBusy ? undefined : setBulkDeleteOpen(false))}
         title="Удалить выбранные треки?"
-        description={`Будут удалены ${selectedIds.length} трек(ов) из медиатеки и всех плейлистов. Действие необратимо.`}
-        confirmLabel="Удалить"
-        danger
-        busy={bulkBusy}
-        onConfirm={() => void confirmBulkDelete()}
-        onCancel={() => setBulkDeleteOpen(false)}
-      />
+        size="sm"
+        footer={
+          <>
+            <Button variant="ghost" onClick={() => setBulkDeleteOpen(false)} disabled={bulkBusy}>
+              Отмена
+            </Button>
+            <Button variant="danger" onClick={() => void confirmBulkDelete()} loading={bulkBusy}>
+              Удалить ({selectedIds.length})
+            </Button>
+          </>
+        }
+      >
+        <p className="confirm-text">
+          Треки исчезнут из медиатеки, «Всей медиатеки» и плейлистов. Действие необратимо.
+        </p>
+        {currentSelected && (
+          <div className="delete-mode" role="radiogroup" aria-label="Когда удалить выбранные треки">
+            <button
+              type="button"
+              role="radio"
+              aria-checked={bulkMode === 'after'}
+              className={`delete-mode__option ${bulkMode === 'after' ? 'is-active' : ''}`.trim()}
+              onClick={() => setBulkMode('after')}
+            >
+              <strong>После завершения трека</strong>
+              <span>Эфир не прервётся; файлы удалятся после освобождения движком.</span>
+            </button>
+            <button
+              type="button"
+              role="radio"
+              aria-checked={bulkMode === 'now'}
+              className={`delete-mode__option ${bulkMode === 'now' ? 'is-active' : ''}`.trim()}
+              onClick={() => setBulkMode('now')}
+            >
+              <strong>Сразу</strong>
+              <span>Текущий трек будет заменён следующим доступным, затем файлы удалятся.</span>
+            </button>
+          </div>
+        )}
+      </Modal>
 
       <Modal
         open={addToPlaylistOpen}

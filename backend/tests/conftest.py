@@ -49,13 +49,20 @@ class FakeEngine:
         self.commands.append("vd_sync")
         return self.sync_ok
 
-    def sync_report(self) -> dict:
+    def sync_report(self, expected_ids=None) -> dict:
         if self.sync_report_result is not None:
             self.sync_calls += 1
             self.commands.append("vd_sync")
             return dict(self.sync_report_result)
-        ok = self.sync()
-        return {"ok": ok, "resolved": None, "failed": 0, "reply": "OK" if ok else ""}
+        self.sync_calls += 1
+        self.commands.append("vd_sync")
+        if not self.sync_ok:
+            return {"ok": False, "resolved": None, "failed": 0, "reply": ""}
+        ids = list(expected_ids or [])
+        reply = "\n".join(
+            ["OK"] + [f"ok {identifier}" for identifier in ids] + ["END"]
+        )
+        return {"ok": True, "resolved": len(ids), "failed": 0, "reply": reply}
 
     def skip(self) -> bool:
         self.skip_calls += 1

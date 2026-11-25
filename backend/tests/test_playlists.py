@@ -172,15 +172,18 @@ def test_add_tracks_counts_existing_relation_before_file_check(env, admin):
     assert readable_result["unavailable"] == 0
 
 
-def test_playlist_play_sets_override_and_plays(env, admin):
+def test_playlist_play_sets_permanent_mode_without_override(env, admin):
     track = _upload(env, "play", "Запуск")
     playlist = make_playlist(env.client, "Эфир", [track["id"]])
     response = env.client.post(f"/api/admin/playlists/{playlist['id']}/play", json={"mode": "now"})
     assert response.status_code == 200
     body = response.json()
     assert body["started"] is True
+    assert body["status"] in ("applied", "switching")
     assert body["playlist"]["id"] == playlist["id"]
     assert body["station"]["desired"] == "playing"
+    assert body["station"]["mode"] == "playlist"
+    assert body["station"]["program_playlist_id"] == playlist["id"]
     queue = env.client.get("/api/admin/queue").json()["items"]
     assert queue and queue[0]["track"]["id"] == track["id"]
     started = play_next(env)
@@ -188,18 +191,15 @@ def test_playlist_play_sets_override_and_plays(env, admin):
 
     conn = db.open_db(env.settings)
     try:
-        assert conn.execute("SELECT COUNT(*) FROM overrides WHERE active = 1").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM overrides WHERE active = 1").fetchone()[0] == 0
+        assert db.get_setting(conn, "playback_mode") == "playlist"
+        assert db.get_setting(conn, "selected_playlist_id") == playlist["id"]
     finally:
         conn.close()
 
     cleared = env.client.delete("/api/admin/station/override")
     assert cleared.status_code == 200
-    conn = db.open_db(env.settings)
-    try:
-        active = conn.execute("SELECT COUNT(*) FROM overrides WHERE active = 1").fetchone()[0]
-    finally:
-        conn.close()
-    assert active == 0
+    assert cleared.json()["mode"] == "playlist"
 
 
 def test_playlist_cover_uses_first_track_cover(env, admin):

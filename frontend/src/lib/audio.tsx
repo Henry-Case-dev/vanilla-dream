@@ -1,10 +1,17 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { useLive } from './live';
+import {
+  PlaybackController,
+  type PlaybackAdapter,
+  type PlaybackIntent,
+  type PlaybackSnapshot,
+  type PlaybackState,
+} from './player-controller';
 
 const VOLUME_KEY = 'vd-radio-volume';
 
-export type LocalPlaybackState = 'idle' | 'connecting' | 'playing' | 'reconnecting' | 'error';
+export type LocalPlaybackState = PlaybackState;
 
 export interface AudioApi {
   /** Локальное прослушивание потока — не влияет на эфир и очередь станции. */
@@ -15,8 +22,11 @@ export interface AudioApi {
   canPlay: boolean;
   unavailableReason: string | null;
   state: LocalPlaybackState;
+  intent: PlaybackIntent;
   play: () => Promise<void>;
   stop: () => void;
+  cancel: () => void;
+  reconnect: () => void;
   toggle: () => Promise<void>;
   setVolume: (value: number) => void;
 }
@@ -34,10 +44,18 @@ function readVolume(): number {
   return 0.8;
 }
 
+const IDLE_SNAPSHOT: PlaybackSnapshot = {
+  intent: 'idle',
+  state: 'idle',
+  error: null,
+  attempts: 0,
+};
+
 export function AudioProvider({ children }: { children: ReactNode }) {
   const { now } = useLive();
   const streamUrl = now?.station.streamUrl ?? '';
   const desired = now?.station.desired ?? 'stopped';
+  const status = now?.station.status ?? 'unknown';
   const unavailableReason = !streamUrl
     ? 'Ссылка на поток ещё не получена от сервера'
     : desired !== 'playing'
@@ -45,22 +63,18 @@ export function AudioProvider({ children }: { children: ReactNode }) {
       : null;
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
-  const [playing, setPlaying] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [snapshot, setSnapshot] = useState<PlaybackSnapshot>(IDLE_SNAPSHOT);
   const [volume, setVolumeState] = useState(readVolume);
-  const [state, setState] = useState<LocalPlaybackState>('idle');
-
-  const playingRef = useRef(false);
-  const retryRef = useRef(0);
   const volumeRef = useRef(volume);
-  const urlRef = useRef(streamUrl);
+  const streamRef = useRef(streamUrl);
   const desiredRef = useRef(desired);
+  const statusRef = useRef(status);
+  const controllerRef = useRef<PlaybackController | null>(null);
 
-  playingRef.current = playing;
   volumeRef.current = volume;
-  urlRef.current = streamUrl;
+  streamRef.current = streamUrl;
   desiredRef.current = desired;
+  statusRef.current = status;
 
   useEffect(() => {
     const element = audioRef.current;
@@ -72,118 +86,124 @@ export function AudioProvider({ children }: { children: ReactNode }) {
     }
   }, [volume]);
 
-  const play = useCallback(async () => {
+  useEffect(() => {
     const element = audioRef.current;
-    const url = urlRef.current;
     if (!element) return;
-    if (!url) {
-      setError('Ссылка на поток ещё не получена от сервера');
-      return;
-    }
-    setBusy(true);
-    try {
-      const absolute = new URL(url, window.location.href).toString();
-      if (element.src !== absolute) {
+    const adapter: PlaybackAdapter = {
+      setSource: (url) => {
         element.src = url;
         element.load();
-      }
-      element.volume = volumeRef.current;
-      await element.play();
-      setPlaying(true);
-      setState('playing');
-      setError(null);
-    } catch (caught) {
-      setPlaying(false);
-      setState('error');
-      if (caught instanceof DOMException && caught.name === 'NotAllowedError') {
-        setError('Браузер заблокировал воспроизведение. Нажмите кнопку ещё раз.');
-      } else {
-        setError('Не удалось подключиться к потоку. Проверьте соединение.');
-      }
-    } finally {
-      setBusy(false);
-    }
+      },
+      play: () => element.play(),
+      pause: () => element.pause(),
+      reset: () => {
+        element.pause();
+        element.removeAttribute('src');
+        element.load();
+      },
+      isPlaying: () => !element.paused && !element.ended && element.readyState >= 2,
+      currentTime: () => element.currentTime,
+    };
+    const controller = new PlaybackController({
+      adapter,
+      getStation: () => ({
+        desired: desiredRef.current,
+        status: statusRef.current,
+        streamUrl: streamRef.current,
+      }),
+      onChange: setSnapshot,
+    });
+    controllerRef.current = controller;
+    controller.setStation({
+      desired: desiredRef.current,
+      status: statusRef.current,
+      streamUrl: streamRef.current,
+    });
+    controller.start();
+
+    const onOnline = () => controller.accelerate();
+    window.addEventListener('online', onOnline);
+
+    return () => {
+      window.removeEventListener('online', onOnline);
+      controller.destroy();
+      controllerRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    controllerRef.current?.setStation({
+      desired,
+      status,
+      streamUrl,
+    });
+  }, [desired, status, streamUrl]);
+
+  const play = useCallback(async () => {
+    controllerRef.current?.play();
   }, []);
 
   const stop = useCallback(() => {
-    const element = audioRef.current;
-    retryRef.current = 0;
-    if (element) {
-      element.pause();
-      element.removeAttribute('src');
-      element.load();
-    }
-    setPlaying(false);
-    setState('idle');
-    setError(null);
+    controllerRef.current?.stop();
+  }, []);
+
+  const cancel = useCallback(() => {
+    controllerRef.current?.cancel();
+  }, []);
+
+  const reconnect = useCallback(() => {
+    controllerRef.current?.reconnect();
   }, []);
 
   const toggle = useCallback(async () => {
-    if (playingRef.current) {
+    if (snapshot.state === 'blocked' || snapshot.state === 'unavailable') {
+      reconnect();
+      return;
+    }
+    if (snapshot.intent !== 'idle') {
       stop();
       return;
     }
     await play();
-  }, [play, stop]);
-
-  useEffect(() => {
-    if (desired === 'playing') return;
-    if (!playingRef.current) return;
-    stop();
-  }, [desired, stop]);
+  }, [snapshot.intent, snapshot.state, play, reconnect, stop]);
 
   const setVolume = useCallback((value: number) => {
     const clamped = Math.min(1, Math.max(0, value));
     setVolumeState(clamped);
   }, []);
 
-  const handlePlaying = useCallback(() => {
-    retryRef.current = 0;
-    setPlaying(true);
-    setState('playing');
-    setError(null);
-  }, []);
-
-  const handlePause = useCallback(() => {
-    setPlaying(false);
-    setState('idle');
-  }, []);
-
-  const handleError = useCallback(() => {
-    if (!playingRef.current) return;
-    if (retryRef.current >= 2) {
-      setPlaying(false);
-      setError('Поток недоступен. Проверьте соединение и попробуйте снова.');
-      return;
-    }
-    retryRef.current += 1;
-    setError('Соединение с потоком прервано, переподключение…');
-    window.setTimeout(() => {
-      const element = audioRef.current;
-      const url = urlRef.current;
-      if (!element || !url || !playingRef.current) return;
-      const separator = url.includes('?') ? '&' : '?';
-      element.src = `${url}${separator}t=${Date.now()}`;
-      element.load();
-      void element.play().catch(() => undefined);
-    }, 3000);
-  }, []);
-
   const value = useMemo<AudioApi>(
     () => ({
-      playing,
-      busy,
+      playing: snapshot.state === 'playing',
+      busy: snapshot.state === 'connecting' || snapshot.state === 'reconnecting',
       volume,
-      error,
+      error: snapshot.error,
       canPlay: Boolean(streamUrl) && desired === 'playing',
       unavailableReason,
-      state,
+      state: snapshot.state,
+      intent: snapshot.intent,
       play,
       stop,
+      cancel,
+      reconnect,
       toggle,
       setVolume,
     }),
-    [playing, busy, volume, error, streamUrl, desired, unavailableReason, state, play, stop, toggle, setVolume],
+    [
+      snapshot.state,
+      snapshot.error,
+      snapshot.intent,
+      volume,
+      streamUrl,
+      desired,
+      unavailableReason,
+      play,
+      stop,
+      cancel,
+      reconnect,
+      toggle,
+      setVolume,
+    ],
   );
 
   return (
@@ -191,11 +211,17 @@ export function AudioProvider({ children }: { children: ReactNode }) {
       {children}
       <audio
         ref={audioRef}
+        data-local-audio="1"
         preload="none"
-        onPlaying={handlePlaying}
-        onPause={handlePause}
-        onEnded={handlePause}
-        onError={handleError}
+        onPlaying={() => controllerRef.current?.notify('playing')}
+        onPause={() => controllerRef.current?.notify('pause')}
+        onEnded={() => controllerRef.current?.notify('ended')}
+        onWaiting={() => controllerRef.current?.notify('waiting')}
+        onStalled={() => controllerRef.current?.notify('stalled')}
+        onError={() => controllerRef.current?.notify('error')}
+        onAbort={() => controllerRef.current?.notify('abort')}
+        onEmptied={() => controllerRef.current?.notify('emptied')}
+        onTimeUpdate={() => controllerRef.current?.notify('timeupdate')}
       />
     </AudioContext.Provider>
   );

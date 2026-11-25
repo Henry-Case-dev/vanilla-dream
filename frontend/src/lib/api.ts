@@ -1,8 +1,19 @@
 import type {
   AddTracksResult,
+  ApplicationState,
+  BulkDeleteResult,
   ConflictInfo,
   DecisionAction,
+  DeleteMode,
+  DeleteTrackResult,
   DuplicateKind,
+  EffectiveSource,
+  OverrideInfo,
+  PendingSource,
+  PlaybackMode,
+  PlaylistUpdateResult,
+  RepeatGovernedBy,
+  StationModeResult,
   ExportCreateResult,
   ExportFile,
   ExportJob,
@@ -18,6 +29,7 @@ import type {
   PendingUpload,
   Playlist,
   PlaylistDetail,
+  PlaylistPlayResult,
   QueueItem,
   QueueSnapshot,
   RadioLink,
@@ -30,6 +42,7 @@ import type {
   ScheduleRuleInput,
   ServiceInfo,
   Settings,
+  StationState,
   StationStatus,
   StorageInfo,
   Track,
@@ -328,6 +341,9 @@ function normalizeTrack(raw: unknown): Track | null {
     duplicateKind: normalizeDuplicateKind(raw.duplicate_kind),
     duplicateOf: asStringOrNull(raw.duplicate_of),
     canRevertCover: asBoolean(raw.can_revert_cover),
+    originalCoverUrl: asStringOrNull(
+      raw.original_cover_url ?? raw.source_cover_url ?? raw.extracted_cover_url,
+    ),
     sourceFilename: asStringOrNull(raw.source_filename),
     createdAt: asStringOrNull(raw.created_at),
     playlistsCount: asNumber(raw.playlists_count),
@@ -353,11 +369,89 @@ function normalizeNowTrack(raw: unknown): NowTrack | null {
   };
 }
 
+function normalizePlaybackMode(value: unknown, fallback: PlaybackMode = 'playlist'): PlaybackMode {
+  return value === 'auto' || value === 'playlist' ? value : fallback;
+}
+
+function normalizeEffectiveSource(raw: unknown): EffectiveSource | null {
+  if (!isObject(raw)) return null;
+  const kind = asString(raw.kind);
+  if (!kind) return null;
+  return {
+    kind,
+    playlistId: asStringOrNull(raw.playlist_id ?? raw.playlistId),
+    name: asStringOrNull(raw.name),
+    reason: asStringOrNull(raw.reason),
+  };
+}
+
+function normalizeRepeatGovernedBy(value: unknown): RepeatGovernedBy {
+  return value === 'playlist' || value === 'rotation' ? value : null;
+}
+
+function normalizeApplication(value: unknown): ApplicationState {
+  return value === 'applied' || value === 'pending' ? value : 'saved';
+}
+
+function normalizePendingSource(raw: unknown): PendingSource | null {
+  if (!isObject(raw)) return null;
+  const playlistId = asStringOrNull(raw.playlist_id ?? raw.playlistId);
+  if (!playlistId) return null;
+  return {
+    playlistId,
+    mode: normalizePlaybackMode(raw.mode),
+    requestedAt: asStringOrNull(raw.requested_at ?? raw.requestedAt),
+  };
+}
+
+function normalizeOverride(raw: unknown): OverrideInfo | null {
+  if (!isObject(raw)) return null;
+  return {
+    id: asString(raw.id),
+    kind: asString(raw.kind) || 'override',
+    playlistId: asStringOrNull(raw.playlist_id ?? raw.playlistId),
+    playlistName: asStringOrNull(raw.playlist_name ?? raw.playlistName),
+    scope: asString(raw.scope),
+    expiresAt: asStringOrNull(raw.expires_at ?? raw.expiresAt),
+    active: asBoolean(raw.active, true),
+    createdAt: asStringOrNull(raw.created_at ?? raw.createdAt),
+    note: asStringOrNull(raw.note),
+  };
+}
+
+export function normalizeStationState(raw: unknown): StationState {
+  const data = requireObject(raw, 'состояние станции');
+  const state = isObject(data.state) ? data.state : data;
+  const status = normalizeStatus(state.status);
+  return {
+    mode: normalizePlaybackMode(state.mode ?? state.playback_mode),
+    selectedPlaylistId: asStringOrNull(state.selected_playlist_id),
+    programPlaylistId: asStringOrNull(state.program_playlist_id),
+    effectiveSource: normalizeEffectiveSource(
+      state.effective_source ?? state.effectiveSource ?? state.source,
+    ),
+    pendingSource: normalizePendingSource(state.pending_source ?? state.pendingSource),
+    override: normalizeOverride(state.override),
+    desired: state.desired === 'stopped' ? 'stopped' : 'playing',
+    status: status === 'unknown' ? 'unknown' : status,
+    reason: asStringOrNull(state.reason),
+    repeatGovernedBy: normalizeRepeatGovernedBy(state.repeat_governed_by),
+    engineInstance: asStringOrNull(state.engine_instance),
+    revision: asNumber(state.state_revision ?? state.revision) ?? 0,
+    appliedRevision: asNumber(state.applied_revision),
+    notice: asStringOrNull(state.notice),
+    diagnosticReason: asStringOrNull(state.diagnostic_reason),
+  };
+}
+
 function normalizeNowStation(raw: unknown): NowStation {
   const station = requireObject(raw, 'станция в now-playing');
   const status = normalizeStatus(station.status);
   if (status === 'unknown') throw contractError('неизвестный статус станции');
   const desired = station.desired === 'playing' ? 'playing' : 'stopped';
+  const effectiveSource = normalizeEffectiveSource(
+    station.effective_source ?? station.effectiveSource ?? station.source,
+  );
   return {
     name: asString(station.name, 'Vanilla Dream Radio'),
     description: asStringOrNull(station.description),
@@ -370,6 +464,15 @@ function normalizeNowStation(raw: unknown): NowStation {
     plsUrl: asString(station.pls_url),
     baseUrl: asString(station.base_url) || window.location.origin,
     bitrate: asNumber(station.bitrate),
+    mode: normalizePlaybackMode(station.mode ?? station.playback_mode),
+    programPlaylistId: asStringOrNull(station.program_playlist_id),
+    effectiveSource,
+    pendingSource: normalizePendingSource(station.pending_source ?? station.pendingSource),
+    override: normalizeOverride(station.override),
+    repeatGovernedBy: normalizeRepeatGovernedBy(station.repeat_governed_by),
+    revision: asNumber(station.state_revision ?? station.revision) ?? 0,
+    notice: asStringOrNull(station.notice),
+    diagnosticReason: asStringOrNull(station.diagnostic_reason),
   };
 }
 
@@ -407,6 +510,8 @@ export function normalizeNowPlaying(raw: unknown): NowPlaying {
       ? { at: asString(nextSchedule.at), ruleName: asStringOrNull(nextSchedule.rule_name) }
       : null,
     statsAvailable: asBoolean(data.stats_available),
+    queueRevision: asNumber(data.queue_revision),
+    historyRevision: asNumber(data.history_revision),
   };
 }
 
@@ -443,6 +548,7 @@ export function normalizePlaylist(raw: unknown): Playlist {
     createdAt: asStringOrNull(data.created_at),
     updatedAt: asStringOrNull(data.updated_at),
     pendingDeleteCount: asNumber(data.pending_delete_count),
+    repeatGovernedBy: normalizeRepeatGovernedBy(data.repeat_governed_by),
   };
 }
 
@@ -468,6 +574,11 @@ export function normalizeAddTracksResult(raw: unknown): AddTracksResult {
     skipped: requireNumber(data.skipped, 'skipped'),
     unavailable: requireNumber(data.unavailable, 'unavailable'),
     playlist: normalizePlaylist(data.playlist),
+    application: 'application' in data ? normalizeApplication(data.application) : null,
+    inCurrentCycle: asBoolean(data.in_current_cycle),
+    engineSynced: 'engine_synced' in data ? asBoolean(data.engine_synced) : null,
+    stateRevision: asNumber(data.state_revision),
+    appliedRevision: asNumber(data.applied_revision),
   };
 }
 
@@ -643,16 +754,24 @@ export function normalizeUploadResponse(raw: unknown): UploadResponse {
   const data = requireObject(raw, 'результат загрузки файла');
   const status = asString(data.status);
   const batchId = requireString(data.batch_id, 'batch_id');
+  const meta = {
+    application: 'application' in data ? normalizeApplication(data.application) : null,
+    inCurrentCycle: asBoolean(data.in_current_cycle),
+    engineSynced: 'engine_synced' in data ? asBoolean(data.engine_synced) : null,
+    stateRevision: asNumber(data.state_revision),
+    appliedRevision: asNumber(data.applied_revision),
+  };
   if (status === 'added') {
     const track = normalizeTrack(data.track);
     if (!track) throw contractError('добавленный трек');
-    return { status: 'added', track, batchId };
+    return { status: 'added', track, batchId, ...meta };
   }
   if (status === 'pending') {
     return {
       status: 'pending',
       pending: normalizePendingUpload(data.pending),
       batchId,
+      ...meta,
     };
   }
   throw contractError('статус загрузки файла');
@@ -798,6 +917,7 @@ function normalizeQueueItem(raw: unknown): QueueItem {
   const sourceText = typeof data.source === 'string' ? data.source : null;
   return {
     id,
+    position: asNumber(data.position),
     track,
     sourceKind: source
       ? asStringOrNull(source.kind)
@@ -822,6 +942,11 @@ export function normalizeQueueSnapshot(raw: unknown): QueueSnapshot {
     current,
     items,
     depth: asNumber(data.depth),
+    stateRevision: asNumber(data.state_revision),
+    engineSynced: 'engine_synced' in data ? asBoolean(data.engine_synced) : null,
+    appliedRevision: asNumber(data.applied_revision),
+    shuffled: asNumber(data.shuffled),
+    removed: asNumber(data.removed),
   };
 }
 
@@ -1017,6 +1142,8 @@ export function normalizeSettings(raw: unknown): Settings {
     maxUploadMb: Math.trunc(asNumber(data.max_upload_mb) ?? 300),
     maxLibraryGb: Math.trunc(asNumber(data.max_library_gb) ?? 0),
     desiredState: desired,
+    playbackMode: normalizePlaybackMode(data.playback_mode),
+    selectedPlaylistId: asStringOrNull(data.selected_playlist_id),
     engineLastStart: asString(data.engine_last_start, ''),
     engineLastError: asString(data.engine_last_error, ''),
   };
@@ -1107,10 +1234,24 @@ function normalizeTrackResponse(raw: unknown, what: string): Track {
   return track;
 }
 
-async function trackUpdate(id: string, patch: Record<string, unknown>): Promise<Track> {
+interface TrackEditorInput {
+  title: string;
+  artist: string | null;
+  album: string | null;
+  coverAction: 'keep' | 'replace' | 'revert';
+  cover?: File | null;
+}
+
+async function trackUpdate(id: string, payload: TrackEditorInput): Promise<Track> {
+  const form = new FormData();
+  form.append('title', payload.title);
+  form.append('artist', payload.artist ?? '');
+  form.append('album', payload.album ?? '');
+  form.append('cover_action', payload.coverAction);
+  if (payload.cover) form.append('cover', payload.cover, payload.cover.name);
   const raw = await request<unknown>(`/api/admin/tracks/${encodeURIComponent(id)}`, {
-    method: 'PATCH',
-    body: patch,
+    method: 'PUT',
+    body: form,
   });
   return normalizeTrackResponse(raw, 'обновлённый трек');
 }
@@ -1194,24 +1335,42 @@ export function exportArchiveUrl(jobId: string): string {
   return `/api/admin/exports/${encodeURIComponent(jobId)}/archive`;
 }
 
-interface DeleteTrackResult {
-  deleted: boolean;
-  playlistsCount: number | null;
-  pending: boolean;
-}
-
-async function trackDelete(id: string): Promise<DeleteTrackResult> {
-  const raw = await request<unknown>(`/api/admin/tracks/${encodeURIComponent(id)}`, { method: 'DELETE' });
+async function trackDelete(id: string, mode: DeleteMode = 'after'): Promise<DeleteTrackResult> {
+  const raw = await request<unknown>(`/api/admin/tracks/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+    body: { mode },
+  });
   const data = isObject(raw) ? raw : {};
   return {
     deleted: asBoolean(data.deleted, true),
     playlistsCount: asNumber(data.playlists_count),
     pending: asBoolean(data.pending),
+    mode: data.mode === 'now' ? 'now' : data.mode === 'after' ? 'after' : null,
+    current: asBoolean(data.current),
+    skipped: asBoolean(data.skipped),
   };
 }
 
-async function tracksBulkDelete(ids: string[]): Promise<void> {
-  await request<unknown>('/api/admin/tracks/bulk-delete', { method: 'POST', body: { ids } });
+function stringList(value: unknown, what: string): string[] {
+  return asArray(value).map((item) => requireString(item, what));
+}
+
+async function tracksBulkDelete(ids: string[], mode: DeleteMode = 'after'): Promise<BulkDeleteResult> {
+  const raw = await request<unknown>('/api/admin/tracks/bulk-delete', {
+    method: 'POST',
+    body: { ids, mode },
+  });
+  const data = requireObject(raw, 'результат массового удаления');
+  return {
+    marked: stringList(data.marked, 'marked'),
+    deleted: stringList(data.deleted, 'deleted'),
+    purged: stringList(data.purged, 'purged'),
+    pending: stringList(data.pending, 'pending'),
+    notFound: stringList(data.not_found, 'not_found'),
+    current: stringList(data.current, 'current'),
+    mode: data.mode === 'now' ? 'now' : 'after',
+    skipped: asBoolean(data.skipped),
+  };
 }
 
 async function trackPlayNow(id: string): Promise<void> {
@@ -1252,8 +1411,19 @@ async function playlistCreate(payload: { name: string; description?: string }): 
   return playlist;
 }
 
-async function playlistUpdate(id: string, patch: Record<string, unknown>): Promise<void> {
-  await request<unknown>(`/api/admin/playlists/${encodeURIComponent(id)}`, { method: 'PATCH', body: patch });
+async function playlistUpdate(id: string, patch: Record<string, unknown>): Promise<PlaylistUpdateResult> {
+  const raw = await request<unknown>(`/api/admin/playlists/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    body: patch,
+  });
+  const data = requireObject(raw, 'обновление плейлиста');
+  return {
+    playlist: normalizePlaylist(data.playlist ?? data),
+    application: normalizeApplication(data.application),
+    engineSynced: asBoolean(data.engine_synced),
+    stateRevision: asNumber(data.state_revision),
+    appliedRevision: asNumber(data.applied_revision),
+  };
 }
 
 async function playlistDelete(id: string): Promise<void> {
@@ -1283,11 +1453,50 @@ async function playlistReorder(id: string, trackIds: string[]): Promise<void> {
   });
 }
 
-async function playlistPlay(id: string, mode: 'now' | 'next' = 'now'): Promise<void> {
-  await request<unknown>(`/api/admin/playlists/${encodeURIComponent(id)}/play`, {
+async function playlistPlay(
+  id: string,
+  mode: 'now' | 'next' = 'now',
+  restart = false,
+): Promise<PlaylistPlayResult> {
+  const raw = await request<unknown>(`/api/admin/playlists/${encodeURIComponent(id)}/play`, {
     method: 'POST',
-    body: { mode },
+    body: { mode, restart },
   });
+  const data = requireObject(raw, 'результат запуска плейлиста');
+  const statusRaw = asString(data.status);
+  const status =
+    statusRaw === 'already_active' || statusRaw === 'applied' || statusRaw === 'switching'
+      ? statusRaw
+      : 'switching';
+  const playlist = data.playlist ? normalizePlaylist(data.playlist) : null;
+  if (!playlist) throw contractError('плейлист в результате запуска');
+  return {
+    status,
+    started: asBoolean(data.started),
+    engineSynced: asBoolean(data.engine_synced),
+    playlist,
+    station: data.station ? normalizeStationState(data.station) : null,
+    stateRevision: asNumber(data.state_revision),
+    appliedRevision: asNumber(data.applied_revision),
+  };
+}
+
+async function playlistRestart(id: string): Promise<PlaylistPlayResult> {
+  const raw = await request<unknown>(`/api/admin/playlists/${encodeURIComponent(id)}/restart`, {
+    method: 'POST',
+  });
+  const data = requireObject(raw, 'результат перезапуска плейлиста');
+  const playlist = data.playlist ? normalizePlaylist(data.playlist) : null;
+  if (!playlist) throw contractError('плейлист в результате перезапуска');
+  return {
+    status: 'switching',
+    started: asBoolean(data.started),
+    engineSynced: asBoolean(data.engine_synced),
+    playlist,
+    station: data.station ? normalizeStationState(data.station) : null,
+    stateRevision: asNumber(data.state_revision),
+    appliedRevision: asNumber(data.applied_revision),
+  };
 }
 
 async function playlistUploadCover(id: string, file: File): Promise<Playlist> {
@@ -1402,23 +1611,39 @@ async function queueGet(): Promise<QueueSnapshot> {
   return normalizeQueueSnapshot(await request<unknown>('/api/admin/queue'));
 }
 
-async function queueMove(id: string, moveTo: number): Promise<void> {
-  await request<unknown>(`/api/admin/queue/${encodeURIComponent(id)}`, {
-    method: 'PATCH',
-    body: { move_to: moveTo },
-  });
+async function queueMove(id: string, moveTo: number): Promise<QueueSnapshot> {
+  return normalizeQueueSnapshot(
+    await request<unknown>(`/api/admin/queue/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: { move_to: moveTo },
+    }),
+  );
 }
 
-async function queueRemove(id: string): Promise<void> {
-  await request<unknown>(`/api/admin/queue/${encodeURIComponent(id)}`, { method: 'DELETE' });
+async function queueRemove(id: string): Promise<QueueSnapshot> {
+  return normalizeQueueSnapshot(
+    await request<unknown>(`/api/admin/queue/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  );
 }
 
-async function queueShuffle(): Promise<void> {
-  await request<unknown>('/api/admin/queue/shuffle', { method: 'POST' });
+async function queueMoveNext(id: string): Promise<QueueSnapshot> {
+  return normalizeQueueSnapshot(
+    await request<unknown>(`/api/admin/queue/${encodeURIComponent(id)}/move-next`, {
+      method: 'POST',
+    }),
+  );
 }
 
-async function queueClearManual(): Promise<void> {
-  await request<unknown>('/api/admin/queue/clear-manual', { method: 'POST' });
+async function queueShuffle(): Promise<QueueSnapshot> {
+  return normalizeQueueSnapshot(
+    await request<unknown>('/api/admin/queue/shuffle', { method: 'POST' }),
+  );
+}
+
+async function queueClearManual(): Promise<QueueSnapshot> {
+  return normalizeQueueSnapshot(
+    await request<unknown>('/api/admin/queue/clear-manual', { method: 'POST' }),
+  );
 }
 
 /* ------------------------------------------------------------------ */
@@ -1427,6 +1652,40 @@ async function queueClearManual(): Promise<void> {
 
 async function stationAction(action: 'start' | 'stop' | 'restart' | 'skip'): Promise<void> {
   await request<unknown>(`/api/admin/station/${action}`, { method: 'POST' });
+}
+
+async function stationStateGet(): Promise<StationState> {
+  return normalizeStationState(await request<unknown>('/api/admin/station/state'));
+}
+
+async function stationModeSet(
+  mode: PlaybackMode,
+  playlistId?: string | null,
+): Promise<StationModeResult> {
+  const raw = await request<unknown>('/api/admin/station/mode', {
+    method: 'PUT',
+    body: { mode, playlist_id: playlistId ?? undefined },
+  });
+  const data = requireObject(raw, 'смена режима станции');
+  return {
+    state: normalizeStationState(data),
+    engineSynced: asBoolean(data.engine_synced),
+    appliedRevision: asNumber(data.applied_revision),
+  };
+}
+
+async function setOverride(payload: {
+  playlistId: string;
+  scope?: 'until_schedule_change' | 'indefinite';
+}): Promise<void> {
+  await request<unknown>('/api/admin/station/override', {
+    method: 'POST',
+    body: {
+      kind: 'playlist',
+      scope: payload.scope ?? 'until_schedule_change',
+      playlist_id: payload.playlistId,
+    },
+  });
 }
 
 async function clearOverride(): Promise<void> {
@@ -1518,6 +1777,7 @@ export const api = {
       removeTrack: playlistRemoveTrack,
       reorder: playlistReorder,
       play: playlistPlay,
+      restart: playlistRestart,
       uploadCover: playlistUploadCover,
       resetCover: playlistResetCover,
       toRotation: playlistToRotation,
@@ -1537,6 +1797,7 @@ export const api = {
     queue: {
       get: queueGet,
       move: queueMove,
+      moveNext: queueMoveNext,
       remove: queueRemove,
       shuffle: queueShuffle,
       clearManual: queueClearManual,
@@ -1546,7 +1807,10 @@ export const api = {
       stop: () => stationAction('stop'),
       restart: () => stationAction('restart'),
       skip: () => stationAction('skip'),
+      setOverride,
       clearOverride,
+      state: stationStateGet,
+      setMode: stationModeSet,
     },
     settings: {
       get: settingsGet,
