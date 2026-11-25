@@ -147,6 +147,8 @@ def cmd_check_config(_args) -> int:
         ("музыки", settings.music_dir),
         ("обложек", settings.cover_dir),
         ("обложек плейлистов", settings.playlist_cover_dir),
+        ("ожидающих загрузок", settings.pending_dir),
+        ("экспорта", settings.export_dir),
         ("состояния движка", settings.engine_dir),
         ("ссылок очереди", settings.queue_link_dir),
         ("базы данных", settings.db_path.parent),

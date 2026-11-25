@@ -48,9 +48,20 @@ sudo -u "$RADIO_USER" /usr/bin/liquidsoap --check "$ETC_DIR/liquidsoap.liq" || d
 
 log "Ensuring runtime directories"
 install -d -o "$RADIO_USER" -g "$RADIO_USER" -m 0755 /srv/vanilla-dream-radio/covers/playlists
+install -d -o "$RADIO_USER" -g "$RADIO_USER" -m 0750 /srv/vanilla-dream-radio/music/.pending
+install -d -o "$RADIO_USER" -g "$RADIO_USER" -m 0750 /var/lib/vanilla-dream-radio/exports
 if ! grep -q '^VD_PLAYLIST_COVER_DIR=' "$ETC_DIR/env"; then
   printf 'VD_PLAYLIST_COVER_DIR=/srv/vanilla-dream-radio/covers/playlists\n' >> "$ETC_DIR/env"
 fi
+for line in \
+  'VD_PENDING_DIR=/srv/vanilla-dream-radio/music/.pending' \
+  'VD_EXPORT_DIR=/var/lib/vanilla-dream-radio/exports' \
+  'VD_UPLOAD_TTL_HOURS=24' \
+  'VD_EXPORT_TTL_HOURS=6' \
+  'VD_EXPORT_RESERVE_BYTES=536870912'; do
+  key="${line%%=*}"
+  grep -q "^${key}=" "$ETC_DIR/env" || printf '%s\n' "$line" >> "$ETC_DIR/env"
+done
 
 log "Syncing systemd units and related files"
 install -o root -g root -m 0644 "$REL/deploy/systemd/vanilla-dream-radio.slice" /etc/systemd/system/vanilla-dream-radio.slice

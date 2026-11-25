@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import {
   ChevronLeft,
+  Download,
   GripVertical,
   ImageOff,
   MoreHorizontal,
@@ -29,15 +30,19 @@ import { Cover } from '../components/Cover';
 import { ConfirmDialog, Modal } from '../components/Modal';
 import { EmptyState, ErrorState, LoadingState } from '../components/States';
 import { MenuButton } from '../components/Menu';
+import { DuplicateBadge } from '../components/DuplicateBadge';
 import { ManualOverrideBanner } from '../components/ManualOverrideBanner';
 import { useToast } from '../components/Toasts';
 import { useResource } from '../lib/hooks';
 import { useLive } from '../lib/live';
 import { useDataChanged, notifyDataChanged } from '../lib/refresh';
-import { api, errorMessage } from '../lib/api';
+import { api, errorMessage, trackDownloadUrl } from '../lib/api';
+import { triggerDownload } from '../lib/download';
 import { formatDuration, formatLongDuration, repeatLabel, tracksLabel } from '../lib/format';
-import type { AddTracksResult, RepeatMode, Track } from '../lib/types';
+import type { AddTracksResult, ExportComposition, RepeatMode, Track } from '../lib/types';
 import { AddTracksDialog } from './AddTracksDialog';
+import { TrackEditorDialog } from './TrackEditorDialog';
+import { ExportDialog } from './ExportDialog';
 
 const COVER_MAX_BYTES = 8 * 1024 * 1024;
 const COVER_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
@@ -60,6 +65,8 @@ export function PlaylistDetailPage() {
   const [removingId, setRemovingId] = useState<string | null>(null);
   const [addOpen, setAddOpen] = useState(false);
   const [editOpen, setEditOpen] = useState(false);
+  const [editTrack, setEditTrack] = useState<Track | null>(null);
+  const [exportComposition, setExportComposition] = useState<ExportComposition | null>(null);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [editName, setEditName] = useState('');
   const [editDescription, setEditDescription] = useState('');
@@ -328,6 +335,19 @@ export function PlaylistDetailPage() {
   const limited = tracksTotal > ordered.length;
   const canReorder = !isSystem && !savingOrder && !limited;
 
+  const openPlaylistExport = () => {
+    const sizeKnown = ordered.every((track) => track.size !== null);
+    setExportComposition({
+      scope: isSystem ? 'library' : 'playlist',
+      playlistId: isSystem ? undefined : playlist.id,
+      title: playlist.name,
+      coverUrl: playlist.coverUrl,
+      count: playlist.trackCount,
+      size: sizeKnown ? ordered.reduce((sum, track) => sum + (track.size ?? 0), 0) : null,
+      partialSize: limited,
+    });
+  };
+
   return (
     <div className="page page--playlist-detail">
       <Link to="/admin/playlists" className="back-link">
@@ -382,6 +402,15 @@ export function PlaylistDetailPage() {
               title={isEmpty ? 'В плейлисте нет доступных треков' : 'Запустить плейлист в эфир'}
             >
               В эфир
+            </Button>
+            <Button
+              variant="secondary"
+              icon={Download}
+              onClick={openPlaylistExport}
+              disabled={isEmpty}
+              title={isEmpty ? 'В плейлисте пока нет треков' : 'Скачать плейлист'}
+            >
+              Скачать
             </Button>
             <Button
               variant={playlist.shuffle ? 'secondary' : 'ghost'}
@@ -546,8 +575,11 @@ export function PlaylistDetailPage() {
                 </span>
                 <Cover src={track.coverUrl} alt="" size="xs" />
                 <div className="playlist-row__text">
-                  <span className="playlist-row__title" title={track.title}>
-                    {track.title}
+                  <span className="playlist-row__title-row">
+                    <span className="playlist-row__title" title={track.title}>
+                      {track.title}
+                    </span>
+                    {track.isDuplicate && <DuplicateBadge kind={track.duplicateKind} />}
                   </span>
                   <span className="playlist-row__artist">{track.artist ?? '—'}</span>
                 </div>
@@ -556,6 +588,37 @@ export function PlaylistDetailPage() {
                 </span>
                 <span className="playlist-row__duration">{formatDuration(track.duration)}</span>
                 <div className="playlist-row__actions">
+                  <MenuButton
+                    label={`Действия с треком ${track.title}`}
+                    items={[
+                      {
+                        label: 'Изменить трек',
+                        icon: Pencil,
+                        onSelect: () => setEditTrack(track),
+                      },
+                      {
+                        label: 'Скачать трек',
+                        icon: Download,
+                        onSelect: () => triggerDownload(trackDownloadUrl(track.id, 'tags')),
+                      },
+                      {
+                        label: 'Скачать оригинал',
+                        icon: Download,
+                        onSelect: () => triggerDownload(trackDownloadUrl(track.id, 'original')),
+                      },
+                      ...(!isSystem
+                        ? [
+                            {
+                              label: 'Убрать из плейлиста',
+                              icon: X,
+                              danger: true,
+                              separatorBefore: true,
+                              onSelect: () => void removeTrack(track),
+                            },
+                          ]
+                        : []),
+                    ]}
+                  />
                   {!isSystem && (
                     <>
                       <IconButton
@@ -711,6 +774,24 @@ export function PlaylistDetailPage() {
           onCancel={() => setDeleteOpen(false)}
         />
       )}
+
+      <TrackEditorDialog
+        open={editTrack !== null}
+        track={editTrack}
+        onClose={() => setEditTrack(null)}
+        onSaved={() => {
+          toast.notify('success', 'Трек сохранён');
+          setEditTrack(null);
+          void detail.reload(true);
+          notifyDataChanged();
+        }}
+      />
+
+      <ExportDialog
+        open={exportComposition !== null}
+        composition={exportComposition}
+        onClose={() => setExportComposition(null)}
+      />
     </div>
   );
 }

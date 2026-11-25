@@ -5,7 +5,7 @@ import {
   ArrowDown,
   ArrowUp,
   ArrowUpDown,
-  Check,
+  Download,
   ListPlus,
   Music4,
   Pause,
@@ -16,53 +16,37 @@ import {
   Upload,
   X,
 } from 'lucide-react';
-import type { Track, TrackSortField } from '../lib/types';
+import type { ExportComposition, Track, TrackSortField } from '../lib/types';
 import {
   Button,
   Equalizer,
   IconButton,
   PageHeader,
   Panel,
-  ProgressBar,
   SelectField,
-  Spinner,
   TextField,
 } from '../components/ui';
 import { Cover } from '../components/Cover';
 import { ConfirmDialog, Modal } from '../components/Modal';
 import { EmptyState, ErrorState, LoadingState } from '../components/States';
 import { MenuButton } from '../components/Menu';
+import { DuplicateBadge } from '../components/DuplicateBadge';
 import { useToast } from '../components/Toasts';
 import { useDebounced, useResource } from '../lib/hooks';
 import { useLive } from '../lib/live';
 import { useAudio } from '../lib/audio';
-import { api, ApiError, errorMessage } from '../lib/api';
+import { api, errorMessage, trackDownloadUrl } from '../lib/api';
 import { formatBytes, formatCount, formatDuration, pluralRu, tracksLabel } from '../lib/format';
-import { isAcceptedAudioFile, UPLOAD_ACCEPT, uploadTrack } from '../lib/upload';
-import { notifyDataChanged } from '../lib/refresh';
-import type { UploadHandle } from '../lib/upload';
+import { isAcceptedAudioFile } from '../lib/upload';
+import { useUploads } from '../lib/uploads';
+import { notifyDataChanged, useDataChanged } from '../lib/refresh';
+import { triggerDownload } from '../lib/download';
+import { UploadDialog } from './UploadDialog';
+import { DecisionsDialog } from './DecisionsDialog';
+import { TrackEditorDialog } from './TrackEditorDialog';
+import { ExportDialog } from './ExportDialog';
 
 const PAGE_SIZE = 50;
-
-type UploadStatus = 'queued' | 'uploading' | 'done' | 'error' | 'duplicate';
-
-interface UploadItem {
-  id: string;
-  file: File;
-  status: UploadStatus;
-  progress: number;
-  error: string | null;
-}
-
-interface EditForm {
-  title: string;
-  artist: string;
-  album: string;
-  genre: string;
-  year: string;
-}
-
-const emptyEditForm: EditForm = { title: '', artist: '', album: '', genre: '', year: '' };
 
 function HeaderCheckbox({
   checked,
@@ -127,8 +111,6 @@ export function LibraryPage() {
   }, [query, sort, order]);
 
   const [editTrack, setEditTrack] = useState<Track | null>(null);
-  const [editForm, setEditForm] = useState<EditForm>(emptyEditForm);
-  const [editBusy, setEditBusy] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<Track | null>(null);
   const [deleteBusy, setDeleteBusy] = useState(false);
   const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false);
@@ -141,6 +123,10 @@ export function LibraryPage() {
   const previewRef = useRef<HTMLAudioElement | null>(null);
 
   const [uploadOpen, setUploadOpen] = useState(false);
+  const [decisionsOpen, setDecisionsOpen] = useState(false);
+  const [decisionPendingId, setDecisionPendingId] = useState<string | null>(null);
+  const [exportComposition, setExportComposition] = useState<ExportComposition | null>(null);
+  const { batch, localItems, uploading, addFiles, refresh: refreshBatch } = useUploads();
 
   useEffect(() => {
     if (searchParams.get('upload') !== '1') return;
@@ -149,47 +135,28 @@ export function LibraryPage() {
     next.delete('upload');
     setSearchParams(next, { replace: true });
   }, [searchParams, setSearchParams]);
-  const [uploadItems, setUploadItems] = useState<UploadItem[]>([]);
-  const [uploadRunning, setUploadRunning] = useState(false);
+
   const [dragActive, setDragActive] = useState(false);
   const dragCounter = useRef(0);
-  const processing = useRef(false);
-  const activeUpload = useRef<UploadHandle | null>(null);
 
   const maxUploadMb = settings.data?.maxUploadMb ?? 300;
 
-  useEffect(() => {
-    if (editTrack) {
-      setEditForm({
-        title: editTrack.title,
-        artist: editTrack.artist ?? '',
-        album: editTrack.album ?? '',
-        genre: editTrack.genre ?? '',
-        year: editTrack.year ? String(editTrack.year) : '',
-      });
-    }
-  }, [editTrack]);
+  useDataChanged(() => void reloadTracks.current(true));
 
   /* ------------------------------ загрузка ------------------------------ */
 
-  const addFiles = (files: File[]) => {
+  const enqueueFiles = (files: File[]) => {
     if (files.length === 0) return;
     const accepted: File[] = [];
     let rejected = 0;
-    const tooBig: UploadItem[] = [];
+    let tooBig = 0;
     files.forEach((file) => {
       if (!isAcceptedAudioFile(file)) {
         rejected += 1;
         return;
       }
       if (file.size > maxUploadMb * 1024 * 1024) {
-        tooBig.push({
-          id: `${Date.now()}-${file.name}-${Math.random().toString(36).slice(2, 8)}`,
-          file,
-          status: 'error',
-          progress: 0,
-          error: `Файл больше ${maxUploadMb} МБ`,
-        });
+        tooBig += 1;
         return;
       }
       accepted.push(file);
@@ -197,111 +164,16 @@ export function LibraryPage() {
     if (rejected > 0) {
       toast.notify('error', `Пропущено файлов: ${rejected}. Поддерживаются MP3, FLAC, OGG, M4A`);
     }
-    const next: UploadItem[] = accepted.map((file, index) => ({
-      id: `${Date.now()}-${index}-${file.name}-${Math.random().toString(36).slice(2, 8)}`,
-      file,
-      status: 'queued',
-      progress: 0,
-      error: null,
-    }));
-    setUploadItems((items) => [...items, ...next, ...tooBig]);
+    if (tooBig > 0) {
+      toast.notify(
+        'error',
+        `Файлов больше ${maxUploadMb} МБ: ${tooBig}. Увеличьте лимит в настройках.`,
+      );
+    }
+    if (accepted.length === 0) return;
+    addFiles(accepted);
     setUploadOpen(true);
   };
-
-  useEffect(() => {
-    if (processing.current) return;
-    const next = uploadItems.find((item) => item.status === 'queued');
-    if (!next) {
-      setUploadRunning(false);
-      return;
-    }
-    processing.current = true;
-    setUploadRunning(true);
-    setUploadItems((items) =>
-      items.map((item) =>
-        item.id === next.id ? { ...item, status: 'uploading', progress: 0, error: null } : item,
-      ),
-    );
-
-    const handle = uploadTrack(next.file, {
-      onProgress: (percent) => {
-        setUploadItems((items) =>
-          items.map((item) => (item.id === next.id ? { ...item, progress: percent } : item)),
-        );
-      },
-    });
-    activeUpload.current = handle;
-
-    handle.promise
-      .then(() => {
-        setUploadItems((items) =>
-          items.map((item) =>
-            item.id === next.id ? { ...item, status: 'done', progress: 100 } : item,
-          ),
-        );
-        void reloadTracks.current(true);
-        notifyDataChanged();
-      })
-      .catch((caught) => {
-        const aborted = caught instanceof ApiError && caught.code === 'aborted';
-        const duplicate =
-          caught instanceof ApiError && (caught.code === 'duplicate' || caught.status === 409);
-        setUploadItems((items) =>
-          items.map((item) =>
-            item.id === next.id
-              ? {
-                  ...item,
-                  status: aborted ? 'error' : duplicate ? 'duplicate' : 'error',
-                  error: aborted ? 'Загрузка отменена' : errorMessage(caught),
-                }
-              : item,
-          ),
-        );
-      })
-      .finally(() => {
-        processing.current = false;
-        activeUpload.current = null;
-        setUploadItems((items) => [...items]);
-      });
-  }, [uploadItems]);
-
-  const cancelUploads = () => {
-    activeUpload.current?.abort();
-    setUploadItems((items) =>
-      items.map((item) =>
-        item.status === 'queued' || item.status === 'uploading'
-          ? { ...item, status: 'error', error: 'Загрузка отменена' }
-          : item,
-      ),
-    );
-  };
-
-  const retryFailed = () => {
-    setUploadItems((items) =>
-      items.map((item) =>
-        item.status === 'error' && item.error !== 'Файл больше допустимого размера'
-          ? { ...item, status: 'queued', progress: 0, error: null }
-          : item,
-      ),
-    );
-  };
-
-  const closeUpload = () => {
-    if (uploadRunning) {
-      toast.notify('info', 'Дождитесь завершения загрузки или отмените её');
-      return;
-    }
-    setUploadOpen(false);
-    setUploadItems((items) => items.filter((item) => item.status !== 'done'));
-  };
-
-  const uploadStats = uploadItems.reduce(
-    (acc, item) => {
-      acc[item.status] += 1;
-      return acc;
-    },
-    { queued: 0, uploading: 0, done: 0, error: 0, duplicate: 0 } as Record<UploadStatus, number>,
-  );
 
   /* ---------------------------- drag-and-drop --------------------------- */
 
@@ -328,7 +200,7 @@ export function LibraryPage() {
     event.preventDefault();
     dragCounter.current = 0;
     setDragActive(false);
-    addFiles(Array.from(event.dataTransfer.files));
+    enqueueFiles(Array.from(event.dataTransfer.files));
   };
 
   /* ------------------------------ действия ------------------------------ */
@@ -347,39 +219,28 @@ export function LibraryPage() {
   const someSelected = pageItems.some((track) => selected.has(track.id));
   const selectedIds = Array.from(selected);
 
-  const saveMetadata = async () => {
-    if (!editTrack) return;
-    if (!editForm.title.trim()) {
-      toast.notify('error', 'Название трека не может быть пустым');
-      return;
-    }
-    let year: number | null = null;
-    if (editForm.year.trim()) {
-      const parsed = Number.parseInt(editForm.year.trim(), 10);
-      if (!Number.isFinite(parsed) || parsed < 1900 || parsed > 2100) {
-        toast.notify('error', 'Год должен быть числом от 1900 до 2100');
-        return;
-      }
-      year = parsed;
-    }
-    setEditBusy(true);
-    try {
-      await api.admin.tracks.update(editTrack.id, {
-        title: editForm.title.trim(),
-        artist: editForm.artist.trim() || null,
-        album: editForm.album.trim() || null,
-        genre: editForm.genre.trim() || null,
-        year,
-      });
-      toast.notify('success', 'Метаданные сохранены');
-      setEditTrack(null);
-      void tracks.reload(true);
-      notifyDataChanged();
-    } catch (caught) {
-      toast.notify('error', errorMessage(caught));
-    } finally {
-      setEditBusy(false);
-    }
+  const openExport = (composition: ExportComposition) => {
+    setExportComposition(composition);
+  };
+
+  const libraryComposition = (): ExportComposition => ({
+    scope: 'library',
+    title: 'Вся медиатека',
+    coverUrl: null,
+    count: tracks.data?.library.count ?? 0,
+    size: tracks.data?.library.bytes ?? null,
+  });
+
+  const selectionComposition = (): ExportComposition => {
+    const items = pageItems.filter((track) => selected.has(track.id));
+    return {
+      scope: 'tracks',
+      ids: items.map((track) => track.id),
+      title: 'Выбранные треки',
+      coverUrl: items[0]?.coverUrl ?? null,
+      count: items.length,
+      size: items.reduce((sum, track) => sum + (track.size ?? 0), 0),
+    };
   };
 
   const confirmDelete = async () => {
@@ -526,120 +387,46 @@ export function LibraryPage() {
               title="Обновить список"
               onClick={() => void tracks.reload()}
             />
-            <Button variant="primary" icon={Upload} onClick={() => setUploadOpen((open) => !open)}>
+            <MenuButton
+              label="Скачать"
+              trigger="button"
+              buttonLabel="Скачать"
+              icon={Download}
+              items={[
+                {
+                  label: 'Скачать всю медиатеку',
+                  icon: Download,
+                  onSelect: () => openExport(libraryComposition()),
+                },
+                {
+                  label: 'Скачать выбранные треки',
+                  icon: Download,
+                  disabled: selectedIds.length === 0,
+                  hint: 'Сначала выберите треки в списке',
+                  onSelect: () => openExport(selectionComposition()),
+                },
+              ]}
+            />
+            {(batch || localItems.length > 0) && !uploadOpen && (
+              <Button
+                variant="secondary"
+                icon={Upload}
+                onClick={() => setUploadOpen(true)}
+                aria-label="Открыть загрузку музыки"
+              >
+                {uploading
+                  ? 'Загрузка идёт'
+                  : (batch?.counts.pending ?? 0) > 0
+                    ? `Совпадения: ${batch?.counts.pending}`
+                    : `Загрузка: ${batch?.total ?? localItems.length}`}
+              </Button>
+            )}
+            <Button variant="primary" icon={Upload} onClick={() => setUploadOpen(true)}>
               Загрузить
             </Button>
           </>
         }
       />
-
-      {uploadOpen && (
-        <Panel className="upload-panel">
-          <div className="panel-head">
-            <div>
-              <h2 className="panel-title">Загрузка музыки</h2>
-              <p className="panel-subtitle">
-                MP3, FLAC, OGG, M4A · до {maxUploadMb} МБ на файл
-                {settings.error ? ' · лимит из настроек недоступен, показано значение по умолчанию' : ''}
-              </p>
-            </div>
-            <IconButton icon={X} label="Свернуть загрузку" onClick={closeUpload} disabled={uploadRunning} />
-          </div>
-
-          <label className="dropzone">
-            <input
-              type="file"
-              multiple
-              accept={UPLOAD_ACCEPT}
-              className="visually-hidden"
-              aria-label="Выбрать аудиофайлы для загрузки"
-              onChange={(event) => {
-                addFiles(Array.from(event.target.files ?? []));
-                event.target.value = '';
-              }}
-            />
-            <Upload size={22} aria-hidden="true" />
-            <span className="dropzone__title">Перетащите файлы сюда или выберите на диске</span>
-            <span className="dropzone__hint">
-              Дубликаты и повреждённые файлы сервер отклонит — они останутся в списке с ошибкой
-            </span>
-          </label>
-
-          {uploadItems.length > 0 && (
-            <ul className="upload-list">
-              {uploadItems.map((item) => (
-                <li key={item.id} className={`upload-item upload-item--${item.status}`}>
-                  <div className="upload-item__main">
-                    <span className="upload-item__name" title={item.file.name}>
-                      {item.file.name}
-                    </span>
-                    <span className="upload-item__meta">
-                      {formatBytes(item.file.size)}
-                      {item.error ? ` · ${item.error}` : ''}
-                    </span>
-                  </div>
-                  {item.status === 'uploading' ? (
-                    <div className="upload-item__progress">
-                      <ProgressBar value={item.progress / 100} label={`Загрузка ${item.file.name}`} />
-                      <span>{item.progress}%</span>
-                    </div>
-                  ) : item.status === 'done' ? (
-                    <span className="upload-item__status upload-item__status--ok">
-                      <Check size={14} aria-hidden="true" /> Готово
-                    </span>
-                  ) : item.status === 'duplicate' ? (
-                    <span className="upload-item__status upload-item__status--warn">Уже в медиатеке</span>
-                  ) : item.status === 'queued' ? (
-                    <span className="upload-item__status">В очереди</span>
-                  ) : (
-                    <span className="upload-item__status upload-item__status--error">Ошибка</span>
-                  )}
-                  {item.status === 'error' && (
-                    <IconButton
-                      icon={RefreshCw}
-                      label="Повторить загрузку файла"
-                      size="sm"
-                      onClick={() =>
-                        setUploadItems((items) =>
-                          items.map((entry) =>
-                            entry.id === item.id
-                              ? { ...entry, status: 'queued', progress: 0, error: null }
-                              : entry,
-                          ),
-                        )
-                      }
-                    />
-                  )}
-                </li>
-              ))}
-            </ul>
-          )}
-
-          <div className="upload-panel__footer">
-            <span className="muted">
-              {uploadRunning ? (
-                <span className="inline-loading">
-                  <Spinner size={14} /> Загрузка…
-                </span>
-              ) : (
-                `Готово: ${uploadStats.done} · ошибок: ${uploadStats.error + uploadStats.duplicate} · в очереди: ${uploadStats.queued}`
-              )}
-            </span>
-            <div className="upload-panel__actions">
-              {uploadStats.error > 0 && !uploadRunning && (
-                <Button variant="secondary" size="sm" icon={RefreshCw} onClick={retryFailed}>
-                  Повторить ошибки
-                </Button>
-              )}
-              {(uploadRunning || uploadStats.queued > 0) && (
-                <Button variant="ghost" size="sm" onClick={cancelUploads}>
-                  Отменить
-                </Button>
-              )}
-            </div>
-          </div>
-        </Panel>
-      )}
 
       <div className="toolbar">
         <div className="search-field">
@@ -689,6 +476,14 @@ export function LibraryPage() {
               }}
             >
               В плейлист
+            </Button>
+            <Button
+              variant="secondary"
+              size="sm"
+              icon={Download}
+              onClick={() => openExport(selectionComposition())}
+            >
+              Скачать
             </Button>
             <Button variant="danger" size="sm" icon={Trash2} onClick={() => setBulkDeleteOpen(true)}>
               Удалить
@@ -793,8 +588,11 @@ export function LibraryPage() {
                         </td>
                         <td>
                           <div className="track-cell">
-                            <span className="track-cell__title" title={track.title}>
-                              {track.title}
+                            <span className="track-cell__title-row">
+                              <span className="track-cell__title" title={track.title}>
+                                {track.title}
+                              </span>
+                              {track.isDuplicate && <DuplicateBadge kind={track.duplicateKind} />}
                             </span>
                             <span className="track-cell__sub">
                               {track.artist ?? '—'}
@@ -847,13 +645,25 @@ export function LibraryPage() {
                                   ),
                               },
                               {
-                                label: 'Изменить метаданные',
+                                label: 'Изменить трек',
                                 separatorBefore: true,
                                 onSelect: () => setEditTrack(track),
                               },
                               {
+                                label: 'Скачать трек',
+                                icon: Download,
+                                onSelect: () => triggerDownload(trackDownloadUrl(track.id, 'tags')),
+                              },
+                              {
+                                label: 'Скачать оригинал',
+                                icon: Download,
+                                onSelect: () =>
+                                  triggerDownload(trackDownloadUrl(track.id, 'original')),
+                              },
+                              {
                                 label: 'Удалить',
                                 danger: true,
+                                separatorBefore: true,
                                 onSelect: () => setDeleteTarget(track),
                               },
                             ]}
@@ -930,58 +740,47 @@ export function LibraryPage() {
         onEnded={() => setPreviewPlaying(false)}
       />
 
-      <Modal
+      <TrackEditorDialog
         open={editTrack !== null}
-        onClose={() => (editBusy ? undefined : setEditTrack(null))}
-        title="Метаданные трека"
-        description="Изменения сохраняются в базе и используются в эфире и интерфейсе."
-        footer={
-          <>
-            <Button variant="ghost" onClick={() => setEditTrack(null)} disabled={editBusy}>
-              Отмена
-            </Button>
-            <Button variant="primary" onClick={() => void saveMetadata()} loading={editBusy}>
-              Сохранить
-            </Button>
-          </>
-        }
-      >
-        <div className="form-grid">
-          <TextField
-            label="Название"
-            value={editForm.title}
-            onChange={(event) => setEditForm({ ...editForm, title: event.target.value })}
-          />
-          <TextField
-            label="Исполнитель"
-            value={editForm.artist}
-            onChange={(event) => setEditForm({ ...editForm, artist: event.target.value })}
-          />
-          <TextField
-            label="Альбом"
-            value={editForm.album}
-            onChange={(event) => setEditForm({ ...editForm, album: event.target.value })}
-          />
-          <TextField
-            label="Жанр"
-            value={editForm.genre}
-            onChange={(event) => setEditForm({ ...editForm, genre: event.target.value })}
-          />
-          <TextField
-            label="Год"
-            inputMode="numeric"
-            value={editForm.year}
-            onChange={(event) => setEditForm({ ...editForm, year: event.target.value })}
-            hint="Необязательно, 1900–2100"
-          />
-          {editTrack && (
-            <div className="form-note">
-              Файл: {editTrack.id.slice(0, 8)} · {formatDuration(editTrack.duration)} ·{' '}
-              {formatBytes(editTrack.size)}
-            </div>
-          )}
-        </div>
-      </Modal>
+        track={editTrack}
+        onClose={() => setEditTrack(null)}
+        onSaved={() => {
+          toast.notify('success', 'Трек сохранён');
+          setEditTrack(null);
+          void tracks.reload(true);
+          notifyDataChanged();
+        }}
+      />
+
+      <UploadDialog
+        open={uploadOpen}
+        onClose={() => setUploadOpen(false)}
+        onOpenDecisions={(pendingId) => {
+          setDecisionPendingId(pendingId ?? null);
+          setDecisionsOpen(true);
+        }}
+        maxUploadMb={maxUploadMb}
+        settingsUnavailable={Boolean(settings.error)}
+      />
+
+      <DecisionsDialog
+        open={decisionsOpen}
+        items={batch?.items ?? []}
+        uploading={uploading}
+        initialPendingId={decisionPendingId}
+        onClose={() => setDecisionsOpen(false)}
+        onBack={() => {
+          setDecisionsOpen(false);
+          setUploadOpen(true);
+        }}
+        onChanged={refreshBatch}
+      />
+
+      <ExportDialog
+        open={exportComposition !== null}
+        composition={exportComposition}
+        onClose={() => setExportComposition(null)}
+      />
 
       <ConfirmDialog
         open={deleteTarget !== null}

@@ -4,7 +4,7 @@
 
 CREATE TABLE IF NOT EXISTS tracks (
     id TEXT PRIMARY KEY,
-    sha256 TEXT UNIQUE NOT NULL,
+    sha256 TEXT NOT NULL,
     path TEXT NOT NULL,
     ext TEXT,
     title TEXT NOT NULL,
@@ -16,14 +16,66 @@ CREATE TABLE IF NOT EXISTS tracks (
     bitrate INTEGER,
     size INTEGER,
     cover_path TEXT,
+    custom_cover_path TEXT,
     source_title TEXT,
     source_artist TEXT,
     source_album TEXT,
     source_genre TEXT,
+    source_filename TEXT,
+    duplicate_of TEXT,
+    duplicate_kind TEXT,
+    duplicate_confirmed_at TEXT,
     play_count INTEGER DEFAULT 0,
     pending_delete INTEGER DEFAULT 0,
     created_at TEXT,
     updated_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS upload_batches (
+    id TEXT PRIMARY KEY,
+    created_at TEXT,
+    updated_at TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    total INTEGER NOT NULL DEFAULT 0,
+    counters TEXT
+);
+
+CREATE TABLE IF NOT EXISTS pending_uploads (
+    id TEXT PRIMARY KEY,
+    batch_id TEXT,
+    filename TEXT,
+    temp_path TEXT,
+    ext TEXT,
+    sha256 TEXT,
+    size INTEGER,
+    metadata TEXT,
+    cover_temp TEXT,
+    reason TEXT,
+    match_track_id TEXT,
+    matches TEXT,
+    state TEXT NOT NULL DEFAULT 'pending',
+    decision TEXT,
+    created_at TEXT,
+    updated_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS export_jobs (
+    id TEXT PRIMARY KEY,
+    scope TEXT,
+    scope_ref TEXT,
+    track_ids TEXT,
+    metadata_mode TEXT,
+    format TEXT,
+    state TEXT NOT NULL DEFAULT 'queued',
+    processed INTEGER DEFAULT 0,
+    total INTEGER DEFAULT 0,
+    archive_path TEXT,
+    archive_name TEXT,
+    size INTEGER,
+    error TEXT,
+    created_at TEXT,
+    updated_at TEXT,
+    expires_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS playlists (
@@ -160,6 +212,9 @@ CREATE TABLE IF NOT EXISTS events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_tracks_sha256 ON tracks(sha256);
+CREATE INDEX IF NOT EXISTS idx_pending_uploads_batch ON pending_uploads(batch_id);
+CREATE INDEX IF NOT EXISTS idx_pending_uploads_state ON pending_uploads(state);
+CREATE INDEX IF NOT EXISTS idx_export_jobs_state ON export_jobs(state);
 CREATE INDEX IF NOT EXISTS idx_playlist_tracks_order ON playlist_tracks(playlist_id, position);
 CREATE INDEX IF NOT EXISTS idx_queue_positions_state_seq ON queue_positions(state, seq);
 CREATE INDEX IF NOT EXISTS idx_history_started_at ON history(started_at);

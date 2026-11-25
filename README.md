@@ -3,7 +3,7 @@
 Self-hosted internet radio for a small community: a continuous MP3 stream, a
 public web player and a browser control panel. Built to replace a paid radio
 hosting account with something one person can run on a single VPS. Current
-version: **1.0.1** (see `CHANGELOG.md`).
+version: **1.1.0** (see `CHANGELOG.md`).
 
 - **Liquidsoap** decodes and encodes the stream, **Icecast** distributes it.
 - **FastAPI + SQLite** owns the library, playlists, rotation, schedule, queue
@@ -13,8 +13,15 @@ version: **1.0.1** (see `CHANGELOG.md`).
 
 ## Features
 
-- Library with drag-and-drop batch upload, progress per file, SHA-256 duplicate
-  detection, Mutagen tags and embedded cover extraction, Cyrillic/Unicode safe.
+- Library with drag-and-drop batch upload, progress per file, Mutagen tags and
+  embedded cover extraction, Cyrillic/Unicode safe.
+- Duplicate-safe import: identical files and matching tags are never silently
+  rejected or overwritten; the owner reviews matches in one dialog and decides
+  per file or in bulk, keeping independent copies when needed.
+- Per-track editor for title, artist, album and a custom cover (with return to
+  the original), applied without touching the source file.
+- Download a single track (with current tags or as the original file), a
+  selection, a playlist or the whole library as a ZIP with `playlist.m3u8`.
 - **«Вся медиатека»** — a system playlist that always contains every available
   track; new uploads join it automatically, deleted files leave it, and it plays
   with shuffle and repeat out of the box, so the station works without any

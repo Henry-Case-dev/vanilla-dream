@@ -15,7 +15,7 @@ from .config import (
     Settings,
 )
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
 DEFAULT_SETTINGS: dict[str, str] = {
@@ -81,8 +81,22 @@ def init_db(settings: Settings) -> None:
 
 
 def _migrate(conn: sqlite3.Connection, previous_version: int) -> None:
-    """Apply non-destructive schema migrations (currently v1 -> v2)."""
+    """Apply non-destructive schema migrations (v1 -> v2 -> v3) atomically."""
 
+    started = not conn.in_transaction
+    if started:
+        conn.execute("BEGIN IMMEDIATE")
+    try:
+        _migrate_locked(conn, previous_version)
+        if started:
+            conn.commit()
+    except BaseException:
+        if started:
+            conn.rollback()
+        raise
+
+
+def _migrate_locked(conn: sqlite3.Connection, previous_version: int) -> None:
     from .util import to_iso, utcnow
 
     columns = {
@@ -108,6 +122,127 @@ def _migrate(conn: sqlite3.Connection, previous_version: int) -> None:
             "DELETE FROM settings WHERE key IN (?, ?)",
             ("_cycle:library", "_cycle:playlist:library"),
         )
+    _migrate_tracks_v3(conn)
+
+
+TRACK_COLUMNS_V3 = (
+    "id",
+    "sha256",
+    "path",
+    "ext",
+    "title",
+    "artist",
+    "album",
+    "genre",
+    "year",
+    "duration",
+    "bitrate",
+    "size",
+    "cover_path",
+    "custom_cover_path",
+    "source_title",
+    "source_artist",
+    "source_album",
+    "source_genre",
+    "source_filename",
+    "duplicate_of",
+    "duplicate_kind",
+    "duplicate_confirmed_at",
+    "play_count",
+    "pending_delete",
+    "created_at",
+    "updated_at",
+)
+
+
+def _sha256_is_unique(conn: sqlite3.Connection) -> bool:
+    """Report whether the legacy ``UNIQUE(sha256)`` constraint is still active."""
+
+    for index in conn.execute("PRAGMA index_list(tracks)").fetchall():
+        if not int(index["unique"] or 0):
+            continue
+        listed = conn.execute(
+            f'PRAGMA index_info("{index["name"]}")'
+        ).fetchall()
+        if [str(row["name"]) for row in listed] == ["sha256"]:
+            return True
+    return False
+
+
+def _migrate_tracks_v3(conn: sqlite3.Connection) -> None:
+    """Rebuild ``tracks`` to drop ``UNIQUE(sha256)`` and add media columns.
+
+    The rebuild copies every row, id, path and relation. It is idempotent: a
+    database that already has the v3 layout (and no unique sha256 constraint)
+    is left untouched.
+    """
+
+    columns = {
+        str(row["name"]) for row in conn.execute("PRAGMA table_info(tracks)").fetchall()
+    }
+    if not columns:
+        # schema.sql always creates the table, but keep the migration safe.
+        return
+    required = {
+        "source_filename",
+        "custom_cover_path",
+        "duplicate_of",
+        "duplicate_kind",
+        "duplicate_confirmed_at",
+    }
+    if required <= columns and not _sha256_is_unique(conn):
+        return
+
+    conn.execute("DROP TABLE IF EXISTS tracks_rebuild_v3")
+    conn.execute(
+        """
+        CREATE TABLE tracks_rebuild_v3 (
+            id TEXT PRIMARY KEY,
+            sha256 TEXT NOT NULL,
+            path TEXT NOT NULL,
+            ext TEXT,
+            title TEXT NOT NULL,
+            artist TEXT,
+            album TEXT,
+            genre TEXT,
+            year INTEGER,
+            duration REAL,
+            bitrate INTEGER,
+            size INTEGER,
+            cover_path TEXT,
+            custom_cover_path TEXT,
+            source_title TEXT,
+            source_artist TEXT,
+            source_album TEXT,
+            source_genre TEXT,
+            source_filename TEXT,
+            duplicate_of TEXT,
+            duplicate_kind TEXT,
+            duplicate_confirmed_at TEXT,
+            play_count INTEGER DEFAULT 0,
+            pending_delete INTEGER DEFAULT 0,
+            created_at TEXT,
+            updated_at TEXT
+        )
+        """
+    )
+    defaults = {
+        "play_count": "0",
+        "pending_delete": "0",
+    }
+    select_parts = []
+    for name in TRACK_COLUMNS_V3:
+        if name in columns:
+            select_parts.append(name)
+        else:
+            select_parts.append(f"{defaults.get(name, 'NULL')} AS {name}")
+    conn.execute(
+        f"INSERT INTO tracks_rebuild_v3 ({', '.join(TRACK_COLUMNS_V3)}) "
+        f"SELECT {', '.join(select_parts)} FROM tracks"
+    )
+    conn.execute("DROP TABLE tracks")
+    conn.execute("ALTER TABLE tracks_rebuild_v3 RENAME TO tracks")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tracks_sha256 ON tracks(sha256)")
 
 
 @contextmanager

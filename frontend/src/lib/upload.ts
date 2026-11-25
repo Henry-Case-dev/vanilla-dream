@@ -1,23 +1,32 @@
-import { ApiError, getCsrfToken, handleUnauthorized } from './api';
+import {
+  ApiError,
+  getCsrfToken,
+  handleUnauthorized,
+  normalizeUploadResponse,
+} from './api';
+import type { UploadResponse } from './types';
 
 export interface UploadHandle {
-  promise: Promise<unknown>;
+  promise: Promise<UploadResponse>;
   abort: () => void;
 }
 
-interface UploadCallbacks {
+interface UploadOptions {
+  batchId?: string | null;
   onProgress?: (percent: number) => void;
 }
 
 /**
  * Загрузка файла через XHR — нужен реальный прогресс отправки.
  * Cookie сессии отправляется автоматически (same-origin), CSRF — заголовком.
+ * Все файлы одной операции делят batch_id: сервер возвращает его в каждом ответе.
  */
-export function uploadTrack(file: File, callbacks: UploadCallbacks = {}): UploadHandle {
+export function uploadTrack(file: File, options: UploadOptions = {}): UploadHandle {
   const xhr = new XMLHttpRequest();
-  const promise = new Promise<unknown>((resolve, reject) => {
+  const promise = new Promise<UploadResponse>((resolve, reject) => {
     const form = new FormData();
     form.append('file', file, file.name);
+    if (options.batchId) form.append('batch_id', options.batchId);
 
     xhr.open('POST', '/api/admin/tracks/upload', true);
     xhr.withCredentials = true;
@@ -28,12 +37,16 @@ export function uploadTrack(file: File, callbacks: UploadCallbacks = {}): Upload
     xhr.upload.onprogress = (event) => {
       if (!event.lengthComputable) return;
       const percent = Math.min(100, Math.round((event.loaded / event.total) * 100));
-      callbacks.onProgress?.(percent);
+      options.onProgress?.(percent);
     };
 
     xhr.onload = () => {
       if (xhr.status >= 200 && xhr.status < 300) {
-        resolve(parseBody(xhr.responseText));
+        try {
+          resolve(normalizeUploadResponse(parseBody(xhr.responseText)));
+        } catch (error) {
+          reject(error);
+        }
         return;
       }
       reject(buildError(xhr));
@@ -82,14 +95,14 @@ function buildError(xhr: XMLHttpRequest): ApiError {
   }
 
   if (!message) {
-    if (xhr.status === 409 || code === 'duplicate') {
-      message = 'Этот файл уже есть в медиатеке';
-    } else if (xhr.status === 413) {
+    if (xhr.status === 413) {
       message = 'Файл больше допустимого размера';
     } else if (xhr.status === 415) {
       message = 'Формат файла не поддерживается';
     } else if (xhr.status === 401) {
       message = 'Сессия истекла — войдите заново';
+    } else if (xhr.status === 422) {
+      message = 'Файл повреждён или не читается';
     } else if (xhr.status === 507) {
       message = 'Недостаточно свободного места на сервере';
     } else if (xhr.status >= 500) {

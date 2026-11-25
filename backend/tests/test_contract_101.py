@@ -436,7 +436,7 @@ def test_migration_is_idempotent_and_preserves_system_settings(settings):
         version = conn.execute("PRAGMA user_version").fetchone()[0]
     finally:
         conn.close()
-    assert version == 2
+    assert version == db.SCHEMA_VERSION == 3
     assert row["shuffle"] == 0
     assert row["repeat_mode"] == "none"
     assert row["system"] == 1
@@ -891,7 +891,7 @@ def test_migration_v1_keeps_data_and_clears_library_cycle(settings):
         }
     finally:
         conn.close()
-    assert version == 2
+    assert version == db.SCHEMA_VERSION == 3
     assert "system" in system_column
     assert system is not None and system["system"] == 1
     assert system["shuffle"] == 1 and system["repeat_mode"] == "all"

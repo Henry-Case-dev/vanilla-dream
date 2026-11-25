@@ -46,6 +46,9 @@ function visibleFocusable(root: HTMLElement | null): HTMLElement[] {
 let scrollLockCount = 0;
 let scrollLockValue = '';
 
+/** Стопка открытых модальных окон: Escape и Tab обрабатывает только верхнее. */
+const modalStack: symbol[] = [];
+
 function lockBodyScroll(): void {
   if (scrollLockCount === 0) {
     scrollLockValue = document.body.style.overflow;
@@ -74,6 +77,7 @@ export function Modal({
   const onCloseRef = useRef(onClose);
   const focusInitialised = useRef(false);
   const openerRef = useRef<HTMLElement | null>(null);
+  const modalId = useRef<symbol>(Symbol('modal')).current;
 
   onCloseRef.current = onClose;
 
@@ -86,8 +90,10 @@ export function Modal({
     openerRef.current =
       document.activeElement instanceof HTMLElement ? document.activeElement : null;
     lockBodyScroll();
+    modalStack.push(modalId);
 
     const handleKeyDown = (event: KeyboardEvent) => {
+      if (modalStack[modalStack.length - 1] !== modalId) return;
       if (event.key === 'Escape') {
         event.preventDefault();
         event.stopPropagation();
@@ -138,6 +144,8 @@ export function Modal({
 
     return () => {
       document.removeEventListener('keydown', handleKeyDown, true);
+      const stackIndex = modalStack.lastIndexOf(modalId);
+      if (stackIndex >= 0) modalStack.splice(stackIndex, 1);
       unlockBodyScroll();
       const opener = openerRef.current;
       openerRef.current = null;

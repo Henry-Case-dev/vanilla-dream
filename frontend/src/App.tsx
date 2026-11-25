@@ -2,6 +2,8 @@ import { BrowserRouter, Link, Route, Routes } from 'react-router-dom';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { ToastProvider } from './components/Toasts';
 import { AuthProvider, RequireAuth } from './lib/auth';
+import { UploadProvider } from './lib/uploads';
+import { ExportProvider } from './lib/exports';
 import { LiveProvider } from './lib/live';
 import { AudioProvider } from './lib/audio';
 import { AdminLayout } from './admin/AdminLayout';
@@ -37,30 +39,34 @@ export function App() {
       <BrowserRouter>
         <ToastProvider>
           <AuthProvider>
-            <LiveProvider>
-              <AudioProvider>
-                <Routes>
-                  <Route path="/" element={<PublicPlayerPage />} />
-                  <Route path="/admin/login" element={<LoginPage />} />
-                  <Route
-                    path="/admin"
-                    element={
-                      <RequireAuth>
-                        <AdminLayout />
-                      </RequireAuth>
-                    }
-                  >
-                    <Route index element={<OverviewPage />} />
-                    <Route path="library" element={<LibraryPage />} />
-                    <Route path="playlists" element={<PlaylistsPage />} />
-                    <Route path="playlists/:id" element={<PlaylistDetailPage />} />
-                    <Route path="schedule" element={<SchedulePage />} />
-                    <Route path="settings" element={<SettingsPage />} />
-                  </Route>
-                  <Route path="*" element={<NotFoundPage />} />
-                </Routes>
-              </AudioProvider>
-            </LiveProvider>
+            <UploadProvider>
+              <ExportProvider>
+                <LiveProvider>
+                  <AudioProvider>
+                  <Routes>
+                    <Route path="/" element={<PublicPlayerPage />} />
+                    <Route path="/admin/login" element={<LoginPage />} />
+                    <Route
+                      path="/admin"
+                      element={
+                        <RequireAuth>
+                          <AdminLayout />
+                        </RequireAuth>
+                      }
+                    >
+                      <Route index element={<OverviewPage />} />
+                      <Route path="library" element={<LibraryPage />} />
+                      <Route path="playlists" element={<PlaylistsPage />} />
+                      <Route path="playlists/:id" element={<PlaylistDetailPage />} />
+                      <Route path="schedule" element={<SchedulePage />} />
+                      <Route path="settings" element={<SettingsPage />} />
+                    </Route>
+                    <Route path="*" element={<NotFoundPage />} />
+                  </Routes>
+                  </AudioProvider>
+                </LiveProvider>
+              </ExportProvider>
+            </UploadProvider>
           </AuthProvider>
         </ToastProvider>
       </BrowserRouter>

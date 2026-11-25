@@ -1,12 +1,21 @@
 import type {
   AddTracksResult,
   ConflictInfo,
+  DecisionAction,
+  DuplicateKind,
+  ExportCreateResult,
+  ExportFile,
+  ExportJob,
+  ExportJobState,
+  ExportRequest,
   HistoryEntry,
   LoginResult,
   MeResult,
   NowPlaying,
   NowStation,
   NowTrack,
+  PendingMatch,
+  PendingUpload,
   Playlist,
   PlaylistDetail,
   QueueItem,
@@ -24,9 +33,17 @@ import type {
   StationStatus,
   StorageInfo,
   Track,
+  TrackComparison,
+  TrackCoverKind,
   TrackIdPage,
   TrackPage,
   TrackQuery,
+  UploadBatch,
+  UploadBatchCounts,
+  UploadBatchItem,
+  UploadBatchStatus,
+  UploadItemState,
+  UploadResponse,
 } from './types';
 
 /* ------------------------------------------------------------------ */
@@ -277,10 +294,23 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
 /* Нормализация ответов API                                            */
 /* ------------------------------------------------------------------ */
 
+function normalizeCoverKind(value: unknown, coverUrl: string | null): TrackCoverKind {
+  if (value === 'custom' || value === 'file' || value === 'none') return value;
+  // Старый backend не присылал cover_kind: выводим из наличия обложки.
+  return coverUrl ? 'file' : 'none';
+}
+
+const DUPLICATE_KINDS: readonly DuplicateKind[] = ['content', 'tags', 'possible'];
+
+function normalizeDuplicateKind(value: unknown): DuplicateKind | null {
+  return DUPLICATE_KINDS.includes(value as DuplicateKind) ? (value as DuplicateKind) : null;
+}
+
 function normalizeTrack(raw: unknown): Track | null {
   if (!isObject(raw)) return null;
   const id = asString(raw.id);
   if (!id) return null;
+  const coverUrl = asStringOrNull(raw.cover_url);
   return {
     id,
     title: asString(raw.title, 'Без названия'),
@@ -291,7 +321,14 @@ function normalizeTrack(raw: unknown): Track | null {
     duration: asNumber(raw.duration),
     bitrate: asNumber(raw.bitrate),
     size: asNumber(raw.size),
-    coverUrl: asStringOrNull(raw.cover_url),
+    ext: asStringOrNull(raw.ext),
+    coverUrl,
+    coverKind: normalizeCoverKind(raw.cover_kind, coverUrl),
+    isDuplicate: asBoolean(raw.is_duplicate),
+    duplicateKind: normalizeDuplicateKind(raw.duplicate_kind),
+    duplicateOf: asStringOrNull(raw.duplicate_of),
+    canRevertCover: asBoolean(raw.can_revert_cover),
+    sourceFilename: asStringOrNull(raw.source_filename),
     createdAt: asStringOrNull(raw.created_at),
     playlistsCount: asNumber(raw.playlists_count),
   };
@@ -449,6 +486,250 @@ export function normalizeTrackIds(raw: unknown): TrackIdPage {
     ids: Array.from(new Set(ids)),
     total: requireNumber(data.total, 'total id треков'),
   };
+}
+
+/* ------------------------------------------------------------------ */
+/* Загрузка музыки (VD-RADIO-MEDIA-02)                                 */
+/* ------------------------------------------------------------------ */
+
+function normalizeComparison(raw: unknown, what: string): TrackComparison {
+  const data = requireObject(raw, what);
+  const source = isObject(data.track) ? data.track : data;
+  return {
+    id: asStringOrNull(source.id),
+    title: asStringOrNull(source.title),
+    artist: asStringOrNull(source.artist),
+    album: asStringOrNull(source.album),
+    duration: asNumber(source.duration),
+    size: asNumber(source.size),
+    bitrate: asNumber(source.bitrate),
+    coverUrl: asStringOrNull(source.cover_url ?? source.coverUrl),
+  };
+}
+
+function normalizePendingMatches(raw: unknown, fallback: DuplicateKind | null): PendingMatch[] {
+  if (raw === undefined || raw === null) return [];
+  const list = requireArray(raw, 'совпадения файла');
+  return list.map((entry) => {
+    const data = requireObject(entry, 'совпадение файла');
+    const kind =
+      normalizeDuplicateKind(data.duplicate_kind) ??
+      normalizeDuplicateKind(data.reason) ??
+      normalizeDuplicateKind(data.kind) ??
+      fallback;
+    if (!kind) throw contractError('причина совпадения');
+    return { kind, track: normalizeComparison(data, 'трек в совпадении') };
+  });
+}
+
+function normalizeDecision(value: unknown): DecisionAction | null {
+  return value === 'save' || value === 'skip' ? value : null;
+}
+
+function normalizePendingUpload(raw: unknown): PendingUpload {
+  const data = requireObject(raw, 'ожидающий решения файл');
+  const id = requireString(data.id, 'id ожидающего файла');
+  const reason = normalizeDuplicateKind(data.reason);
+  const metadataRaw = data.metadata;
+  const metadata =
+    metadataRaw === undefined || metadataRaw === null
+      ? null
+      : normalizeComparison(metadataRaw, 'метаданные нового файла');
+  return {
+    id,
+    reason,
+    metadata,
+    matches: normalizePendingMatches(data.matches, reason),
+    decision: normalizeDecision(data.decision),
+  };
+}
+
+const ITEM_STATE_ALIASES: Record<string, UploadItemState> = {
+  queued: 'queued',
+  waiting: 'queued',
+  uploading: 'uploading',
+  processing: 'processing',
+  added: 'added',
+  pending: 'pending',
+  pending_decision: 'pending',
+  needs_decision: 'pending',
+  saved: 'saved',
+  duplicate: 'saved',
+  skipped: 'skipped',
+  cancelled: 'cancelled',
+  canceled: 'cancelled',
+  error: 'error',
+  failed: 'error',
+};
+
+function normalizeItemState(value: unknown): UploadItemState {
+  const state = ITEM_STATE_ALIASES[asString(value)];
+  if (!state) throw contractError('состояние файла загрузки');
+  return state;
+}
+
+function normalizeBatchStatus(value: unknown): UploadBatchStatus {
+  const status = asString(value);
+  switch (status) {
+    case 'uploading':
+    case 'processing':
+    case 'pending':
+    case 'done':
+    case 'cancelled':
+    case 'error':
+      return status;
+    case 'queued':
+    case 'active':
+      return 'uploading';
+    case 'completed':
+    case 'finished':
+      return 'done';
+    case 'canceled':
+      return 'cancelled';
+    case 'failed':
+      return 'error';
+    default:
+      throw contractError('состояние пакета загрузки');
+  }
+}
+
+function normalizeBatchCounts(raw: unknown): UploadBatchCounts {
+  const data = requireObject(raw, 'счётчики загрузки');
+  return {
+    added: requireNumber(data.added, 'added загрузки'),
+    pending: requireNumber(data.pending, 'pending загрузки'),
+    skipped: requireNumber(data.skipped, 'skipped загрузки'),
+    errors: requireNumber(data.errors, 'errors загрузки'),
+  };
+}
+
+function normalizeBatchItem(raw: unknown, fallback: DuplicateKind | null): UploadBatchItem {
+  const data = requireObject(raw, 'файл пакета загрузки');
+  const id = requireString(data.id, 'id файла загрузки');
+  const state = normalizeItemState(data.state);
+  const reason = normalizeDuplicateKind(data.reason) ?? fallback;
+  const metadataRaw = data.metadata;
+  return {
+    id,
+    filename: requireString(data.filename, 'имя файла загрузки'),
+    size: asNumber(data.size),
+    state,
+    reason,
+    metadata:
+      metadataRaw === undefined || metadataRaw === null
+        ? null
+        : normalizeComparison(metadataRaw, 'метаданные файла загрузки'),
+    matches: normalizePendingMatches(data.matches, reason),
+    decision: normalizeDecision(data.decision),
+    error: asStringOrNull(data.error),
+  };
+}
+
+export function normalizeUploadBatch(raw: unknown): UploadBatch {
+  const data = requireObject(raw, 'состояние загрузки');
+  const batch = isObject(data.batch) ? data.batch : data;
+  const total = requireNumber(batch.total, 'total загрузки');
+  const itemsRaw = requireArray(batch.items, 'items загрузки');
+  return {
+    id: requireString(batch.id, 'id пакета загрузки'),
+    status: normalizeBatchStatus(batch.status),
+    total,
+    counts: normalizeBatchCounts(batch.counts),
+    items: itemsRaw.map((item) => normalizeBatchItem(item, null)),
+  };
+}
+
+export function normalizeUploadResponse(raw: unknown): UploadResponse {
+  const data = requireObject(raw, 'результат загрузки файла');
+  const status = asString(data.status);
+  const batchId = requireString(data.batch_id, 'batch_id');
+  if (status === 'added') {
+    const track = normalizeTrack(data.track);
+    if (!track) throw contractError('добавленный трек');
+    return { status: 'added', track, batchId };
+  }
+  if (status === 'pending') {
+    return {
+      status: 'pending',
+      pending: normalizePendingUpload(data.pending),
+      batchId,
+    };
+  }
+  throw contractError('статус загрузки файла');
+}
+
+/* ------------------------------------------------------------------ */
+/* Экспорт (VD-RADIO-MEDIA-02)                                         */
+/* ------------------------------------------------------------------ */
+
+const EXPORT_STATES: readonly ExportJobState[] = [
+  'queued',
+  'preparing',
+  'ready',
+  'downloading',
+  'cancelled',
+  'error',
+];
+
+export function normalizeExportJob(raw: unknown): ExportJob {
+  const data = requireObject(raw, 'задание экспорта');
+  const job = isObject(data.job) ? data.job : data;
+  const state = asString(job.state) as ExportJobState;
+  if (!EXPORT_STATES.includes(state)) throw contractError('состояние экспорта');
+  const processed = requireNumber(job.processed, 'processed экспорта');
+  const total = requireNumber(job.total, 'total экспорта');
+  const archiveRaw = job.archive;
+  let archive: ExportJob['archive'] = null;
+  if (archiveRaw !== undefined && archiveRaw !== null) {
+    const archiveData = requireObject(archiveRaw, 'архив экспорта');
+    archive = {
+      name: requireString(archiveData.name, 'имя архива'),
+      size: requireNumber(archiveData.size, 'размер архива'),
+    };
+  }
+  const progress = asNumber(job.progress);
+  // Контракт не фиксирует шкалу progress: принимаем и долю, и проценты.
+  const normalizedProgress =
+    progress === null ? null : progress > 1 ? progress / 100 : progress;
+  return {
+    id: requireString(job.id, 'id задания экспорта'),
+    state,
+    processed,
+    total,
+    progress:
+      normalizedProgress !== null
+        ? Math.min(1, Math.max(0, normalizedProgress))
+        : total > 0
+          ? Math.min(1, Math.max(0, processed / total))
+          : 0,
+    archive,
+    error: asStringOrNull(job.error),
+    expiresAt: asStringOrNull(job.expires_at),
+  };
+}
+
+function normalizeExportFile(raw: unknown): ExportFile {
+  const data = requireObject(raw, 'файл экспорта');
+  return {
+    trackId: requireString(data.track_id, 'track_id файла экспорта'),
+    name: requireString(data.name, 'имя файла экспорта'),
+    size: requireNumber(data.size, 'размер файла экспорта'),
+    url: requireString(data.url, 'url файла экспорта'),
+  };
+}
+
+export function normalizeExportCreateResult(raw: unknown): ExportCreateResult {
+  const data = requireObject(raw, 'создание экспорта');
+  if (data.files !== undefined) {
+    return {
+      kind: 'files',
+      files: requireArray(data.files, 'files экспорта').map(normalizeExportFile),
+    };
+  }
+  if (isObject(data.job)) {
+    return { kind: 'job', job: normalizeExportJob({ job: data.job }) };
+  }
+  throw contractError('ответ создания экспорта');
 }
 
 function minutesToClock(value: number | null): string | null {
@@ -819,8 +1100,98 @@ async function tracksIds(query: { q?: string; excludePlaylistId?: string } = {})
   return normalizeTrackIds(raw);
 }
 
-async function trackUpdate(id: string, patch: Record<string, unknown>): Promise<void> {
-  await request<unknown>(`/api/admin/tracks/${encodeURIComponent(id)}`, { method: 'PATCH', body: patch });
+function normalizeTrackResponse(raw: unknown, what: string): Track {
+  const data = isObject(raw) ? raw : {};
+  const track = normalizeTrack(data.track ?? raw);
+  if (!track) throw contractError(what);
+  return track;
+}
+
+async function trackUpdate(id: string, patch: Record<string, unknown>): Promise<Track> {
+  const raw = await request<unknown>(`/api/admin/tracks/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    body: patch,
+  });
+  return normalizeTrackResponse(raw, 'обновлённый трек');
+}
+
+async function trackUploadCover(id: string, file: File): Promise<Track> {
+  const form = new FormData();
+  form.append('file', file, file.name);
+  const raw = await request<unknown>(`/api/admin/tracks/${encodeURIComponent(id)}/cover`, {
+    method: 'POST',
+    body: form,
+  });
+  return normalizeTrackResponse(raw, 'обложка трека');
+}
+
+async function trackResetCover(id: string): Promise<Track> {
+  const raw = await request<unknown>(`/api/admin/tracks/${encodeURIComponent(id)}/cover`, {
+    method: 'DELETE',
+  });
+  return normalizeTrackResponse(raw, 'исходная обложка трека');
+}
+
+export function trackDownloadUrl(id: string, mode: 'tags' | 'original'): string {
+  return `/api/admin/tracks/${encodeURIComponent(id)}/download?mode=${mode}`;
+}
+
+/* ------------------------------------------------------------------ */
+/* Пакеты загрузки                                                     */
+/* ------------------------------------------------------------------ */
+
+async function uploadBatchGet(batchId: string): Promise<UploadBatch> {
+  const raw = await request<unknown>(`/api/admin/uploads/${encodeURIComponent(batchId)}`);
+  return normalizeUploadBatch(raw);
+}
+
+async function uploadDecide(pendingId: string, action: DecisionAction): Promise<void> {
+  await request<unknown>(`/api/admin/uploads/${encodeURIComponent(pendingId)}/decide`, {
+    method: 'POST',
+    body: { action },
+  });
+}
+
+async function uploadDecideBatch(
+  batchId: string,
+  action: DecisionAction,
+  scope: 'all' | 'search' = 'all',
+  query = '',
+): Promise<void> {
+  await request<unknown>(`/api/admin/uploads/batch/${encodeURIComponent(batchId)}/decide`, {
+    method: 'POST',
+    body: { action, scope, query },
+  });
+}
+
+async function uploadCancelBatch(batchId: string): Promise<void> {
+  await request<unknown>(`/api/admin/uploads/batch/${encodeURIComponent(batchId)}/cancel`, {
+    method: 'POST',
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/* Экспорт                                                             */
+/* ------------------------------------------------------------------ */
+
+async function exportsCreate(payload: ExportRequest): Promise<ExportCreateResult> {
+  const raw = await request<unknown>('/api/admin/exports', { method: 'POST', body: payload });
+  return normalizeExportCreateResult(raw);
+}
+
+async function exportGet(jobId: string): Promise<ExportJob> {
+  const raw = await request<unknown>(`/api/admin/exports/${encodeURIComponent(jobId)}`);
+  return normalizeExportJob(raw);
+}
+
+async function exportCancel(jobId: string): Promise<void> {
+  await request<unknown>(`/api/admin/exports/${encodeURIComponent(jobId)}/cancel`, {
+    method: 'POST',
+  });
+}
+
+export function exportArchiveUrl(jobId: string): string {
+  return `/api/admin/exports/${encodeURIComponent(jobId)}/archive`;
 }
 
 interface DeleteTrackResult {
@@ -1118,11 +1489,24 @@ export const api = {
       list: tracksList,
       ids: tracksIds,
       update: trackUpdate,
+      uploadCover: trackUploadCover,
+      resetCover: trackResetCover,
       remove: trackDelete,
       bulkDelete: tracksBulkDelete,
       playNow: trackPlayNow,
       playNext: trackPlayNext,
       enqueue: trackEnqueue,
+    },
+    uploads: {
+      get: uploadBatchGet,
+      decide: uploadDecide,
+      decideBatch: uploadDecideBatch,
+      cancel: uploadCancelBatch,
+    },
+    exports: {
+      create: exportsCreate,
+      get: exportGet,
+      cancel: exportCancel,
     },
     playlists: {
       list: playlistsList,

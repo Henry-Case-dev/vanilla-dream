@@ -269,7 +269,7 @@ class SchedulerLoop:
         self._stop.set()
 
     def tick(self) -> dict:
-        from . import db, queue_engine
+        from . import db, queue_engine, uploads, exports
         from . import scheduler as schedule_module
         from .auth import purge_expired_sessions
         from .util import to_iso
@@ -278,6 +278,8 @@ class SchedulerLoop:
         try:
             now = self.clock.now()
             purge_expired_sessions(conn, now)
+            uploads.cleanup_pending(conn, self.settings, now)
+            exports.cleanup_exports(conn, self.settings, now)
             queue_engine.deactivate_expired_overrides(conn, now)
             stats = self.icecast.stats() if self.icecast is not None else {"available": False}
             status = self.station.status(conn, now, stats)

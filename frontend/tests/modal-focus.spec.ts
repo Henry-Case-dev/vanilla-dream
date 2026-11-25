@@ -208,7 +208,7 @@ test('add-tracks, metadata, password and confirm dialogs use the same focus cont
 
   await page.goto('/admin/library');
   await page.locator('.track-table tbody tr').first().locator('.menu .icon-btn').click();
-  await page.getByRole('menuitem', { name: 'Изменить метаданные' }).click();
+  await page.getByRole('menuitem', { name: 'Изменить трек' }).click();
   const metadataDialog = page.getByRole('dialog');
   await expect(metadataDialog).toBeVisible();
   const title = metadataDialog.getByLabel('Название');

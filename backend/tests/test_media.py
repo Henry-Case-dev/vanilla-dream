@@ -74,15 +74,20 @@ def test_unicode_and_filename_fallback(env, admin):
     assert second["artist"] == "Ёлка"
 
 
-def test_duplicate_returns_409_with_existing_track(env, admin):
+def test_duplicate_returns_pending_decision(env, admin):
     path = write_mp3(env.settings.music_dir.parent / "dup.mp3", title="Дубль")
     first = upload_and_get(env.client, path)
     response = upload_mp3(env.client, path, expect=None)
-    assert response.status_code == 409
-    detail = response.json()["detail"]
-    assert detail["code"] == "duplicate"
-    assert detail["existing_track_id"] == first["id"]
-    assert "уже есть" in detail["message"]
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert body["status"] == "pending"
+    pending = body["pending"]
+    assert pending["reason"] == "content"
+    assert pending["match_track_id"] == first["id"]
+    assert pending["matches"][0]["track"]["id"] == first["id"]
+    assert env.client.get("/api/admin/tracks").json()["total"] == 1
+    assert (env.settings.music_dir / ".pending").exists()
+    assert any((env.settings.music_dir / ".pending").iterdir())
 
 
 def test_corrupt_and_unsupported_files_rejected(env, admin):
@@ -110,7 +115,6 @@ def test_path_traversal_filename_is_not_used(env, admin):
     row = db.open_db(env.settings)
     try:
         stored = row.execute("SELECT path FROM tracks WHERE id = ?", (track["id"],)).fetchone()
-        digest = row.execute("SELECT sha256 FROM tracks WHERE id = ?", (track["id"],)).fetchone()
     finally:
         row.close()
     assert (env.settings.music_dir / stored["path"]).resolve().is_relative_to(
@@ -118,7 +122,7 @@ def test_path_traversal_filename_is_not_used(env, admin):
     )
     files = _music_files(env)
     assert len(files) == 1
-    assert files[0] == f"{digest['sha256']}.mp3"
+    assert files[0] == f"{track['id']}.mp3"
 
 
 def test_metadata_edit_is_used_everywhere(env, admin):

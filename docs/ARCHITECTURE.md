@@ -83,6 +83,29 @@ installation plays music as soon as files exist; the owner can change both, and
 the choice persists. It cannot be deleted and its membership cannot be edited —
 removing music is done in the library, which immediately updates the playlist.
 
+## Media pipeline (1.1.0)
+
+Upload is two-phase. A received file is streamed to `music/.pending/`, probed with
+Mutagen and hashed; if it matches nothing it is stored as `music/<track_id><ext>`
+and inserted. If it matches an existing record by content (same SHA-256) or by
+normalised tags (title+artist, album equal or differing), the file stays pending
+with its own id until the owner decides «Сохранить копию» or «Пропустить». A
+pending file is invisible to the library, the system playlist, the queue and the
+public API. Confirmation is idempotent and creates an independent record
+(`duplicate_of`, `duplicate_kind`), never overwriting the original file.
+
+`sha256` is an indexed detection tool, not a uniqueness constraint; ids and
+physical paths stay unique. Metadata edits (title, artist, album) and custom
+covers live in SQLite and `covers/custom/`, never in the source audio file, and
+never restart the engine.
+
+Export is a background job: a single track is streamed (optionally from a
+temporary copy with rewritten ID3/APIC, no re-encoding), while a playlist, a
+selection or the whole library becomes a `ZIP_STORED` archive under
+`state/exports/<job>/` with `<NNN> - Artist - Title.ext` entries and
+`playlist.m3u8`. One archive runs at a time, memory stays bounded, free space is
+checked before starting, and archives expire automatically.
+
 ## Failure behaviour
 
 - Backend down: Liquidsoap keeps playing the prepared requests. On the next start

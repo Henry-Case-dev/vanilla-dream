@@ -80,10 +80,19 @@ class Settings:
     engine_label: str = "Liquidsoap"
     playlist_cover_dir: Path | None = None
     engine_start_grace: float = 10.0
+    pending_dir: Path | None = None
+    export_dir: Path | None = None
+    upload_ttl_hours: float = 24.0
+    export_ttl_hours: float = 6.0
+    export_reserve_bytes: int = 536870912
 
     def __post_init__(self) -> None:
         if self.playlist_cover_dir is None:
             object.__setattr__(self, "playlist_cover_dir", self.cover_dir / "playlists")
+        if self.pending_dir is None:
+            object.__setattr__(self, "pending_dir", self.music_dir / ".pending")
+        if self.export_dir is None:
+            object.__setattr__(self, "export_dir", self.db_path.parent / "exports")
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -126,6 +135,17 @@ class Settings:
             station_sudo=_env_bool("VD_STATION_SUDO", True),
             engine_label=_env("VD_ENGINE_LABEL", "Liquidsoap") or "Liquidsoap",
             engine_start_grace=_env_float("VD_ENGINE_START_GRACE", 10.0),
+            pending_dir=Path(
+                _env("VD_PENDING_DIR", str(Path(_env("VD_MUSIC_DIR", "/srv/vanilla-dream-radio/music")) / ".pending"))
+                or ""
+            ),
+            export_dir=Path(
+                _env("VD_EXPORT_DIR", str(Path(_env("VD_DB_PATH", "/var/lib/vanilla-dream-radio/app.db")).parent / "exports"))
+                or ""
+            ),
+            upload_ttl_hours=_env_float("VD_UPLOAD_TTL_HOURS", 24.0),
+            export_ttl_hours=_env_float("VD_EXPORT_TTL_HOURS", 6.0),
+            export_reserve_bytes=_env_int("VD_EXPORT_RESERVE_BYTES", 536870912),
         )
 
     def ensure_directories(self) -> None:
@@ -133,6 +153,8 @@ class Settings:
             self.music_dir,
             self.cover_dir,
             self.playlist_cover_dir,
+            self.pending_dir,
+            self.export_dir,
             self.engine_dir,
             self.queue_link_dir,
             self.db_path.parent,

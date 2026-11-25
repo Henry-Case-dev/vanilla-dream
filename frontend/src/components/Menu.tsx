@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { MoreHorizontal } from 'lucide-react';
+import { ChevronDown, MoreHorizontal } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 
 export interface MenuItem {
@@ -19,6 +19,9 @@ interface MenuButtonProps {
   align?: 'start' | 'end';
   icon?: LucideIcon;
   className?: string;
+  /** 'button' — видимая secondary-кнопка с подписью вместо иконки. */
+  trigger?: 'icon' | 'button';
+  buttonLabel?: string;
 }
 
 const MENU_WIDTH = 224;
@@ -27,7 +30,15 @@ const MENU_WIDTH = 224;
  * Меню действий. Список рендерится порталом с фиксированными координатами,
  * чтобы не обрезаться прокручиваемыми таблицами и нижней панелью.
  */
-export function MenuButton({ label, items, align = 'end', icon: Icon = MoreHorizontal, className = '' }: MenuButtonProps) {
+export function MenuButton({
+  label,
+  items,
+  align = 'end',
+  icon: Icon = MoreHorizontal,
+  className = '',
+  trigger = 'icon',
+  buttonLabel,
+}: MenuButtonProps) {
   const [open, setOpen] = useState(false);
   const [position, setPosition] = useState<{ top: number; left: number } | null>(null);
   const triggerRef = useRef<HTMLButtonElement | null>(null);
@@ -93,11 +104,15 @@ export function MenuButton({ label, items, align = 'end', icon: Icon = MoreHoriz
   }, [open]);
 
   return (
-    <div className={`menu ${className}`.trim()}>
+    <div className={`menu ${trigger === 'button' ? 'menu--button' : ''} ${className}`.trim()}>
       <button
         ref={triggerRef}
         type="button"
-        className={`icon-btn icon-btn--sm ${open ? 'is-active' : ''}`.trim()}
+        className={
+          trigger === 'button'
+            ? `btn btn--secondary btn--md ${open ? 'is-active' : ''}`.trim()
+            : `icon-btn icon-btn--sm ${open ? 'is-active' : ''}`.trim()
+        }
         aria-label={label}
         aria-haspopup="menu"
         aria-expanded={open}
@@ -105,6 +120,8 @@ export function MenuButton({ label, items, align = 'end', icon: Icon = MoreHoriz
         onClick={() => (open ? close() : openMenu())}
       >
         <Icon size={16} aria-hidden="true" />
+        {trigger === 'button' && <span className="btn__label">{buttonLabel ?? label}</span>}
+        {trigger === 'button' && <ChevronDown size={14} aria-hidden="true" />}
       </button>
       {open &&
         position &&

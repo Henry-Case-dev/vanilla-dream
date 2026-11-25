@@ -14,7 +14,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from . import api_admin, api_internal, api_public, auth, db, queue_engine
+from . import __version__, api_admin, api_internal, api_public, auth, db, exports, queue_engine, uploads
 from .config import Settings
 from .icecast import IcecastClient
 from .liquidsoap import LiquidsoapClient
@@ -95,6 +95,8 @@ async def lifespan(app: FastAPI):
                 (playback["position_id"],),
             )
         auth.purge_expired_sessions(conn, app.state.clock.now())
+        uploads.startup_cleanup(conn, settings)
+        exports.startup_cleanup(conn, settings, app.state.clock.now())
         queue_engine.deactivate_expired_overrides(conn, app.state.clock.now())
         conn.commit()
         now = app.state.clock.now()
@@ -168,7 +170,7 @@ def create_app(
     icecast = icecast if icecast is not None else IcecastClient(settings)
     station = station or StationController(settings, clock, engine=engine, icecast=icecast)
 
-    app = FastAPI(title="Vanilla Dream Radio", version="1.0.1", lifespan=lifespan)
+    app = FastAPI(title="Vanilla Dream Radio", version=__version__, lifespan=lifespan)
     app.state.settings = settings
     app.state.clock = clock
     app.state.engine = engine

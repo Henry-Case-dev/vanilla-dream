@@ -50,9 +50,20 @@ def track_payload(
 ) -> dict[str, Any]:
     track_id = _value(row, "id")
     cover_path = _value(row, "cover_path")
+    custom_cover = _value(row, "custom_cover_path")
+    effective_cover = custom_cover or cover_path
+    if custom_cover:
+        cover_kind = "custom"
+    elif cover_path:
+        cover_kind = "file"
+    else:
+        cover_kind = "none"
     cover_url = (
-        f"{settings.public_base_url}/api/public/cover/{track_id}" if cover_path else None
+        f"{settings.public_base_url}/api/public/cover/{track_id}"
+        if effective_cover
+        else None
     )
+    duplicate_of = _value(row, "duplicate_of")
     payload: dict[str, Any] = {
         "id": track_id,
         "title": _value(row, "title") or "",
@@ -65,6 +76,12 @@ def track_payload(
         "size": _value(row, "size"),
         "ext": _value(row, "ext"),
         "cover_url": cover_url,
+        "cover_kind": cover_kind,
+        "is_duplicate": bool(duplicate_of),
+        "duplicate_kind": _value(row, "duplicate_kind"),
+        "duplicate_of": duplicate_of,
+        "can_revert_cover": bool(custom_cover),
+        "source_filename": _value(row, "source_filename"),
         "play_count": _value(row, "play_count", 0) or 0,
         "pending_delete": bool(_value(row, "pending_delete", 0)),
         "created_at": _value(row, "created_at"),
@@ -138,19 +155,23 @@ def playlist_stats(conn: sqlite3.Connection, playlist_id: str) -> dict[str, int 
 def playlist_auto_cover(conn: sqlite3.Connection, playlist_id: str) -> str | None:
     if playlist_id == SYSTEM_PLAYLIST_ID:
         row = conn.execute(
-            "SELECT cover_path FROM tracks WHERE pending_delete = 0 "
-            "AND cover_path IS NOT NULL AND cover_path != '' "
+            "SELECT COALESCE(custom_cover_path, cover_path) AS cover FROM tracks "
+            "WHERE pending_delete = 0 "
+            "AND COALESCE(custom_cover_path, cover_path) IS NOT NULL "
+            "AND COALESCE(custom_cover_path, cover_path) != '' "
             "ORDER BY created_at ASC, id ASC LIMIT 1"
         ).fetchone()
     else:
         row = conn.execute(
-            "SELECT t.cover_path FROM playlist_tracks pt JOIN tracks t ON t.id = pt.track_id "
+            "SELECT COALESCE(t.custom_cover_path, t.cover_path) AS cover "
+            "FROM playlist_tracks pt JOIN tracks t ON t.id = pt.track_id "
             "WHERE pt.playlist_id = ? AND t.pending_delete = 0 "
-            "AND t.cover_path IS NOT NULL AND t.cover_path != '' "
+            "AND COALESCE(t.custom_cover_path, t.cover_path) IS NOT NULL "
+            "AND COALESCE(t.custom_cover_path, t.cover_path) != '' "
             "ORDER BY pt.position ASC LIMIT 1",
             (playlist_id,),
         ).fetchone()
-    return str(row["cover_path"]) if row and row["cover_path"] else None
+    return str(row["cover"]) if row and row["cover"] else None
 
 
 def playlist_payload(

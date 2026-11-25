@@ -63,6 +63,9 @@ export interface NowPlaying {
   statsAvailable: boolean;
 }
 
+export type DuplicateKind = 'content' | 'tags' | 'possible';
+export type TrackCoverKind = 'custom' | 'file' | 'none';
+
 export interface Track {
   id: string;
   title: string;
@@ -73,7 +76,14 @@ export interface Track {
   duration: number | null;
   bitrate: number | null;
   size: number | null;
+  ext: string | null;
   coverUrl: string | null;
+  coverKind: TrackCoverKind;
+  isDuplicate: boolean;
+  duplicateKind: DuplicateKind | null;
+  duplicateOf: string | null;
+  canRevertCover: boolean;
+  sourceFilename: string | null;
   createdAt: string | null;
   playlistsCount: number | null;
 }
@@ -268,4 +278,148 @@ export interface MeResult {
 export interface ConflictInfo {
   ruleIds: string[];
   message: string;
+}
+
+/* ------------------------------------------------------------------ */
+/* Загрузка музыки (VD-RADIO-MEDIA-02)                                 */
+/* ------------------------------------------------------------------ */
+
+export type DecisionAction = 'save' | 'skip';
+
+/** Поля сравнения «В медиатеке» / «Новый файл». */
+export interface TrackComparison {
+  id: string | null;
+  title: string | null;
+  artist: string | null;
+  album: string | null;
+  duration: number | null;
+  size: number | null;
+  bitrate: number | null;
+  coverUrl: string | null;
+}
+
+export interface PendingMatch {
+  kind: DuplicateKind;
+  track: TrackComparison;
+}
+
+export interface PendingUpload {
+  id: string;
+  reason: DuplicateKind | null;
+  metadata: TrackComparison | null;
+  matches: PendingMatch[];
+  decision: DecisionAction | null;
+}
+
+export type UploadItemState =
+  | 'queued'
+  | 'uploading'
+  | 'processing'
+  | 'added'
+  | 'pending'
+  | 'saved'
+  | 'skipped'
+  | 'cancelled'
+  | 'error';
+
+export interface UploadBatchItem {
+  id: string;
+  filename: string;
+  size: number | null;
+  state: UploadItemState;
+  reason: DuplicateKind | null;
+  metadata: TrackComparison | null;
+  matches: PendingMatch[];
+  decision: DecisionAction | null;
+  error: string | null;
+}
+
+export interface UploadBatchCounts {
+  added: number;
+  pending: number;
+  skipped: number;
+  errors: number;
+}
+
+export type UploadBatchStatus =
+  | 'uploading'
+  | 'processing'
+  | 'pending'
+  | 'done'
+  | 'cancelled'
+  | 'error';
+
+export interface UploadBatch {
+  id: string;
+  status: UploadBatchStatus;
+  total: number;
+  counts: UploadBatchCounts;
+  items: UploadBatchItem[];
+}
+
+export type UploadResponse =
+  | { status: 'added'; track: Track; batchId: string }
+  | { status: 'pending'; pending: PendingUpload; batchId: string };
+
+/* ------------------------------------------------------------------ */
+/* Экспорт (VD-RADIO-MEDIA-02)                                          */
+/* ------------------------------------------------------------------ */
+
+export type ExportFormat = 'zip' | 'files';
+export type ExportMetadataMode = 'tags' | 'original';
+export type ExportScopeKind = 'tracks' | 'playlist' | 'library';
+export type ExportJobState =
+  | 'queued'
+  | 'preparing'
+  | 'ready'
+  | 'downloading'
+  | 'cancelled'
+  | 'error';
+
+export interface ExportArchive {
+  name: string;
+  size: number;
+}
+
+export interface ExportJob {
+  id: string;
+  state: ExportJobState;
+  processed: number;
+  total: number;
+  progress: number;
+  archive: ExportArchive | null;
+  error: string | null;
+  expiresAt: string | null;
+}
+
+export interface ExportFile {
+  trackId: string;
+  name: string;
+  size: number;
+  url: string;
+}
+
+export type ExportCreateResult =
+  | { kind: 'job'; job: ExportJob }
+  | { kind: 'files'; files: ExportFile[] };
+
+export interface ExportRequest {
+  scope: ExportScopeKind;
+  ids?: string[];
+  playlist_id?: string;
+  format: ExportFormat;
+  metadata: ExportMetadataMode;
+}
+
+/** Состав, который показывает диалог экспорта до создания задания. */
+export interface ExportComposition {
+  scope: ExportScopeKind;
+  playlistId?: string;
+  ids?: string[];
+  title: string;
+  coverUrl: string | null;
+  count: number;
+  size: number | null;
+  /** Размер посчитан по загруженной части состава. */
+  partialSize?: boolean;
 }

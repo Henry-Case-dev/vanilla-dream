@@ -83,6 +83,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setCsrfToken(null);
     setState('guest');
     setBootError(null);
+    try {
+      // Индикаторы операций принадлежат сессии владельца, а не браузеру.
+      window.localStorage.removeItem('vd.upload.batch');
+      window.localStorage.removeItem('vd.export.job');
+    } catch {
+      /* приватный режим — нечего очищать */
+    }
     // Полная навигация очищает данные всех провайдеров (live/audio/query-состояния).
     window.location.replace('/admin/login');
   }, []);

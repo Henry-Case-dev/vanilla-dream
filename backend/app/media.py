@@ -7,10 +7,10 @@ import hashlib
 import io
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import tempfile
-import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import BinaryIO
@@ -184,6 +184,94 @@ def cover_path_for(settings: Settings, track_id: str) -> Path:
     return settings.cover_dir / f"{track_id}.jpg"
 
 
+def effective_cover_path(settings: Settings, row) -> Path | None:
+    """Return the effective cover file: custom first, then the extracted one."""
+
+    custom = row["custom_cover_path"] if "custom_cover_path" in row.keys() else None
+    if custom:
+        candidate = settings.cover_dir / str(custom)
+        if is_relative_to(candidate, settings.cover_dir) and candidate.exists():
+            return candidate
+    extracted = row["cover_path"] if "cover_path" in row.keys() else None
+    if extracted:
+        candidate = settings.cover_dir / str(extracted)
+        if is_relative_to(candidate, settings.cover_dir) and candidate.exists():
+            return candidate
+    return None
+
+
+def effective_cover_name(row) -> str | None:
+    custom = row["custom_cover_path"] if "custom_cover_path" in row.keys() else None
+    if custom:
+        return str(custom)
+    extracted = row["cover_path"] if "cover_path" in row.keys() else None
+    return str(extracted) if extracted else None
+
+
+def save_custom_cover(settings: Settings, track_id: str, stream: BinaryIO) -> str:
+    """Validate, crop and store a custom square 600x600 JPEG cover."""
+
+    from PIL import Image
+
+    data = stream.read(PLAYLIST_COVER_MAX_BYTES + 1)
+    if len(data) > PLAYLIST_COVER_MAX_BYTES:
+        raise ApiError(
+            413,
+            "cover_too_large",
+            "Обложка больше 8 МБ. Выберите файл меньшего размера.",
+        )
+    if not data:
+        raise ApiError(422, "invalid_cover", "Файл обложки пустой.")
+    try:
+        image = Image.open(io.BytesIO(data))
+        image.load()
+        if image.format not in ("JPEG", "PNG", "WEBP"):
+            raise ValueError("unsupported image format")
+    except Exception as exc:  # noqa: BLE001 - Pillow raises many formats
+        raise ApiError(
+            422,
+            "invalid_cover",
+            "Не удалось прочитать изображение. Поддерживаются JPEG, PNG и WebP.",
+        ) from exc
+    width, height = image.size
+    side = min(width, height)
+    left = (width - side) // 2
+    top = (height - side) // 2
+    image = image.crop((left, top, left + side, top + side))
+    if image.mode not in ("RGB", "L"):
+        image = image.convert("RGB")
+    image = image.resize((PLAYLIST_COVER_SIDE, PLAYLIST_COVER_SIDE), Image.LANCZOS)
+    digest = hashlib.sha256(data).hexdigest()[:8]
+    safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", str(track_id))[:64] or "track"
+    custom_dir = settings.cover_dir / "custom"
+    custom_dir.mkdir(parents=True, exist_ok=True)
+    destination = custom_dir / f"{safe_id}-{digest}.jpg"
+    fd, temp_name = tempfile.mkstemp(prefix=".cover-", suffix=".jpg", dir=str(custom_dir))
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            image.save(handle, format="JPEG", quality=88, optimize=True)
+        os.replace(temp_name, destination)
+    except BaseException:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
+    return f"custom/{destination.name}"
+
+
+def remove_custom_cover(settings: Settings, relative: str | None) -> None:
+    if not relative:
+        return
+    candidate = settings.cover_dir / str(relative)
+    if not is_relative_to(candidate, settings.cover_dir / "custom"):
+        return
+    try:
+        candidate.unlink(missing_ok=True)
+    except OSError:
+        LOGGER.warning("failed to delete custom cover %s", candidate, exc_info=True)
+
+
 def write_cover(settings: Settings, track_id: str, data: bytes) -> str | None:
     """Re-encode an embedded picture to JPEG (max 800x800) and store it."""
 
@@ -315,130 +403,13 @@ def ingest_upload(
     stream: BinaryIO,
     filename: str | None,
     now: datetime,
+    batch_id: str | None = None,
 ) -> dict:
-    """Stream an uploaded file to disk, validate it and insert the track row."""
+    """Compatibility shim: the two-phase pipeline lives in :mod:`app.uploads`."""
 
-    base_name, ext = _normalise_filename(filename)
-    max_upload_mb = db.get_int_setting(conn, "max_upload_mb", 300)
-    max_bytes = max_upload_mb * 1024 * 1024
-    settings.ensure_directories()
-    usage = disk_state(settings)
-    if settings.min_free_bytes and usage["free_bytes"] < settings.min_free_bytes:
-        raise ApiError(
-            507,
-            "not_enough_space",
-            "Недостаточно свободного места на диске для загрузки файла.",
-        )
-    temp_dir = settings.music_dir / ".upload"
-    temp_dir.mkdir(parents=True, exist_ok=True)
+    from . import uploads
 
-    digest = hashlib.sha256()
-    size = 0
-    fd, temp_name = tempfile.mkstemp(prefix="incoming-", suffix=ext, dir=str(temp_dir))
-    temp_path = Path(temp_name)
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            while True:
-                chunk = stream.read(CHUNK_SIZE)
-                if not chunk:
-                    break
-                size += len(chunk)
-                if size > max_bytes:
-                    raise ApiError(
-                        413,
-                        "file_too_large",
-                        f"Файл превышает допустимый размер {max_upload_mb} МБ.",
-                    )
-                digest.update(chunk)
-                handle.write(chunk)
-            handle.flush()
-            os.fsync(handle.fileno())
-        if size == 0:
-            raise ApiError(422, "empty_file", "Файл пустой.")
-
-        _check_upload_limits(conn, settings, size)
-        sha256 = digest.hexdigest()
-        existing = conn.execute(
-            "SELECT id, title, artist FROM tracks WHERE sha256 = ?", (sha256,)
-        ).fetchone()
-        if existing is not None:
-            raise ApiError(
-                409,
-                "duplicate",
-                "Этот файл уже есть в медиатеке.",
-                extra={"existing_track_id": existing["id"]},
-            )
-
-        meta = probe_audio(temp_path, ext)
-        target = settings.music_dir / f"{sha256}{ext}"
-        track_id = uuid.uuid4().hex
-        cover_name = None
-        audio = meta["audio"]
-        cover_bytes = extract_cover_bytes(audio, ext)
-        if cover_bytes:
-            cover_name = write_cover(settings, track_id, cover_bytes)
-
-        if target.exists():
-            temp_path.unlink(missing_ok=True)
-        else:
-            os.replace(temp_path, target)
-
-        tags = meta["tags"]
-        fallback_title = Path(base_name).stem.strip()
-        title = tags["title"] or fallback_title or "Без названия"
-        try:
-            relative = str(target.relative_to(settings.music_dir))
-        except ValueError:
-            relative = str(target)
-        stamp = to_iso(now)
-        try:
-            conn.execute(
-                "INSERT INTO tracks(id, sha256, path, ext, title, artist, album, genre, year, "
-                "duration, bitrate, size, cover_path, source_title, source_artist, source_album, "
-                "source_genre, play_count, pending_delete, created_at, updated_at) "
-                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)",
-                (
-                    track_id,
-                    sha256,
-                    relative,
-                    ext,
-                    title,
-                    tags["artist"],
-                    tags["album"],
-                    tags["genre"],
-                    tags["year"],
-                    meta["duration"],
-                    meta["bitrate"],
-                    size,
-                    cover_name,
-                    tags["title"],
-                    tags["artist"],
-                    tags["album"],
-                    tags["genre"],
-                    stamp,
-                    stamp,
-                ),
-            )
-            conn.commit()
-        except sqlite3.IntegrityError:
-            conn.rollback()
-            if cover_name:
-                cover_path_for(settings, track_id).unlink(missing_ok=True)
-            existing = conn.execute(
-                "SELECT id FROM tracks WHERE sha256 = ?", (sha256,)
-            ).fetchone()
-            raise ApiError(
-                409,
-                "duplicate",
-                "Этот файл уже есть в медиатеке.",
-                extra={"existing_track_id": existing["id"] if existing else None},
-            )
-        row = conn.execute("SELECT * FROM tracks WHERE id = ?", (track_id,)).fetchone()
-        db.log_event(conn, "info", "media", "Трек загружен", {"track_id": track_id}, at=stamp)
-        conn.commit()
-        return {"track": row, "duplicate": False, "size": size}
-    finally:
-        temp_path.unlink(missing_ok=True)
+    return uploads.receive_upload(conn, settings, stream, filename, now, batch_id=batch_id)
 
 
 def purge_track(conn: sqlite3.Connection, settings: Settings, track_id: str) -> None:
@@ -463,6 +434,8 @@ def purge_track(conn: sqlite3.Connection, settings: Settings, track_id: str) -> 
                 cover_file.unlink(missing_ok=True)
             except OSError:
                 LOGGER.warning("failed to delete cover %s", cover_file, exc_info=True)
+    if "custom_cover_path" in row.keys():
+        remove_custom_cover(settings, row["custom_cover_path"])
     positions = conn.execute(
         "SELECT id FROM queue_positions WHERE track_id = ?", (track_id,)
     ).fetchall()

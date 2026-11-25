@@ -10,10 +10,10 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 
-from . import db, queue_engine, scheduler
+from . import db, media, queue_engine, scheduler
 from .auth import get_conn
 from .models import STATE_LABELS, playlist_auto_cover, source_payload
-from .util import ApiError, clamp, parse_iso
+from .util import ApiError, clamp, is_relative_to, parse_iso
 
 router = APIRouter(tags=["public"])
 
@@ -29,8 +29,9 @@ def public_base(conn: sqlite3.Connection, settings) -> str:
 
 
 def _public_track(track: sqlite3.Row, settings, base: str) -> dict:
+    effective_cover = track["custom_cover_path"] or track["cover_path"]
     cover_url = (
-        f"{base}/api/public/cover/{track['id']}" if track["cover_path"] else None
+        f"{base}/api/public/cover/{track['id']}" if effective_cover else None
     )
     return {
         "id": track["id"],
@@ -155,8 +156,8 @@ def history(
     settings = request.app.state.settings
     base = public_base(conn, settings)
     rows = conn.execute(
-        "SELECT h.*, t.cover_path AS cover_path FROM history h "
-        "LEFT JOIN tracks t ON t.id = h.track_id "
+        "SELECT h.*, COALESCE(t.custom_cover_path, t.cover_path) AS cover_path "
+        "FROM history h LEFT JOIN tracks t ON t.id = h.track_id "
         "ORDER BY h.started_at DESC, h.id DESC LIMIT ?",
         (limit,),
     ).fetchall()
@@ -250,11 +251,13 @@ def public_cover(
     request: Request,
     conn: sqlite3.Connection = Depends(get_conn),
 ):
-    row = conn.execute("SELECT cover_path FROM tracks WHERE id = ?", (track_id,)).fetchone()
-    if row is None or not row["cover_path"]:
+    row = conn.execute(
+        "SELECT cover_path, custom_cover_path FROM tracks WHERE id = ?", (track_id,)
+    ).fetchone()
+    if row is None:
         raise ApiError(404, "cover_not_found", "Обложка не найдена.")
-    path = request.app.state.settings.cover_dir / str(row["cover_path"])
-    if not path.exists():
+    path = media.effective_cover_path(request.app.state.settings, row)
+    if path is None:
         raise ApiError(404, "cover_not_found", "Обложка не найдена.")
     return FileResponse(path, media_type="image/jpeg", headers={"Cache-Control": COVER_CACHE})
 
@@ -273,7 +276,7 @@ def playlist_cover(
         raise ApiError(404, "playlist_not_found", "Плейлист не найден.")
     if row["cover_path"]:
         path = settings.playlist_cover_dir / str(row["cover_path"])
-        if path.exists():
+        if is_relative_to(path, settings.playlist_cover_dir) and path.exists():
             return FileResponse(
                 path, media_type="image/jpeg", headers={"Cache-Control": COVER_CACHE}
             )
@@ -281,7 +284,7 @@ def playlist_cover(
     if not auto:
         raise ApiError(404, "cover_not_found", "Обложка не найдена.")
     path = settings.cover_dir / str(auto)
-    if not path.exists():
+    if not is_relative_to(path, settings.cover_dir) or not path.exists():
         raise ApiError(404, "cover_not_found", "Обложка не найдена.")
     return FileResponse(path, media_type="image/jpeg", headers={"Cache-Control": COVER_CACHE})
 

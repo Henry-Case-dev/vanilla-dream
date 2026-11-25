@@ -11,10 +11,11 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
 
-from fastapi import APIRouter, Body, Depends, File, Request, UploadFile
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, Form, Request, UploadFile
+from fastapi.responses import FileResponse, JSONResponse
+from starlette.background import BackgroundTask
 
-from . import db, media, playlists, queue_engine, scheduler
+from . import db, exports, media, playlists, queue_engine, scheduler, uploads
 from .auth import get_conn, require_csrf, require_session
 from .config import SUPPORTED_BITRATES, Settings
 from .models import (
@@ -28,7 +29,7 @@ from .models import (
     source_payload,
     track_payload,
 )
-from .util import ApiError, atomic_write_text, escape_liq_string, parse_iso, to_iso
+from .util import ApiError, atomic_write_text, escape_liq_string, is_relative_to, parse_iso, to_iso
 
 router = APIRouter(prefix="/api/admin", tags=["admin"], dependencies=[Depends(require_session)])
 
@@ -168,22 +169,132 @@ def list_track_ids(
     return {"ids": ids, "total": len(ids)}
 
 
-@router.post("/tracks/upload", status_code=201)
+@router.post("/tracks/upload")
 def upload_track(
     request: Request,
     file: UploadFile = File(...),
+    batch_id: str | None = Form(None),
     conn: sqlite3.Connection = Depends(get_conn),
     session: dict = Depends(require_csrf),
 ):
     settings = _settings(request)
-    result = media.ingest_upload(
-        conn, settings, file.file, file.filename, _now(request)
+    result = uploads.receive_upload(
+        conn, settings, file.file, file.filename, _now(request), batch_id=batch_id
     )
-    row = result["track"]
-    queue_engine.ensure_queue(conn, settings, _now(request))
-    _sync(request, conn)
-    request.app.state.scheduler.wake()
-    return {"track": track_payload(row, settings, include_source=True), "duplicate": False}
+    if result["status"] == "added":
+        queue_engine.ensure_queue(conn, settings, _now(request))
+        _sync(request, conn)
+        request.app.state.scheduler.wake()
+        payload = {
+            "status": "added",
+            "track": track_payload(result["track"], settings, include_source=True),
+            "batch_id": result["batch_id"],
+        }
+        return JSONResponse(payload, status_code=201)
+    return JSONResponse(
+        {
+            "status": "pending",
+            "pending": result["pending"],
+            "batch_id": result["batch_id"],
+        },
+        status_code=202,
+    )
+
+
+@router.get("/uploads/{batch_id}")
+def get_upload_batch(
+    batch_id: str,
+    request: Request,
+    conn: sqlite3.Connection = Depends(get_conn),
+):
+    payload = uploads.batch_payload(conn, _settings(request), batch_id)
+    if payload is None:
+        raise ApiError(404, "batch_not_found", "Загрузка не найдена.")
+    return {"batch": payload}
+
+
+@router.get("/uploads/{pending_id}/cover")
+def get_pending_cover(
+    pending_id: str,
+    request: Request,
+    conn: sqlite3.Connection = Depends(get_conn),
+):
+    row = conn.execute(
+        "SELECT cover_temp FROM pending_uploads WHERE id = ?", (pending_id,)
+    ).fetchone()
+    if row is None or not row["cover_temp"]:
+        raise ApiError(404, "cover_not_found", "Обложка не найдена.")
+    path = Path(str(row["cover_temp"]))
+    if not is_relative_to(path, _settings(request).pending_dir) or not path.exists():
+        raise ApiError(404, "cover_not_found", "Обложка не найдена.")
+    from PIL import Image
+
+    try:
+        with Image.open(path) as image:
+            image_format = image.format
+    except Exception:  # noqa: BLE001 - malformed pending cover
+        raise ApiError(404, "cover_not_found", "Обложка не найдена.")
+    media_type = {
+        "JPEG": "image/jpeg",
+        "PNG": "image/png",
+        "WEBP": "image/webp",
+    }.get(str(image_format or ""), "application/octet-stream")
+    return FileResponse(
+        path, media_type=media_type, headers={"Cache-Control": "private, max-age=0"}
+    )
+
+
+@router.post("/uploads/batch/{batch_id}/decide")
+def decide_upload_batch(
+    batch_id: str,
+    request: Request,
+    body: dict = Body(default={}),
+    conn: sqlite3.Connection = Depends(get_conn),
+    session: dict = Depends(require_csrf),
+):
+    data = body or {}
+    action = str(data.get("action") or "")
+    result = uploads.batch_decide(
+        conn,
+        _settings(request),
+        batch_id,
+        action,
+        str(data.get("scope") or "all"),
+        str(data.get("query") or ""),
+        _now(request),
+    )
+    if action == "save" and result.get("processed"):
+        queue_engine.ensure_queue(conn, _settings(request), _now(request))
+        _sync(request, conn)
+        request.app.state.scheduler.wake()
+    return result
+
+
+@router.post("/uploads/batch/{batch_id}/cancel")
+def cancel_upload_batch(
+    batch_id: str,
+    request: Request,
+    conn: sqlite3.Connection = Depends(get_conn),
+    session: dict = Depends(require_csrf),
+):
+    return uploads.batch_cancel(conn, _settings(request), batch_id, _now(request))
+
+
+@router.post("/uploads/{pending_id}/decide")
+def decide_upload(
+    pending_id: str,
+    request: Request,
+    body: dict = Body(default={}),
+    conn: sqlite3.Connection = Depends(get_conn),
+    session: dict = Depends(require_csrf),
+):
+    action = str((body or {}).get("action") or "")
+    result = uploads.decide(conn, _settings(request), pending_id, action, _now(request))
+    if action == "save":
+        queue_engine.ensure_queue(conn, _settings(request), _now(request))
+        _sync(request, conn)
+        request.app.state.scheduler.wake()
+    return result
 
 
 @router.patch("/tracks/{track_id}")
@@ -275,13 +386,80 @@ def track_cover(
     request: Request,
     conn: sqlite3.Connection = Depends(get_conn),
 ):
-    row = conn.execute("SELECT cover_path FROM tracks WHERE id = ?", (track_id,)).fetchone()
-    if row is None or not row["cover_path"]:
+    row = conn.execute(
+        "SELECT * FROM tracks WHERE id = ?", (track_id,)
+    ).fetchone()
+    if row is None:
         raise ApiError(404, "cover_not_found", "Обложка не найдена.")
-    path = _settings(request).cover_dir / str(row["cover_path"])
-    if not path.exists():
+    path = media.effective_cover_path(_settings(request), row)
+    if path is None:
         raise ApiError(404, "cover_not_found", "Обложка не найдена.")
     return FileResponse(path, media_type="image/jpeg")
+
+
+@router.post("/tracks/{track_id}/cover")
+def upload_track_cover(
+    track_id: str,
+    request: Request,
+    file: UploadFile = File(...),
+    conn: sqlite3.Connection = Depends(get_conn),
+    session: dict = Depends(require_csrf),
+):
+    settings = _settings(request)
+    row = conn.execute("SELECT * FROM tracks WHERE id = ?", (track_id,)).fetchone()
+    if row is None:
+        raise ApiError(404, "track_not_found", "Трек не найден.")
+    name = media.save_custom_cover(settings, track_id, file.file)
+    old = row["custom_cover_path"]
+    conn.execute(
+        "UPDATE tracks SET custom_cover_path = ?, updated_at = ? WHERE id = ?",
+        (name, to_iso(_now(request)), track_id),
+    )
+    conn.commit()
+    if old and old != name:
+        media.remove_custom_cover(settings, old)
+    updated = conn.execute("SELECT * FROM tracks WHERE id = ?", (track_id,)).fetchone()
+    return {"track": track_payload(updated, settings, include_source=True)}
+
+
+@router.delete("/tracks/{track_id}/cover")
+def delete_track_cover(
+    track_id: str,
+    request: Request,
+    conn: sqlite3.Connection = Depends(get_conn),
+    session: dict = Depends(require_csrf),
+):
+    settings = _settings(request)
+    row = conn.execute("SELECT * FROM tracks WHERE id = ?", (track_id,)).fetchone()
+    if row is None:
+        raise ApiError(404, "track_not_found", "Трек не найден.")
+    media.remove_custom_cover(settings, row["custom_cover_path"])
+    conn.execute(
+        "UPDATE tracks SET custom_cover_path = NULL, updated_at = ? WHERE id = ?",
+        (to_iso(_now(request)), track_id),
+    )
+    conn.commit()
+    updated = conn.execute("SELECT * FROM tracks WHERE id = ?", (track_id,)).fetchone()
+    return {"track": track_payload(updated, settings, include_source=True)}
+
+
+@router.get("/tracks/{track_id}/download")
+def download_track(
+    track_id: str,
+    request: Request,
+    mode: str = "tags",
+    conn: sqlite3.Connection = Depends(get_conn),
+):
+    path, media_type, disposition, cleanup = exports.single_download(
+        conn, _settings(request), track_id, mode, _now(request)
+    )
+    background = BackgroundTask(cleanup.unlink, missing_ok=True) if cleanup else None
+    return FileResponse(
+        path,
+        media_type=media_type,
+        headers={"Content-Disposition": disposition},
+        background=background,
+    )
 
 
 def _after_manual_change(request: Request, conn, settings, skip: bool) -> dict:
@@ -299,6 +477,58 @@ def _manual_add(request: Request, conn, track_id: str, mode: str, skip: bool) ->
     queue_engine.enqueue_manual(conn, settings, track_id, mode, _now(request))
     should_skip = skip and request.app.state.station.desired(conn) == "playing"
     return _after_manual_change(request, conn, settings, skip=should_skip)
+
+
+@router.post("/exports")
+def create_export(
+    request: Request,
+    background: BackgroundTasks,
+    body: dict = Body(default={}),
+    conn: sqlite3.Connection = Depends(get_conn),
+    session: dict = Depends(require_csrf),
+):
+    settings = _settings(request)
+    now = _now(request)
+    status, payload = exports.create_export(conn, settings, body or {}, now)
+    if status == 202:
+        background.add_task(exports.process_job, settings, payload["job"]["id"], now)
+    return JSONResponse(payload, status_code=status)
+
+
+@router.get("/exports/{job_id}")
+def get_export(
+    job_id: str,
+    request: Request,
+    conn: sqlite3.Connection = Depends(get_conn),
+):
+    return {"job": exports.get_job(conn, job_id)}
+
+
+@router.get("/exports/{job_id}/archive")
+def get_export_archive(
+    job_id: str,
+    request: Request,
+    conn: sqlite3.Connection = Depends(get_conn),
+):
+    settings = _settings(request)
+    path, name = exports.archive_file(conn, settings, job_id)
+    exports.mark_downloading(conn, job_id, _now(request))
+    return FileResponse(
+        path,
+        media_type="application/zip",
+        headers={"Content-Disposition": exports.content_disposition(name)},
+        background=BackgroundTask(exports.finish_download, settings, job_id),
+    )
+
+
+@router.post("/exports/{job_id}/cancel")
+def cancel_export(
+    job_id: str,
+    request: Request,
+    conn: sqlite3.Connection = Depends(get_conn),
+    session: dict = Depends(require_csrf),
+):
+    return exports.cancel_job(conn, _settings(request), job_id, _now(request))
 
 
 @router.post("/tracks/{track_id}/play-now")
@@ -1397,7 +1627,11 @@ def storage(request: Request, conn: sqlite3.Connection = Depends(get_conn)):
     settings = _settings(request)
     totals = db.library_totals(conn)
     cover_bytes = 0
-    for directory in (settings.cover_dir, settings.playlist_cover_dir):
+    for directory in (
+        settings.cover_dir,
+        settings.playlist_cover_dir,
+        settings.cover_dir / "custom",
+    ):
         try:
             for entry in os.scandir(directory):
                 if entry.is_file():
@@ -1440,8 +1674,8 @@ def admin_history(
 ):
     limit = max(1, min(int(limit or 50), 200))
     rows = conn.execute(
-        "SELECT h.*, t.cover_path AS cover_path FROM history h "
-        "LEFT JOIN tracks t ON t.id = h.track_id "
+        "SELECT h.*, COALESCE(t.custom_cover_path, t.cover_path) AS cover_path "
+        "FROM history h LEFT JOIN tracks t ON t.id = h.track_id "
         "ORDER BY h.started_at DESC, h.id DESC LIMIT ?",
         (limit,),
     ).fetchall()

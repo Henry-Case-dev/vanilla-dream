@@ -16,6 +16,7 @@ import { api } from '../lib/api';
 import { describeStationStatus, statusDotClass } from '../lib/status';
 import { useDataChanged } from '../lib/refresh';
 import { PlayerBar } from './PlayerBar';
+import { ExportIndicator } from './ExportIndicator';
 
 interface NavItem {
   to: string;
@@ -121,6 +122,7 @@ export function AdminLayout() {
 
       <main className="main">
         <div className="main__inner">
+          <ExportIndicator />
           <Outlet />
         </div>
       </main>

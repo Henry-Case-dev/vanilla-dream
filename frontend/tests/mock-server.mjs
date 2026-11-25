@@ -49,6 +49,12 @@ const tracks = Array.from({ length: 120 }, (_, index) => {
     size: 8000000 + index * 1000,
     ext: 'mp3',
     cover_url: index % 4 === 0 ? COVER : null,
+    cover_kind: index % 4 === 0 ? 'file' : 'none',
+    is_duplicate: index % 10 === 1,
+    duplicate_kind: index % 10 === 1 ? 'tags' : null,
+    duplicate_of: index % 10 === 1 ? 't1' : null,
+    can_revert_cover: index % 4 === 0,
+    source_filename: `track-${String(number).padStart(3, '0')}.mp3`,
     play_count: index,
     pending_delete: false,
     created_at: new Date(Date.UTC(2026, 10, 1, 0, index % 60)).toISOString(),
@@ -106,8 +112,105 @@ const state = {
 
 const byId = new Map(tracks.map((track) => [track.id, track]));
 
+const stateMedia = {
+  batches: new Map(),
+  exports: new Map(),
+  seq: 0,
+};
+
 function nowIso(offsetMs = 0) {
   return new Date(Date.now() + offsetMs).toISOString();
+}
+
+function nextId(prefix) {
+  stateMedia.seq += 1;
+  return `${prefix}${stateMedia.seq}`;
+}
+
+function comparison(track) {
+  return {
+    id: track.id,
+    title: track.title,
+    artist: track.artist,
+    album: track.album,
+    duration: track.duration,
+    size: track.size,
+    bitrate: track.bitrate,
+    cover_url: track.cover_url,
+  };
+}
+
+function batchItemPayload(item) {
+  return {
+    id: item.id,
+    filename: item.filename,
+    size: item.size,
+    state: item.state,
+    reason: item.reason,
+    metadata: item.metadata,
+    matches: item.matches,
+    decision: item.decision,
+    error: item.error,
+  };
+}
+
+function batchPayload(batch) {
+  const counts = { added: 0, pending: 0, skipped: 0, errors: 0 };
+  for (const item of batch.items) {
+    if (item.state === 'added' || item.state === 'saved') counts.added += 1;
+    else if (item.state === 'pending') counts.pending += 1;
+    else if (item.state === 'skipped') counts.skipped += 1;
+    else if (item.state === 'error') counts.errors += 1;
+  }
+  const status =
+    counts.pending > 0
+      ? 'pending'
+      : batch.cancelled
+        ? 'cancelled'
+        : batch.items.some((item) => item.state === 'uploading' || item.state === 'processing')
+          ? 'processing'
+          : 'done';
+  return {
+    id: batch.id,
+    status,
+    total: batch.items.length,
+    counts,
+    items: batch.items.map(batchItemPayload),
+  };
+}
+
+function readRaw(req) {
+  return new Promise((resolve) => {
+    const chunks = [];
+    req.on('data', (chunk) => chunks.push(chunk));
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+  });
+}
+
+function multipartField(buffer, name) {
+  const text = buffer.toString('latin1');
+  const match = text.match(new RegExp(`name="${name}"\\r?\\n\\r?\\n([^\\r]*)`));
+  return match ? match[1] : '';
+}
+
+function multipartFilename(buffer) {
+  const text = buffer.toString('latin1');
+  const match = text.match(/filename="([^"]*)"/);
+  if (!match) return 'upload.mp3';
+  return Buffer.from(match[1], 'latin1').toString('utf8');
+}
+
+function exportJobPayload(job) {
+  return {
+    id: job.id,
+    state: job.state,
+    processed: job.processed,
+    total: job.total,
+    progress: job.total > 0 ? job.processed / job.total : 0,
+    archive: job.archive,
+    error: job.error,
+    expires_at: job.expires_at,
+  };
 }
 
 function playlistTracks(id) {
@@ -458,6 +561,240 @@ const server = http.createServer(async (req, res) => {
         .map((track) => track.id);
       return json(res, 200, { ids, total: ids.length });
     }
+
+    if (route === '/api/admin/tracks/upload' && req.method === 'POST') {
+      const buffer = await readRaw(req);
+      const filename = multipartFilename(buffer);
+      const requestedBatch = multipartField(buffer, 'batch_id');
+      let batch = requestedBatch ? stateMedia.batches.get(requestedBatch) : null;
+      if (!batch) {
+        batch = { id: requestedBatch || nextId('b'), items: [], cancelled: false };
+        stateMedia.batches.set(batch.id, batch);
+      }
+      const lower = filename.toLowerCase();
+      const base = filename.replace(/\.[^.]+$/, '');
+      const size = Math.max(1024, buffer.length);
+      if (lower.includes('bad')) {
+        const item = {
+          id: nextId('u'),
+          filename,
+          size,
+          state: 'error',
+          reason: null,
+          metadata: null,
+          matches: [],
+          decision: null,
+          error: 'Файл повреждён или не читается',
+        };
+        batch.items.push(item);
+        return json(res, 422, {
+          detail: { code: 'invalid_audio', message: 'Файл повреждён или не читается' },
+        });
+      }
+      if (lower.includes('dup') || lower.includes('copy') || lower.includes('same')) {
+        const kind = lower.includes('same') ? 'content' : lower.includes('possible') ? 'possible' : 'tags';
+        const match = byId.get('t1');
+        const metadata = {
+          title: base,
+          artist: 'Новый артист',
+          album: 'Копии',
+          duration: 201,
+          size,
+          bitrate: 320,
+          cover_url: COVER,
+        };
+        const item = {
+          id: nextId('u'),
+          filename,
+          size,
+          state: 'pending',
+          reason: kind,
+          metadata,
+          matches: [
+            { duplicate_kind: kind, track: comparison(match) },
+            ...(kind === 'tags'
+              ? [{ duplicate_kind: 'possible', track: comparison(byId.get('t3')) }]
+              : []),
+          ],
+          decision: null,
+          error: null,
+        };
+        batch.items.push(item);
+        return json(res, 202, {
+          status: 'pending',
+          pending: {
+            id: item.id,
+            reason: kind,
+            metadata,
+            matches: item.matches,
+            decision: null,
+          },
+          batch_id: batch.id,
+        });
+      }
+      const id = nextId('up');
+      const track = {
+        id,
+        title: base,
+        artist: 'Новый артист',
+        album: 'Свежие загрузки',
+        genre: 'Ambient',
+        year: 2026,
+        duration: 187,
+        bitrate: 320,
+        size,
+        ext: 'mp3',
+        cover_url: COVER,
+        cover_kind: 'file',
+        is_duplicate: false,
+        duplicate_kind: null,
+        duplicate_of: null,
+        can_revert_cover: false,
+        source_filename: filename,
+        play_count: 0,
+        pending_delete: false,
+        created_at: nowIso(),
+        updated_at: nowIso(),
+        stream_url: `/api/admin/tracks/${id}/stream`,
+      };
+      tracks.unshift(track);
+      byId.set(id, track);
+      batch.items.push({
+        id: nextId('u'),
+        filename,
+        size,
+        state: 'added',
+        reason: null,
+        metadata: null,
+        matches: [],
+        decision: null,
+        error: null,
+      });
+      return json(res, 201, { status: 'added', track, batch_id: batch.id });
+    }
+
+    const batchMatch = route.match(/^\/api\/admin\/uploads\/([^/]+)$/);
+    if (batchMatch && req.method === 'GET') {
+      const batch = stateMedia.batches.get(decodeURIComponent(batchMatch[1]));
+      if (!batch) return json(res, 404, { detail: { code: 'batch_not_found', message: 'Пакет не найден' } });
+      return json(res, 200, { batch: batchPayload(batch) });
+    }
+
+    function applyDecision(item, action) {
+      item.decision = action;
+      item.state = action === 'save' ? 'saved' : 'skipped';
+      if (action === 'save') {
+        const id = nextId('up');
+        const source = item.matches[0]?.track;
+        const track = {
+          id,
+          title: item.metadata?.title || item.filename,
+          artist: item.metadata?.artist || 'Новый артист',
+          album: item.metadata?.album || 'Копии',
+          genre: 'Ambient',
+          year: 2026,
+          duration: item.metadata?.duration ?? 201,
+          bitrate: item.metadata?.bitrate ?? 320,
+          size: item.metadata?.size ?? item.size,
+          ext: 'mp3',
+          cover_url: item.metadata?.cover_url ?? COVER,
+          cover_kind: 'file',
+          is_duplicate: true,
+          duplicate_kind: item.reason,
+          duplicate_of: source?.id ?? 't1',
+          can_revert_cover: false,
+          source_filename: item.filename,
+          play_count: 0,
+          pending_delete: false,
+          created_at: nowIso(),
+          updated_at: nowIso(),
+          stream_url: `/api/admin/tracks/${id}/stream`,
+        };
+        tracks.unshift(track);
+        byId.set(id, track);
+      }
+    }
+
+    const decideMatch = route.match(/^\/api\/admin\/uploads\/([^/]+)\/decide$/);
+    if (decideMatch && req.method === 'POST') {
+      const body = await readBody(req);
+      const action = body.action === 'skip' ? 'skip' : 'save';
+      let found = null;
+      for (const batch of stateMedia.batches.values()) {
+        const item = batch.items.find((entry) => entry.id === decodeURIComponent(decideMatch[1]));
+        if (item) found = { batch, item };
+      }
+      if (!found) return json(res, 404, { detail: { code: 'pending_not_found', message: 'Файл не найден' } });
+      if (found.item.decision) {
+        if (found.item.decision === action) return json(res, 200, { ok: true, already: true });
+        return json(res, 409, {
+          detail: { code: 'already_decided', message: 'Решение уже принято' },
+        });
+      }
+      applyDecision(found.item, action);
+      return json(res, 200, { ok: true, batch: batchPayload(found.batch) });
+    }
+
+    const batchDecideMatch = route.match(/^\/api\/admin\/uploads\/batch\/([^/]+)\/decide$/);
+    if (batchDecideMatch && req.method === 'POST') {
+      const body = await readBody(req);
+      const action = body.action === 'skip' ? 'skip' : 'save';
+      const query = String(body.query || '').toLowerCase();
+      const batch = stateMedia.batches.get(decodeURIComponent(batchDecideMatch[1]));
+      if (!batch) return json(res, 404, { detail: { code: 'batch_not_found', message: 'Пакет не найден' } });
+      for (const item of batch.items) {
+        if (item.state !== 'pending' || item.decision) continue;
+        if (query && !`${item.filename} ${item.metadata?.title || ''} ${item.metadata?.artist || ''}`.toLowerCase().includes(query)) {
+          continue;
+        }
+        applyDecision(item, action);
+      }
+      return json(res, 200, { ok: true, batch: batchPayload(batch) });
+    }
+
+    const batchCancelMatch = route.match(/^\/api\/admin\/uploads\/batch\/([^/]+)\/cancel$/);
+    if (batchCancelMatch && req.method === 'POST') {
+      const batch = stateMedia.batches.get(decodeURIComponent(batchCancelMatch[1]));
+      if (!batch) return json(res, 404, { detail: { code: 'batch_not_found', message: 'Пакет не найден' } });
+      for (const item of batch.items) {
+        if (item.state === 'pending' && !item.decision) applyDecision(item, 'skip');
+      }
+      batch.cancelled = true;
+      return json(res, 200, { ok: true, batch: batchPayload(batch) });
+    }
+
+    const downloadMatch = route.match(/^\/api\/admin\/tracks\/([^/]+)\/download$/);
+    if (downloadMatch && req.method === 'GET') {
+      const track = byId.get(decodeURIComponent(downloadMatch[1]));
+      if (!track) return json(res, 404, { detail: { code: 'track_not_found', message: 'Трек не найден' } });
+      const mode = url.searchParams.get('mode') === 'original' ? 'original' : 'tags';
+      const filename = `${track.artist || 'Без исполнителя'} - ${track.title}.${track.ext || 'mp3'}`;
+      res.writeHead(200, {
+        'Content-Type': 'audio/mpeg',
+        'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`,
+        'X-Mock-Mode': mode,
+      });
+      return res.end(Buffer.from(`MOCK-AUDIO:${track.id}:${mode}`));
+    }
+
+    const trackCoverMatch = route.match(/^\/api\/admin\/tracks\/([^/]+)\/cover$/);
+    if (trackCoverMatch && (req.method === 'POST' || req.method === 'DELETE')) {
+      const track = byId.get(decodeURIComponent(trackCoverMatch[1]));
+      if (!track) return json(res, 404, { detail: { code: 'track_not_found', message: 'Трек не найден' } });
+      if (req.method === 'POST') {
+        await readRaw(req);
+        track.cover_url = `${COVER}?v=${Date.now()}`;
+        track.cover_kind = 'custom';
+        track.can_revert_cover = true;
+      } else {
+        track.cover_url = COVER;
+        track.cover_kind = 'file';
+        track.can_revert_cover = false;
+      }
+      track.updated_at = nowIso();
+      return json(res, 200, { track });
+    }
+
     if (/^\/api\/admin\/tracks\/[^/]+$/.test(route) && req.method === 'PATCH') {
       const body = await readBody(req);
       const track = byId.get(route.split('/').pop());
@@ -627,6 +964,85 @@ const server = http.createServer(async (req, res) => {
     if (route === '/api/admin/schedule/conflicts') return json(res, 200, { conflicts: [] });
     if (route === '/api/admin/rotation') return json(res, 200, { mode: 'sequential', items: [] });
     if (route === '/api/admin/rotation/next-preview') return json(res, 200, { playlist_id: 'library', playlist_name: 'Вся медиатека' });
+
+    if (route === '/api/admin/exports' && req.method === 'POST') {
+      const body = await readBody(req);
+      const metadata = body.metadata === 'original' ? 'original' : 'tags';
+      const scope = body.scope === 'playlist' || body.scope === 'tracks' ? body.scope : 'library';
+      let composition;
+      if (scope === 'tracks') {
+        composition = (Array.isArray(body.ids) ? body.ids : []).map((id) => byId.get(id)).filter(Boolean);
+      } else if (scope === 'playlist') {
+        composition = playlistTracks(body.playlist_id);
+      } else {
+        composition = tracks;
+      }
+      const names = composition.map((track) => ({
+        track,
+        name: `${track.artist || 'Без исполнителя'} - ${track.title}.${track.ext || 'mp3'}`,
+      }));
+      if (body.format === 'files') {
+        return json(res, 200, {
+          files: names.map(({ track, name }) => ({
+            track_id: track.id,
+            name,
+            size: track.size,
+            url: `/api/admin/tracks/${encodeURIComponent(track.id)}/download?mode=${metadata}`,
+          })),
+        });
+      }
+      const job = {
+        id: nextId('e'),
+        state: 'preparing',
+        processed: 0,
+        total: names.length,
+        archive: null,
+        error: null,
+        polls: 0,
+        expires_at: nowIso(6 * 3600 * 1000),
+      };
+      stateMedia.exports.set(job.id, job);
+      return json(res, 202, { job: exportJobPayload(job) });
+    }
+
+    const exportMatch = route.match(/^\/api\/admin\/exports\/([^/]+)$/);
+    if (exportMatch && req.method === 'GET') {
+      const job = stateMedia.exports.get(decodeURIComponent(exportMatch[1]));
+      if (!job) return json(res, 404, { detail: { code: 'export_not_found', message: 'Задание не найдено' } });
+      if (job.state === 'preparing') {
+        job.polls += 1;
+        const step = Math.max(1, Math.ceil(job.total / 3));
+        job.processed = Math.min(job.total, job.processed + step);
+        if (job.processed >= job.total) {
+          job.state = 'ready';
+          job.archive = { name: 'Vanilla Dream Radio.zip', size: 12345678 };
+        }
+      }
+      return json(res, 200, { job: exportJobPayload(job) });
+    }
+
+    const exportArchiveMatch = route.match(/^\/api\/admin\/exports\/([^/]+)\/archive$/);
+    if (exportArchiveMatch && req.method === 'GET') {
+      const job = stateMedia.exports.get(decodeURIComponent(exportArchiveMatch[1]));
+      if (!job || job.state !== 'ready') {
+        return json(res, 409, { detail: { code: 'archive_not_ready', message: 'Архив ещё не готов' } });
+      }
+      res.writeHead(200, {
+        'Content-Type': 'application/zip',
+        'Content-Disposition': 'attachment; filename="vanilla-dream-radio.zip"',
+      });
+      return res.end(Buffer.from('PK-MOCK-ARCHIVE'));
+    }
+
+    const exportCancelMatch = route.match(/^\/api\/admin\/exports\/([^/]+)\/cancel$/);
+    if (exportCancelMatch && req.method === 'POST') {
+      const job = stateMedia.exports.get(decodeURIComponent(exportCancelMatch[1]));
+      if (!job) return json(res, 404, { detail: { code: 'export_not_found', message: 'Задание не найдено' } });
+      job.state = 'cancelled';
+      job.archive = null;
+      return json(res, 200, { ok: true, job: exportJobPayload(job) });
+    }
+
     return json(res, 200, { ok: true });
   }
 
