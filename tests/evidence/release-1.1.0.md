@@ -35,10 +35,11 @@ bind to this commit.
 | backend `pytest -q` | 213 passed |
 | frontend `npm test` | 28 unit + 11 Playwright |
 | `tsc --noEmit`, `npm run build` | clean |
-| `tests/e2e/media_flow.py` (isolated, real backend/engine) | 23/23 — duplicates, decisions, editor, single download with ID3 read-back, playlist ZIP with duplicates and m3u8, selection export, station stays on air |
-| `tests/e2e/playwright_flow.py` | 51/51 (corrective scenarios unaffected) |
-| `tests/e2e/stress_checks.py` | 12/12 (62-track select-all, real audio −25 dB) |
+| `tests/e2e/media_flow.py` (isolated, real backend/engine) | all checks pass; 32/32 on a clean isolated station (the count depends on how many matches the batch produces) — duplicates, decisions, editor, single download with ID3 read-back, playlist ZIP with duplicates and m3u8, selection export, station stays on air |
+| `tests/e2e/playwright_flow.py` | 51/51 on a fresh station; on a station whose short test playlist finishes before the override banner is read, the banner checks are timing-dependent (the banner itself is confirmed in the UI) |
+| `tests/e2e/stress_checks.py` | 12/12 when the station is already playing (the flow expects live audio) |
 | Production migration | v2 → v3 with a verified backup: 29 tracks / 237 906 336 B, «Приснись нам, Земля» with 29 relations, history and settings preserved, station back on air |
+| Production download | `GET /tracks/{id}/download?mode=tags` returns the real MP3 with `Content-Disposition: attachment`, ID3 title/artist and an embedded APIC; `mode=original` works |
 | Adminbot | active, healthz ok before and after the deploy |
 
 ## Known limitations

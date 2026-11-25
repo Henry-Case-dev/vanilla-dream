@@ -46,6 +46,27 @@ log "Validating Liquidsoap configuration"
 install -o root -g root -m 0644 "$REL/radio/liquidsoap.liq" "$ETC_DIR/liquidsoap.liq"
 sudo -u "$RADIO_USER" /usr/bin/liquidsoap --check "$ETC_DIR/liquidsoap.liq" || die "invalid liquidsoap configuration"
 
+log "Backup before migration"
+BACKUP_DIR=/var/backups/vanilla-dream-radio/pre-deploy
+install -d -o "$RADIO_USER" -g "$RADIO_USER" -m 0750 "$BACKUP_DIR"
+STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+sudo -u "$RADIO_USER" /opt/vanilla-dream-radio/venv/bin/python - "$BACKUP_DIR" "$STAMP" <<'PY' || die "pre-deploy backup failed"
+import sqlite3, sys, pathlib
+dest_dir = pathlib.Path(sys.argv[1]); stamp = sys.argv[2]
+src = pathlib.Path('/var/lib/vanilla-dream-radio/app.db')
+if not src.exists():
+    print('no database yet, nothing to back up')
+    raise SystemExit(0)
+dst = dest_dir / f'app-{stamp}.db'
+s = sqlite3.connect(f'file:{src}?mode=ro', uri=True)
+o = sqlite3.connect(dst)
+with o:
+    s.backup(o)
+o.close(); s.close()
+print('backup', dst, dst.stat().st_size)
+PY
+ls -1dt "$BACKUP_DIR"/app-*.db 2>/dev/null | tail -n +8 | xargs -r rm -f --
+
 log "Ensuring runtime directories"
 install -d -o "$RADIO_USER" -g "$RADIO_USER" -m 0755 /srv/vanilla-dream-radio/covers/playlists
 install -d -o "$RADIO_USER" -g "$RADIO_USER" -m 0750 /srv/vanilla-dream-radio/music/.pending

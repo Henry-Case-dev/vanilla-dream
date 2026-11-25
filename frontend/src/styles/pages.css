@@ -2314,10 +2314,18 @@
 .decisions-list {
   display: grid;
   gap: 8px;
-  max-height: min(44vh, 360px);
+  max-height: min(48vh, 420px);
   overflow-y: auto;
+  scroll-snap-type: y proximity;
+  scroll-padding-block: 10px 14px;
   margin: 0 -2px;
-  padding: 0 2px;
+  padding: 0 2px 14px;
+  -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 18px), transparent);
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 18px), transparent);
+}
+
+.decision {
+  scroll-snap-align: start;
 }
 
 .decision {

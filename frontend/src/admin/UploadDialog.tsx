@@ -10,6 +10,7 @@ import {
   X,
 } from 'lucide-react';
 import { Button, ProgressBar, Spinner } from '../components/ui';
+import { pluralRu } from '../lib/format';
 import { Modal } from '../components/Modal';
 import { InlineError } from '../components/States';
 import { useUploads } from '../lib/uploads';
@@ -234,7 +235,7 @@ export function UploadDialog({
             <ListChecks size={18} aria-hidden="true" />
           </span>
           <div className="upload-matches__text">
-            <strong>Обнаружено {needsDecision} совпадений</strong>
+            <strong>Обнаружено {needsDecision}{' '}{pluralRu(needsDecision, ['совпадение', 'совпадения', 'совпадений'])}</strong>
             <span>Файлы сохранены во временном хранилище и ждут решения.</span>
           </div>
           <Button
