@@ -813,6 +813,22 @@ def test_start_grace_expires_to_sync_error(env, admin):
     assert status["reason"] == "engine_sync_failed"
 
 
+def test_restart_resets_start_grace(env, admin):
+    _upload(env, "grace-restart")
+    env.engine.sync_ok = False
+    env.client.post("/api/admin/station/start")
+    env.clock.advance(10.1)
+    env.app.state.scheduler.tick()
+    assert env.client.get("/api/admin/station/status").json()["state"] == "error"
+    restarted = env.client.post("/api/admin/station/restart")
+    assert restarted.status_code == 200
+    assert restarted.json()["state"] == "starting"
+    assert restarted.json()["reason"] == "engine_starting"
+    status = env.client.get("/api/admin/station/status").json()
+    assert status["state"] == "starting"
+    assert status["reason"] == "engine_starting"
+
+
 def test_stop_resets_start_grace(env, admin):
     _upload(env, "grace-stop")
     env.engine.sync_ok = False

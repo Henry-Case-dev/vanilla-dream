@@ -1367,6 +1367,7 @@ def sync_engine(
         ok = bool(engine and engine.sync())
         resolved = len(lines)
         failed = 0
+    engine_ok = ok
     if ok and resolved is None:
         resolved = len(lines)
     if ok and lines and (resolved or 0) == 0:
@@ -1416,7 +1417,8 @@ def sync_engine(
             )
         db.delete_setting(conn, "_engine_sync_error")
         db.set_setting(conn, "engine_last_error", "")
-        db.set_setting(conn, "_engine_start_synced", "1")
+        if not empty_valid or engine_ok:
+            db.set_setting(conn, "_engine_start_synced", "1")
         if db.get_setting(conn, "_sync_warned") == "1":
             db.delete_setting(conn, "_sync_warned")
             db.log_event(conn, "info", "engine", "Синхронизация очереди с движком восстановлена", None)

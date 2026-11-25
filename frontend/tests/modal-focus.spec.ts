@@ -35,11 +35,12 @@ async function recordActive(
   page: Page,
   field: string,
   key: string,
-): Promise<{ tag: string; text: string; aria: string | null }> {
+): Promise<{ tag: string; id: string | null; text: string; aria: string | null }> {
   const info = await page.evaluate(() => {
     const active = document.activeElement as HTMLElement | null;
     return {
       tag: active?.tagName ?? 'NONE',
+      id: active?.id || null,
       text: active?.textContent?.trim().slice(0, 80) ?? '',
       aria: active?.getAttribute('aria-label'),
     };
@@ -48,7 +49,7 @@ async function recordActive(
     field,
     key,
     activeTag: info.tag,
-    activeId: null,
+    activeId: info.id,
     activePlaceholder: info.aria ?? info.text,
   });
   return info;
@@ -190,7 +191,11 @@ test('add-tracks, metadata, password and confirm dialogs use the same focus cont
   page,
 }) => {
   await page.goto('/admin/playlists/p1');
-  await page.getByRole('button', { name: 'Добавить треки' }).click();
+  await page.waitForSelector('.playlist-row:not(.playlist-row--head)');
+  await page
+    .locator('.playlist-head__actions')
+    .getByRole('button', { name: 'Добавить треки' })
+    .click();
   const addDialog = page.getByRole('dialog');
   await expect(addDialog).toBeVisible();
   const search = addDialog.getByLabel('Поиск треков');
@@ -264,7 +269,9 @@ test('Escape restores focus to the real opener for create and add dialogs', asyn
 
   await page.goto('/admin/playlists/p1');
   await page.waitForSelector('.playlist-row:not(.playlist-row--head)');
-  const addTrigger = page.getByRole('button', { name: 'Добавить треки' });
+  const addTrigger = page
+    .locator('.playlist-head__actions')
+    .getByRole('button', { name: 'Добавить треки' });
   await recordActive(page, 'add-tracks-dialog', 'before-trigger-click');
   await addTrigger.click();
   const addDialog = page.getByRole('dialog');
