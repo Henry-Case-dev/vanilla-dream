@@ -15,6 +15,8 @@ UNIT=vanilla-dream-radio-e2e-liquidsoap.service
 log() { printf '\n== %s\n' "$*"; }
 
 log "Reset isolated state (test instance only)"
+pkill -f "uvicorn app.main:app --host 127.0.0.1 --port $PORT_API" 2>/dev/null || true
+systemctl stop "$UNIT" vanilla-dream-radio-e2e-icecast.service 2>/dev/null || true
 rm -rf "$ROOT"
 install -d -o vdradio -g vdradio -m 0755 "$ROOT"/{music,covers,covers/playlists,state,log,run,etc}
 
@@ -62,7 +64,7 @@ sed -e "s|/etc/vanilla-dream-radio|$ROOT/etc|g" -e "s|port=8101|port=$PORT_ICE|"
 chown -R vdradio:vdradio "$ROOT"
 chmod 0644 "$ROOT/etc/liquidsoap.liq"
 
-log "Isolated Icecast unit"
+log "Isolated units"
 cat > /etc/systemd/system/vanilla-dream-radio-e2e-icecast.service <<EOF
 [Unit]
 Description=VDR e2e Icecast
@@ -76,8 +78,6 @@ Restart=no
 [Install]
 WantedBy=multi-user.target
 EOF
-
-log "Isolated Liquidsoap unit"
 cat > /etc/systemd/system/$UNIT <<EOF
 [Unit]
 Description=VDR e2e Liquidsoap
@@ -93,13 +93,22 @@ Restart=no
 WantedBy=multi-user.target
 EOF
 
+log "Isolated sudoers (test unit only)"
+cat > /etc/sudoers.d/vdr-e2e <<EOF
+vdradio ALL=(root) NOPASSWD: /usr/bin/systemctl start $UNIT
+vdradio ALL=(root) NOPASSWD: /usr/bin/systemctl stop $UNIT
+vdradio ALL=(root) NOPASSWD: /usr/bin/systemctl restart $UNIT
+vdradio ALL=(root) NOPASSWD: /usr/bin/systemctl is-active $UNIT
+EOF
+chmod 0440 /etc/sudoers.d/vdr-e2e
+visudo -cf /etc/sudoers.d/vdr-e2e >/dev/null
+
 systemctl daemon-reload
-systemctl stop "$UNIT" vanilla-dream-radio-e2e-icecast.service 2>/dev/null || true
 systemctl start vanilla-dream-radio-e2e-icecast.service
 sleep 2
 curl -fsS --max-time 3 http://127.0.0.1:$PORT_ICE/status-json.xsl >/dev/null && echo "e2e icecast up on $PORT_ICE"
 
-log "Isolated API (root, no sudo wrapper, own DB)"
+log "Isolated API as vdradio (same user as the engine, like production)"
 cat > "$ROOT/state/env" <<EOF
 VD_DB_PATH=$ROOT/state/app.db
 VD_MUSIC_DIR=$ROOT/music
@@ -110,7 +119,7 @@ VD_ENGINE_DIR=$ROOT/run
 VD_ENGINE_QUEUE_FILE=$ROOT/run/engine-queue.txt
 VD_ENGINE_SOCKET=$ROOT/run/liquidsoap.sock
 VD_ENGINE_UNIT=$UNIT
-VD_STATION_SUDO=0
+VD_STATION_SUDO=1
 VD_ENGINE_LABEL=Liquidsoap-e2e
 VD_ENCODER_FILE=$ROOT/etc/encoder.liq
 VD_STATION_FILE=$ROOT/etc/station.liq
@@ -123,15 +132,16 @@ VD_PUBLIC_BASE_URL=http://127.0.0.1:18080
 VD_SECURE_COOKIES=0
 VD_SCHEDULER_TICK=1.0
 EOF
-chmod 0600 "$ROOT/state/env"
-set -a; source "$ROOT/state/env"; set +a
-cd "$APP/backend"
-/opt/vanilla-dream-radio/venv/bin/python -m app.cli init-db
-printf 'e2e-owner-password\n' | /opt/vanilla-dream-radio/venv/bin/python -m app.cli set-password
+chown root:vdradio "$ROOT/state/env"
+chmod 0640 "$ROOT/state/env"
 
-pkill -f "uvicorn app.main:app --host 127.0.0.1 --port $PORT_API" 2>/dev/null || true
-sleep 1
-setsid env $(grep -v '^#' "$ROOT/state/env" | xargs) \
+cd "$APP/backend"
+sudo -u vdradio env $(grep -v '^#' "$ROOT/state/env" | xargs) \
+  /opt/vanilla-dream-radio/venv/bin/python -m app.cli init-db
+printf 'e2e-owner-password\n' | sudo -u vdradio env $(grep -v '^#' "$ROOT/state/env" | xargs) \
+  /opt/vanilla-dream-radio/venv/bin/python -m app.cli set-password
+
+setsid sudo -u vdradio env $(grep -v '^#' "$ROOT/state/env" | xargs) \
   /opt/vanilla-dream-radio/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port $PORT_API \
   > "$ROOT/log/api.log" 2>&1 < /dev/null &
 sleep 3
@@ -139,9 +149,11 @@ curl -fsS --max-time 5 http://127.0.0.1:$PORT_API/api/public/now-playing >/dev/n
 
 log "Front door (static + proxy)"
 pkill -f harness_proxy.py 2>/dev/null || true
-setsid env VDR_E2E_DIST="/opt/vanilla-dream-radio/frontend-dist" VDR_E2E_API_PORT=$PORT_API \
-  VDR_E2E_ICECAST_PORT=$PORT_ICE VDR_E2E_PROXY_PORT=$PORT_WEB \
-  python3 "$APP/tests/e2e/harness_proxy.py" > "$ROOT/log/proxy.log" 2>&1 < /dev/null &
+sleep 1
+cd /opt/vanilla-dream-radio/current
+nohup setsid env VDR_E2E_DIST=/opt/vanilla-dream-radio/frontend-dist \
+  VDR_E2E_API_PORT=$PORT_API VDR_E2E_ICECAST_PORT=$PORT_ICE VDR_E2E_PROXY_PORT=$PORT_WEB \
+  python3 tests/e2e/harness_proxy.py > "$ROOT/log/proxy.log" 2>&1 < /dev/null &
 sleep 2
 curl -fsS --max-time 5 -o /dev/null -w "e2e front door: %{http_code}\n" http://127.0.0.1:$PORT_WEB/
 
