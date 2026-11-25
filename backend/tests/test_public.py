@@ -307,8 +307,10 @@ def test_public_base_url_setting_changes_links(env, admin):
     payload = env.client.get("/api/public/now-playing").json()
     assert payload["station"]["stream_url"] == "https://radio.example.test/radio.mp3"
     assert "https://radio.example.test/radio.mp3" in env.client.get("/radio.m3u").text
-    links = env.client.get("/api/admin/links").json()
-    assert links["world_radio"] == "https://radio.example.test/radio.mp3"
+    links = env.client.get("/api/admin/links").json()["links"]
+    by_key = {item["key"]: item for item in links}
+    assert by_key["mp3"]["url"] == "https://radio.example.test/radio.mp3"
+    assert "world_radio" not in by_key
 
 
 def test_cover_cache_headers(env, admin):

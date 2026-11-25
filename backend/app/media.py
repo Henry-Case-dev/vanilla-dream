@@ -28,6 +28,8 @@ LOGGER = logging.getLogger("vdradio.media")
 ALLOWED_EXTS = (".mp3", ".flac", ".ogg", ".m4a")
 CHUNK_SIZE = 1024 * 1024
 MAX_COVER_SIDE = 800
+PLAYLIST_COVER_SIDE = 600
+PLAYLIST_COVER_MAX_BYTES = 8 * 1024 * 1024
 YEAR_MIN = 1900
 YEAR_MAX = 2100
 
@@ -202,6 +204,60 @@ def write_cover(settings: Settings, track_id: str, data: bytes) -> str | None:
     except Exception:  # noqa: BLE001 - invalid picture data must not fail ingest
         LOGGER.warning("failed to re-encode cover for %s", track_id, exc_info=True)
         return None
+
+
+def save_playlist_cover(
+    settings: Settings, playlist_id: str, stream: BinaryIO
+) -> str:
+    """Validate, crop, resize and store a custom playlist cover as JPEG."""
+
+    from PIL import Image
+
+    data = stream.read(PLAYLIST_COVER_MAX_BYTES + 1)
+    if len(data) > PLAYLIST_COVER_MAX_BYTES:
+        raise ApiError(
+            413,
+            "cover_too_large",
+            "Обложка больше 8 МБ. Выберите файл меньшего размера.",
+        )
+    if not data:
+        raise ApiError(422, "invalid_cover", "Файл обложки пустой.")
+    try:
+        image = Image.open(io.BytesIO(data))
+        image.load()
+        if image.format not in ("JPEG", "PNG", "WEBP"):
+            raise ValueError("unsupported image format")
+    except Exception as exc:  # noqa: BLE001 - Pillow raises many formats
+        raise ApiError(
+            422,
+            "invalid_cover",
+            "Не удалось прочитать изображение. Поддерживаются JPEG, PNG и WebP.",
+        ) from exc
+    settings.playlist_cover_dir.mkdir(parents=True, exist_ok=True)
+    width, height = image.size
+    side = min(width, height)
+    left = (width - side) // 2
+    top = (height - side) // 2
+    image = image.crop((left, top, left + side, top + side))
+    if image.mode not in ("RGB", "L"):
+        image = image.convert("RGB")
+    image = image.resize((PLAYLIST_COVER_SIDE, PLAYLIST_COVER_SIDE), Image.LANCZOS)
+    digest = hashlib.sha256(data).hexdigest()[:8]
+    destination = settings.playlist_cover_dir / f"{playlist_id}-{digest}.jpg"
+    fd, temp_name = tempfile.mkstemp(
+        prefix=".cover-", suffix=".jpg", dir=str(settings.playlist_cover_dir)
+    )
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            image.save(handle, format="JPEG", quality=88, optimize=True)
+        os.replace(temp_name, destination)
+    except BaseException:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
+    return destination.name
 
 
 def resolve_track_path(settings: Settings, row: sqlite3.Row) -> Path:

@@ -62,6 +62,23 @@ def test_sync_reads_reply_until_end():
     assert sock.replies == b"remaining"  # reading stopped at the END line
 
 
+def test_sync_report_parses_resolved_and_failed():
+    client, sock = _client(b"OK 2 1\nEND\n")
+    report = client.sync_report()
+    assert report["ok"] is True
+    assert report["resolved"] == 2
+    assert report["failed"] == 1
+    assert sock.sent == b"vd_sync\n"
+
+
+def test_sync_report_tolerates_plain_ok():
+    client, _sock = _client(b"OK\nEND\n")
+    report = client.sync_report()
+    assert report["ok"] is True
+    assert report["resolved"] is None
+    assert report["failed"] is None
+
+
 def test_vd_skip_is_allow_listed_and_used_first():
     assert "vd_skip" in ALLOWED_COMMANDS
     client, sock = _client(b"OK\nEND\n")

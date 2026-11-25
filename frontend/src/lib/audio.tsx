@@ -4,6 +4,8 @@ import { useLive } from './live';
 
 const VOLUME_KEY = 'vd-radio-volume';
 
+export type LocalPlaybackState = 'idle' | 'connecting' | 'playing' | 'reconnecting' | 'error';
+
 export interface AudioApi {
   /** Локальное прослушивание потока — не влияет на эфир и очередь станции. */
   playing: boolean;
@@ -11,6 +13,8 @@ export interface AudioApi {
   volume: number;
   error: string | null;
   canPlay: boolean;
+  unavailableReason: string | null;
+  state: LocalPlaybackState;
   play: () => Promise<void>;
   stop: () => void;
   toggle: () => Promise<void>;
@@ -33,21 +37,30 @@ function readVolume(): number {
 export function AudioProvider({ children }: { children: ReactNode }) {
   const { now } = useLive();
   const streamUrl = now?.station.streamUrl ?? '';
+  const desired = now?.station.desired ?? 'stopped';
+  const unavailableReason = !streamUrl
+    ? 'Ссылка на поток ещё не получена от сервера'
+    : desired !== 'playing'
+      ? 'Сначала запустите эфир'
+      : null;
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const [playing, setPlaying] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [volume, setVolumeState] = useState(readVolume);
+  const [state, setState] = useState<LocalPlaybackState>('idle');
 
   const playingRef = useRef(false);
   const retryRef = useRef(0);
   const volumeRef = useRef(volume);
   const urlRef = useRef(streamUrl);
+  const desiredRef = useRef(desired);
 
   playingRef.current = playing;
   volumeRef.current = volume;
   urlRef.current = streamUrl;
+  desiredRef.current = desired;
 
   useEffect(() => {
     const element = audioRef.current;
@@ -77,9 +90,11 @@ export function AudioProvider({ children }: { children: ReactNode }) {
       element.volume = volumeRef.current;
       await element.play();
       setPlaying(true);
+      setState('playing');
       setError(null);
     } catch (caught) {
       setPlaying(false);
+      setState('error');
       if (caught instanceof DOMException && caught.name === 'NotAllowedError') {
         setError('Браузер заблокировал воспроизведение. Нажмите кнопку ещё раз.');
       } else {
@@ -99,6 +114,7 @@ export function AudioProvider({ children }: { children: ReactNode }) {
       element.load();
     }
     setPlaying(false);
+    setState('idle');
     setError(null);
   }, []);
 
@@ -110,6 +126,12 @@ export function AudioProvider({ children }: { children: ReactNode }) {
     await play();
   }, [play, stop]);
 
+  useEffect(() => {
+    if (desired === 'playing') return;
+    if (!playingRef.current) return;
+    stop();
+  }, [desired, stop]);
+
   const setVolume = useCallback((value: number) => {
     const clamped = Math.min(1, Math.max(0, value));
     setVolumeState(clamped);
@@ -118,11 +140,13 @@ export function AudioProvider({ children }: { children: ReactNode }) {
   const handlePlaying = useCallback(() => {
     retryRef.current = 0;
     setPlaying(true);
+    setState('playing');
     setError(null);
   }, []);
 
   const handlePause = useCallback(() => {
     setPlaying(false);
+    setState('idle');
   }, []);
 
   const handleError = useCallback(() => {
@@ -151,13 +175,15 @@ export function AudioProvider({ children }: { children: ReactNode }) {
       busy,
       volume,
       error,
-      canPlay: Boolean(streamUrl),
+      canPlay: Boolean(streamUrl) && desired === 'playing',
+      unavailableReason,
+      state,
       play,
       stop,
       toggle,
       setVolume,
     }),
-    [playing, busy, volume, error, streamUrl, play, stop, toggle, setVolume],
+    [playing, busy, volume, error, streamUrl, desired, unavailableReason, state, play, stop, toggle, setVolume],
   );
 
   return (

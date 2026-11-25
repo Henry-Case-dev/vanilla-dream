@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import type { DragEvent } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import {
   ArrowDown,
   ArrowUp,
@@ -38,6 +39,7 @@ import { useAudio } from '../lib/audio';
 import { api, ApiError, errorMessage } from '../lib/api';
 import { formatBytes, formatCount, formatDuration, pluralRu, tracksLabel } from '../lib/format';
 import { isAcceptedAudioFile, UPLOAD_ACCEPT, uploadTrack } from '../lib/upload';
+import { notifyDataChanged } from '../lib/refresh';
 import type { UploadHandle } from '../lib/upload';
 
 const PAGE_SIZE = 50;
@@ -88,6 +90,7 @@ function HeaderCheckbox({
 
 export function LibraryPage() {
   const toast = useToast();
+  const [searchParams, setSearchParams] = useSearchParams();
   const { now } = useLive();
   const audio = useAudio();
   const desired = now?.station.desired ?? 'stopped';
@@ -138,6 +141,14 @@ export function LibraryPage() {
   const previewRef = useRef<HTMLAudioElement | null>(null);
 
   const [uploadOpen, setUploadOpen] = useState(false);
+
+  useEffect(() => {
+    if (searchParams.get('upload') !== '1') return;
+    setUploadOpen(true);
+    const next = new URLSearchParams(searchParams);
+    next.delete('upload');
+    setSearchParams(next, { replace: true });
+  }, [searchParams, setSearchParams]);
   const [uploadItems, setUploadItems] = useState<UploadItem[]>([]);
   const [uploadRunning, setUploadRunning] = useState(false);
   const [dragActive, setDragActive] = useState(false);
@@ -229,6 +240,7 @@ export function LibraryPage() {
           ),
         );
         void reloadTracks.current(true);
+        notifyDataChanged();
       })
       .catch((caught) => {
         const aborted = caught instanceof ApiError && caught.code === 'aborted';
@@ -362,6 +374,7 @@ export function LibraryPage() {
       toast.notify('success', 'Метаданные сохранены');
       setEditTrack(null);
       void tracks.reload(true);
+      notifyDataChanged();
     } catch (caught) {
       toast.notify('error', errorMessage(caught));
     } finally {
@@ -383,6 +396,7 @@ export function LibraryPage() {
       setDeleteTarget(null);
       void tracks.reload(true);
       void playlists.reload(true);
+      notifyDataChanged();
     } catch (caught) {
       toast.notify('error', errorMessage(caught));
     } finally {
@@ -399,6 +413,7 @@ export function LibraryPage() {
       setBulkDeleteOpen(false);
       setSelected(new Set());
       void tracks.reload(true);
+      notifyDataChanged();
     } catch (caught) {
       toast.notify('error', errorMessage(caught));
     } finally {
@@ -415,6 +430,7 @@ export function LibraryPage() {
       setAddToPlaylistOpen(false);
       setSelected(new Set());
       void playlists.reload(true);
+      notifyDataChanged();
     } catch (caught) {
       toast.notify('error', errorMessage(caught));
     } finally {

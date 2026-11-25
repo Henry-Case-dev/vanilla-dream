@@ -193,7 +193,7 @@ export function intervalLabel(start: string, end: string): string {
 export function sourceKindLabel(kind: string | null | undefined): string {
   switch (kind) {
     case 'override':
-      return 'Ручное переопределение';
+      return 'Ручной выбор';
     case 'schedule':
       return 'Расписание';
     case 'rotation':
@@ -206,25 +206,6 @@ export function sourceKindLabel(kind: string | null | undefined): string {
       return 'Ручная очередь';
     default:
       return kind ? kind : 'Источник';
-  }
-}
-
-export function statusText(status: string | null | undefined): string {
-  switch (status) {
-    case 'on_air':
-      return 'В эфире';
-    case 'starting':
-      return 'Запуск';
-    case 'reconnecting':
-      return 'Переподключение';
-    case 'no_music':
-      return 'Нет музыки';
-    case 'error':
-      return 'Ошибка';
-    case 'off':
-      return 'Эфир остановлен';
-    default:
-      return 'Неизвестно';
   }
 }
 
@@ -292,4 +273,16 @@ export function timeZoneOptions(): string[] {
   }
   timeZoneCache.set('all', zones);
   return zones;
+}
+
+export function sourceDisplayName(source: { kind?: string | null; name?: string | null; playlistId?: string | null } | null | undefined): string | null {
+  if (!source) return null;
+  if (source.kind === 'none') return null;
+  if (source.kind === 'library' || source.playlistId === 'library' || source.name === 'library') {
+    return 'Вся медиатека';
+  }
+  if (source.kind === 'override') {
+    return source.name && source.name !== 'library' ? source.name : 'Ручной выбор';
+  }
+  return source.name || sourceKindLabel(source.kind) || null;
 }

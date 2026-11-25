@@ -81,6 +81,22 @@ class LiquidsoapClient:
         ok, _ = self.command("vd_sync")
         return ok
 
+    def sync_report(self) -> dict:
+        """Return parsed ``OK <resolved> <failed>`` details for vd_sync."""
+
+        ok, reply = self.command("vd_sync")
+        resolved: int | None = None
+        failed: int | None = None
+        if ok and reply:
+            parts = reply.splitlines()[0].strip().split()
+            if len(parts) >= 3:
+                try:
+                    resolved = int(parts[1])
+                    failed = int(parts[2])
+                except (TypeError, ValueError):
+                    resolved = failed = None
+        return {"ok": ok, "resolved": resolved, "failed": failed, "reply": reply}
+
     def skip(self) -> bool:
         ok, _ = self.command("vd_skip")
         if ok:

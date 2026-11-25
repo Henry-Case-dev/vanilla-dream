@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from . import db, media, queue_engine
-from .config import UNIT_API, UNIT_ICECAST, UNIT_LIQUIDSOAP, Settings
+from .config import UNIT_API, UNIT_ICECAST, Settings
 from .liquidsoap import LiquidsoapClient
 from .models import STATE_LABELS
 from .util import ApiError, Clock, parse_iso, remove_queue_link, to_iso
@@ -22,6 +22,8 @@ STARTING_GRACE_SECONDS = 30
 FAILURE_WINDOW_SECONDS = 120
 FAILURE_LIMIT = 3
 AUTO_START_COOLDOWN = 10.0
+PLAYBACK_STALL_SECONDS = 60
+CURRENT_TRACK_GRACE_SECONDS = 5
 
 
 def compute_state(
@@ -72,11 +74,12 @@ class StationController:
         self._unit_cache: dict[str, tuple[str, datetime]] = {}
 
     # -- systemctl ---------------------------------------------------------
-    def _systemctl(self, action: str, unit: str = UNIT_LIQUIDSOAP, sudo: bool = True):
+    def _systemctl(self, action: str, unit: str | None = None, sudo: bool = True):
         if action not in ("start", "stop", "restart", "is-active"):
             raise ValueError(f"systemctl action not allowed: {action}")
+        unit = unit or self.settings.engine_unit
         command = []
-        if sudo:
+        if sudo and self.settings.station_sudo:
             command.extend(["sudo", "-n", SYSTEMCTL, action, unit])
         else:
             command.extend([SYSTEMCTL, action, unit])
@@ -125,11 +128,29 @@ class StationController:
         return state
 
     def unit_info(self, now: datetime | None = None) -> tuple[bool, str]:
-        state = self._unit_state(UNIT_LIQUIDSOAP, sudo=True, now=now)
+        state = self._unit_state(self.settings.engine_unit, sudo=True, now=now)
         return state in ("active", "activating", "reloading"), state
 
     def unit_state_of(self, unit: str, now: datetime | None = None) -> str:
         return self._unit_state(unit, sudo=False, now=now)
+
+    def unit_last_start(self, unit: str) -> str | None:
+        try:
+            result = self.runner(
+                [SYSTEMCTL, "show", "-p", "ActiveEnterTimestamp", unit],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                env={"PATH": "/usr/bin:/bin", "LC_ALL": "C", "LANG": "C"},
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        output = (result.stdout or "").strip()
+        if not output:
+            return None
+        if "=" in output:
+            output = output.split("=", 1)[1].strip()
+        return output or None
 
     # -- desired state -----------------------------------------------------
     def _set_desired(self, conn, value: str) -> None:
@@ -179,30 +200,110 @@ class StationController:
         unit_active, unit_state = self.unit_info(now)
         active_since = self.active_since(conn, now, unit_active)
         desired = self.desired(conn)
-        state_row = conn.execute("SELECT track_id FROM playback_state WHERE singleton = 1").fetchone()
-        has_current = bool(state_row and state_row["track_id"])
-        has_library = db.library_totals(conn)["count"] > 0
+        state_row = conn.execute("SELECT * FROM playback_state WHERE singleton = 1").fetchone()
+        reported_current = bool(state_row and state_row["track_id"])
+        current_started = parse_iso(state_row["started_at"]) if state_row is not None else None
+        current_duration = None
+        if reported_current:
+            track_row = conn.execute(
+                "SELECT duration FROM tracks WHERE id = ?", (state_row["track_id"],)
+            ).fetchone()
+            if track_row is not None and track_row["duration"]:
+                current_duration = float(track_row["duration"])
+        current_stale = False
+        if (
+            reported_current
+            and current_started is not None
+            and current_duration is not None
+            and (now - current_started).total_seconds()
+            > current_duration + CURRENT_TRACK_GRACE_SECONDS
+        ):
+            current_stale = True
+        has_current = reported_current and not current_stale
+        library_count = db.library_totals(conn)["count"]
+        has_library = library_count > 0
         failures = len(self._failures(conn, now))
+        mount_present = bool(stats.get("mount_present"))
         state = compute_state(
             desired=desired,
             unit_active=unit_active,
             unit_state=unit_state,
-            mount_present=bool(stats.get("mount_present")),
+            mount_present=mount_present,
             has_current=has_current,
             active_since=active_since,
             now=now,
             recent_failures=failures,
             has_library=has_library,
         )
+        future_count = len(queue_engine.future_positions(conn))
+        diagnostic = queue_engine.source_diagnostic(conn, now)
+        source = diagnostic.get("source")
+        source_tracks = (
+            bool(queue_engine.playlist_track_ids(conn, source.playlist_id))
+            if source is not None and source.playlist_id
+            else False
+        )
+        reason = None
+        if desired != "playing":
+            reason = "stopped_by_owner"
+        elif state == "on_air":
+            reason = "playing"
+        elif state == "starting":
+            reason = "engine_starting"
+        elif state == "reconnecting":
+            reason = "mount_missing"
+        elif state == "error":
+            reason = "engine_unavailable"
+        elif state == "no_music":
+            if not has_library:
+                reason = "library_empty"
+            elif future_count > 0:
+                reason = "engine_starting"
+            else:
+                reason = diagnostic.get("reason") or "no_source"
+
+        startup = current_started
+        if startup is None:
+            last_row = conn.execute(
+                "SELECT started_at FROM history WHERE started_at IS NOT NULL "
+                "ORDER BY started_at DESC, id DESC LIMIT 1"
+            ).fetchone()
+            startup = parse_iso(last_row["started_at"]) if last_row else None
+        stall_reference = startup or active_since
+        elapsed = (now - stall_reference).total_seconds() if stall_reference is not None else None
+        duration = current_duration
+        stalled = False
+        if desired == "playing" and mount_present and source_tracks and future_count > 0:
+            if not has_current and elapsed is not None and elapsed > PLAYBACK_STALL_SECONDS:
+                stalled = True
+            elif (
+                has_current
+                and duration is not None
+                and startup is not None
+                and (now - startup).total_seconds() > duration + PLAYBACK_STALL_SECONDS
+            ):
+                stalled = True
+        if stalled:
+            state = "error"
+            reason = "playback_stalled"
+        elif (
+            desired == "playing"
+            and state != "off"
+            and db.get_setting(conn, "_engine_sync_error")
+        ):
+            state = "error"
+            reason = "engine_sync_failed"
         conn.commit()
         return {
             "state": state,
+            "status": state,
             "label": STATE_LABELS.get(state, state),
+            "reason": reason,
             "desired": desired,
-            "unit": UNIT_LIQUIDSOAP,
+            "unit": self.settings.engine_unit,
             "unit_active": unit_active,
             "unit_state": unit_state,
-            "mount_present": bool(stats.get("mount_present")),
+            "mount_present": mount_present,
             "stats_available": bool(stats.get("available")),
             "listeners": stats.get("listeners"),
             "bitrate": stats.get("bitrate"),
@@ -215,7 +316,7 @@ class StationController:
     # -- commands ----------------------------------------------------------
     def _start_unit(self, conn, now: datetime, raise_on_error: bool) -> bool:
         ok, output, _code = self._systemctl("start")
-        self.invalidate_unit_cache(UNIT_LIQUIDSOAP)
+        self.invalidate_unit_cache(self.settings.engine_unit)
         if ok:
             db.set_setting(conn, "engine_last_start", to_iso(now) or "")
             self._clear_failures(conn)
@@ -236,16 +337,21 @@ class StationController:
 
     def start(self, conn, now: datetime | None = None) -> dict:
         now = now or self.clock.now()
+        was_playing = self.desired(conn) == "playing" and self.unit_info(now)[0]
         self._set_desired(conn, "playing")
         conn.commit()
+        if not was_playing:
+            self._forget_current(conn, now)
+        self._reset_prepared(conn)
         queue_engine.ensure_queue(conn, self.settings, now)
-        library = db.library_totals(conn)["count"]
-        if library == 0:
+        if db.library_totals(conn)["count"] == 0:
             db.log_event(
-                conn, "warning", "station", "Эфир включён, но в медиатеке нет музыки", None
+                conn,
+                "warning",
+                "station",
+                "Эфир включён без музыки: техническая тишина",
+                None,
             )
-            conn.commit()
-            return self.status(conn, now)
         self._start_unit(conn, now, raise_on_error=True)
         if self.engine is not None:
             queue_engine.sync_engine(conn, self.settings, self.engine)
@@ -254,7 +360,7 @@ class StationController:
     def stop(self, conn, now: datetime | None = None) -> dict:
         now = now or self.clock.now()
         ok, output, _code = self._systemctl("stop")
-        self.invalidate_unit_cache(UNIT_LIQUIDSOAP)
+        self.invalidate_unit_cache(self.settings.engine_unit)
         if not ok:
             db.set_setting(conn, "engine_last_error", (output or "Не удалось остановить движок")[:500])
             db.log_event(conn, "error", "station", "Не удалось остановить движок", {"output": output})
@@ -284,6 +390,28 @@ class StationController:
         conn.commit()
         return self.status(conn, now)
 
+    def _forget_current(self, conn, now: datetime) -> None:
+        state = conn.execute(
+            "SELECT position_id FROM playback_state WHERE singleton = 1"
+        ).fetchone()
+        if state is not None and state["position_id"]:
+            conn.execute(
+                "UPDATE history SET ended_at = ? WHERE position_id = ? AND ended_at IS NULL",
+                (to_iso(now), state["position_id"]),
+            )
+            conn.execute(
+                "DELETE FROM queue_positions WHERE id = ?", (state["position_id"],)
+            )
+            remove_queue_link(self.settings, str(state["position_id"]))
+        conn.execute("DELETE FROM playback_state WHERE singleton = 1")
+        conn.commit()
+
+    def _reset_prepared(self, conn) -> None:
+        conn.execute(
+            "UPDATE queue_positions SET state = 'pending' WHERE state = 'prepared'"
+        )
+        conn.commit()
+
     def restart(self, conn, now: datetime | None = None) -> dict:
         now = now or self.clock.now()
         if self.desired(conn) != "playing":
@@ -292,9 +420,11 @@ class StationController:
                 "station_stopped",
                 "Сначала включите эфир: перезапуск сохраняет желаемое состояние.",
             )
+        self._reset_prepared(conn)
+        self._forget_current(conn, now)
         queue_engine.ensure_queue(conn, self.settings, now)
         ok, output, _code = self._systemctl("restart")
-        self.invalidate_unit_cache(UNIT_LIQUIDSOAP)
+        self.invalidate_unit_cache(self.settings.engine_unit)
         if not ok:
             self._record_failure(conn, now, output or "Не удалось перезапустить движок")
             db.log_event(
@@ -317,8 +447,10 @@ class StationController:
     def restart_for_settings(self, conn, now: datetime) -> bool:
         if self.desired(conn) != "playing":
             return False
+        self._reset_prepared(conn)
+        self._forget_current(conn, now)
         ok, output, _code = self._systemctl("restart")
-        self.invalidate_unit_cache(UNIT_LIQUIDSOAP)
+        self.invalidate_unit_cache(self.settings.engine_unit)
         if ok:
             db.set_setting(conn, "engine_last_start", to_iso(now) or "")
             self._clear_failures(conn)
@@ -338,8 +470,6 @@ class StationController:
     def auto_start_if_needed(self, conn, now: datetime, status: dict) -> bool:
         if status.get("desired") != "playing" or status.get("unit_active"):
             return False
-        if db.library_totals(conn)["count"] == 0:
-            return False
         if len(self._failures(conn, now)) >= FAILURE_LIMIT:
             # Stop the restart loop: the owner sees `error` and must intervene.
             return False
@@ -348,6 +478,8 @@ class StationController:
             return False
         db.set_setting(conn, "_last_auto_start", to_iso(now) or "")
         conn.commit()
+        self._reset_prepared(conn)
+        self._forget_current(conn, now)
         queue_engine.ensure_queue(conn, self.settings, now)
         started = self._start_unit(conn, now, raise_on_error=False)
         if started and self.engine is not None:
@@ -356,31 +488,39 @@ class StationController:
 
     def services(self, conn) -> list[dict]:
         units = [
-            (UNIT_API, "Backend", True),
-            (UNIT_LIQUIDSOAP, "Liquidsoap", False),
-            (UNIT_ICECAST, "Icecast", False),
+            ("api", UNIT_API, "Backend", True),
+            ("liquidsoap", self.settings.engine_unit, self.settings.engine_label, False),
+            ("icecast", UNIT_ICECAST, "Icecast", False),
         ]
+        state_labels = {
+            "active": "Работает",
+            "activating": "Запускается",
+            "reloading": "Перезагружается",
+            "inactive": "Остановлена",
+            "failed": "Ошибка",
+            "unknown": "Неизвестно",
+        }
+        last_error = db.get_setting(conn, "engine_last_error") or None
         result = []
-        for unit, label, always in units:
-            if always:
-                # The request itself proves the API process is serving; this is
-                # not a systemd check, so do not claim unit health.
-                result.append(
-                    {
-                        "unit": unit,
-                        "label": label,
-                        "state": "active",
-                        "detail": "процесс отвечает",
-                    }
-                )
-                continue
-            state = self.unit_state_of(unit)
+        for service_id, unit, label, is_api in units:
+            if is_api:
+                state = "active"
+                detail = "процесс отвечает"
+                last_start = None
+            else:
+                state = self.unit_state_of(unit)
+                detail = "systemctl is-active"
+                last_start = self.unit_last_start(unit)
             result.append(
                 {
+                    "id": service_id,
                     "unit": unit,
                     "label": label,
                     "state": state,
-                    "detail": "systemctl is-active",
+                    "state_label": state_labels.get(state, "Неизвестно"),
+                    "detail": detail,
+                    "last_start": last_start,
+                    "last_error": last_error if service_id == "liquidsoap" else None,
                 }
             )
         return result

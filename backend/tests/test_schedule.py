@@ -302,7 +302,7 @@ def test_override_indefinite_and_clear(env, admin):
     a_track = _upload(env, "indA")
     b_track = _upload(env, "indB")
     playlist_a = make_playlist(env.client, "Default", [a_track["id"]])
-    playlist_b = make_playlist(env.client, "Forever", [b_track["id"]])
+    playlist_b = make_playlist(env.client, "Forever", [b_track["id"]], repeat_mode="all")
     env.client.put("/api/admin/settings", json={"default_playlist_id": playlist_a["id"]})
     created = env.client.post(
         "/api/admin/station/override",

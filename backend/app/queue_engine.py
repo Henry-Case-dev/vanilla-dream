@@ -19,8 +19,13 @@ from datetime import datetime
 from pathlib import Path
 
 from . import db, media, scheduler
-from .config import Settings
-from .models import source_payload, track_payload
+from .config import SYSTEM_PLAYLIST_ID, SYSTEM_PLAYLIST_NAME, Settings
+from .models import (
+    playlist_available_ids,
+    playlist_available_rows,
+    source_payload,
+    track_payload,
+)
 from .util import ApiError, parse_iso, to_iso
 
 LOGGER = logging.getLogger("vdradio.queue")
@@ -62,6 +67,9 @@ class Source:
     repeat_mode: str = "none"
     shuffle: bool = False
     by_count: bool = False
+    allow_empty: bool = False
+    fallback_allowed: bool = False
+    is_system: bool = False
 
     @property
     def ref_prefix(self) -> str:
@@ -113,25 +121,24 @@ def parse_override_id(ref: str | None) -> str | None:
 
 
 def playlist_track_ids(conn: sqlite3.Connection, playlist_id: str) -> list[str]:
-    rows = conn.execute(
-        "SELECT pt.track_id FROM playlist_tracks pt JOIN tracks t ON t.id = pt.track_id "
-        "WHERE pt.playlist_id = ? AND t.pending_delete = 0 ORDER BY pt.position ASC",
-        (playlist_id,),
-    ).fetchall()
-    return [str(row["track_id"]) for row in rows]
+    return playlist_available_ids(conn, playlist_id)
 
 
 def library_track_ids(conn: sqlite3.Connection) -> list[str]:
-    rows = conn.execute(
-        "SELECT id FROM tracks WHERE pending_delete = 0 ORDER BY created_at ASC, id ASC"
-    ).fetchall()
-    return [str(row["id"]) for row in rows]
+    return playlist_available_ids(conn, SYSTEM_PLAYLIST_ID)
 
 
 def get_playlist(conn: sqlite3.Connection, playlist_id: str | None) -> sqlite3.Row | None:
     if not playlist_id:
         return None
     return conn.execute("SELECT * FROM playlists WHERE id = ?", (playlist_id,)).fetchone()
+
+
+def system_playlist_row(conn: sqlite3.Connection) -> sqlite3.Row | None:
+    row = get_playlist(conn, SYSTEM_PLAYLIST_ID)
+    if row is not None:
+        return row
+    return None
 
 
 def get_rotation(conn: sqlite3.Connection) -> sqlite3.Row:
@@ -368,11 +375,23 @@ def _playlist_source(
     *,
     rule_id: str | None = None,
     override_id: str | None = None,
+    allow_empty: bool = False,
+    fallback_allowed: bool = False,
 ) -> Source | None:
+    if playlist_id == SYSTEM_PLAYLIST_ID:
+        return _system_source(
+            conn,
+            kind=kind,
+            key=key,
+            rule_id=rule_id,
+            override_id=override_id,
+            fallback_allowed=fallback_allowed,
+            allow_empty=allow_empty,
+        )
     playlist = get_playlist(conn, playlist_id)
     if playlist is None:
         return None
-    if not playlist_track_ids(conn, playlist_id):
+    if not playlist_track_ids(conn, playlist_id) and not allow_empty:
         _warn_once(
             conn, f"empty:{key}", "Пустой плейлист пропущен", {"playlist_id": playlist_id}
         )
@@ -386,6 +405,34 @@ def _playlist_source(
         name=str(playlist["name"] or ""),
         repeat_mode=str(playlist["repeat_mode"] or "none"),
         shuffle=bool(playlist["shuffle"]),
+        allow_empty=allow_empty,
+        fallback_allowed=fallback_allowed,
+    )
+
+
+def _system_source(
+    conn: sqlite3.Connection,
+    *,
+    kind: str = "library",
+    key: str = SYSTEM_PLAYLIST_ID,
+    rule_id: str | None = None,
+    override_id: str | None = None,
+    fallback_allowed: bool = False,
+    allow_empty: bool = True,
+) -> Source:
+    row = system_playlist_row(conn)
+    return Source(
+        kind=kind,
+        key=key,
+        playlist_id=SYSTEM_PLAYLIST_ID,
+        rule_id=rule_id,
+        override_id=override_id,
+        name=SYSTEM_PLAYLIST_NAME,
+        repeat_mode=str((row["repeat_mode"] if row is not None else "all") or "none"),
+        shuffle=bool(row["shuffle"]) if row is not None else True,
+        allow_empty=allow_empty,
+        fallback_allowed=fallback_allowed,
+        is_system=True,
     )
 
 
@@ -418,6 +465,8 @@ def _rotation_source(
         repeat_mode="none",
         shuffle=bool(playlist["shuffle"]),
         by_count=(rotation["mode"] or "sequential") == "by_count",
+        fallback_allowed=kind in ("schedule", "rotation"),
+        is_system=str(item["playlist_id"]) == SYSTEM_PLAYLIST_ID,
     )
 
 
@@ -442,6 +491,7 @@ def resolve_source(
                     "override",
                     key,
                     override_id=str(override["id"]),
+                    allow_empty=True,
                 )
                 if source is not None:
                     return source
@@ -453,8 +503,7 @@ def resolve_source(
             if source is not None and source.key not in excluded:
                 return source
 
-    rule = scheduler.active_rule(conn, now)
-    if rule is not None:
+    for rule in scheduler.active_rules(conn, now):
         source = None
         if rule["playlist_id"]:
             key = f"schedule:{rule['id']}:playlist:{rule['playlist_id']}"
@@ -465,6 +514,8 @@ def resolve_source(
                     "schedule",
                     key,
                     rule_id=str(rule["id"]),
+                    allow_empty=False,
+                    fallback_allowed=True,
                 )
         elif int(rule["rotation"] or 0):
             key = f"schedule:{rule['id']}:rotation"
@@ -485,21 +536,32 @@ def resolve_source(
         return source
 
     default_id = db.get_setting(conn, "default_playlist_id")
+    if default_id == SYSTEM_PLAYLIST_ID:
+        return _system_source(conn)
     if default_id:
         key = f"playlist:{default_id}"
-        if key not in excluded:
-            source = _playlist_source(conn, default_id, "playlist", key)
-            if source is not None:
-                return source
+        playlist = get_playlist(conn, default_id)
+        if playlist is not None:
+            return _playlist_source(
+                conn,
+                default_id,
+                "playlist",
+                key,
+                allow_empty=True,
+                fallback_allowed=False,
+            )
+        # Unknown default id falls back to the system playlist.
 
-    if "library" not in excluded and library_track_ids(conn):
-        return Source(kind="library", key="library", name="Вся медиатека", shuffle=True)
-    return None
+    return _system_source(conn)
 
 
 # ---------------------------------------------------------------------------
 # Cycles (shuffle / repeat)
 # ---------------------------------------------------------------------------
+
+
+def _cycle_setting_key(key: str) -> str:
+    return f"_cycle:{key}"
 
 
 def _last_played_for_key(conn: sqlite3.Connection, key: str) -> str | None:
@@ -510,8 +572,147 @@ def _last_played_for_key(conn: sqlite3.Connection, key: str) -> str | None:
     return str(row["track_id"]) if row and row["track_id"] else None
 
 
-def _cycle_setting_key(key: str) -> str:
-    return f"_cycle:{key}"
+def _source_signature(conn: sqlite3.Connection, source: Source) -> dict:
+    ids = playlist_track_ids(conn, source.playlist_id) if source.playlist_id else []
+    return {
+        "ids": ids,
+        "shuffle": bool(source.shuffle),
+        "repeat": source.repeat_mode,
+    }
+
+
+def _source_setting_key(key: str) -> str:
+    return f"_source_sig:{key}"
+
+
+def _invalidate_source_key(conn: sqlite3.Connection, key: str) -> int:
+    rows = conn.execute(
+        "SELECT id FROM queue_positions WHERE state IN ('pending', 'prepared') "
+        "AND manual = 0 AND source_ref LIKE ?",
+        (key + ":cycle:%",),
+    ).fetchall()
+    for row in rows:
+        conn.execute("DELETE FROM queue_positions WHERE id = ?", (row["id"],))
+    db.delete_setting(conn, _cycle_setting_key(key))
+    return len(rows)
+
+
+def invalidate_position_refs(conn: sqlite3.Connection, fragments: list[str]) -> int:
+    """Delete future positions whose source_ref contains any fragment."""
+
+    if not fragments:
+        return 0
+    removed = 0
+    keys: set[str] = set()
+    for row in future_positions(conn):
+        if row["manual"]:
+            continue
+        ref = str(row["source_ref"] or "")
+        if any(fragment in ref for fragment in fragments):
+            conn.execute("DELETE FROM queue_positions WHERE id = ?", (row["id"],))
+            keys.add(key_of(ref))
+            removed += 1
+    for key in keys:
+        db.delete_setting(conn, _cycle_setting_key(key))
+    return removed
+
+
+def invalidate_playlist_sources(conn: sqlite3.Connection, playlist_id: str) -> int:
+    """Drop stale future positions for every source backed by a playlist."""
+
+    keys: set[str] = set()
+    for row in future_positions(conn):
+        if row["manual"]:
+            continue
+        ref = row["source_ref"] or ""
+        parts = ref.split(":")
+        if "playlist" in parts:
+            index = parts.index("playlist")
+            if index + 1 < len(parts) and parts[index + 1] == playlist_id:
+                keys.add(key_of(ref))
+        if "item" in parts:
+            index = parts.index("item")
+            if index + 1 < len(parts):
+                item = conn.execute(
+                    "SELECT playlist_id FROM rotation_items WHERE id = ?",
+                    (parts[index + 1],),
+                ).fetchone()
+                if item is not None and str(item["playlist_id"]) == playlist_id:
+                    keys.add(key_of(ref))
+    if playlist_id == SYSTEM_PLAYLIST_ID:
+        keys.add(SYSTEM_PLAYLIST_ID)
+    removed = 0
+    for key in keys:
+        removed += _invalidate_source_key(conn, key)
+    db.delete_setting(conn, _source_setting_key(playlist_id))
+    return removed
+
+
+def _apply_source_signature(conn: sqlite3.Connection, source: Source) -> None:
+    signature = _source_signature(conn, source)
+    stored = db.get_json_setting(conn, _source_setting_key(source.key), None)
+    if stored is not None and stored != signature:
+        if source.is_system and (
+            bool(stored.get("shuffle")) != signature["shuffle"]
+            or stored.get("repeat") != signature["repeat"]
+        ):
+            _invalidate_source_key(conn, source.key)
+        elif source.is_system:
+            removed_ids = set(stored.get("ids") or []) - set(signature["ids"])
+            if removed_ids:
+                for row in future_positions(conn):
+                    if (
+                        not row["manual"]
+                        and key_of(row["source_ref"]) == source.key
+                        and str(row["track_id"]) in removed_ids
+                    ):
+                        conn.execute(
+                            "DELETE FROM queue_positions WHERE id = ?", (row["id"],)
+                        )
+        else:
+            _invalidate_source_key(conn, source.key)
+    if stored != signature:
+        db.set_json_setting(conn, _source_setting_key(source.key), signature)
+
+
+def source_diagnostic(conn: sqlite3.Connection, now: datetime) -> dict:
+    """Reason code + source metadata for status/no_music decisions."""
+
+    source = resolve_source(conn, now)
+    if source is None:
+        return {"source": None, "reason": "no_source"}
+    ids = playlist_track_ids(conn, source.playlist_id) if source.playlist_id else []
+    if not ids:
+        reason = "library_empty" if source.is_system else "playlist_empty"
+        return {"source": source, "reason": reason}
+    if source.repeat_mode not in ("all", "one"):
+        state = db.get_json_setting(conn, _cycle_setting_key(source.key), None)
+        if state is not None and state.get("started") and not state.get("remaining"):
+            queued = [
+                row
+                for row in future_positions(conn)
+                if key_of(row["source_ref"]) == source.key and not row["manual"]
+            ]
+            if not queued:
+                return {"source": source, "reason": "playlist_exhausted"}
+    return {"source": source, "reason": None}
+
+
+def _current_source_has_future(conn: sqlite3.Connection, key: str) -> bool:
+    return any(
+        key_of(row["source_ref"]) == key for row in future_positions(conn)
+    )
+
+
+
+def _cycle_positions(
+    conn: sqlite3.Connection, key: str, cycle: int, states: tuple[str, ...]
+) -> list[sqlite3.Row]:
+    placeholders = ",".join("?" for _ in states)
+    return conn.execute(
+        f"SELECT * FROM queue_positions WHERE source_ref = ? AND state IN ({placeholders})",
+        (f"{key}:cycle:{cycle}", *states),
+    ).fetchall()
 
 
 def _cycle_next(
@@ -540,8 +741,13 @@ def _cycle_next(
             finished = bool(state.get("started")) and not remaining
 
         if state is None or finished:
-            if finished and repeat == "none":
-                return Choice(None, cycle, "exhausted")
+            if finished:
+                if not allow_duplicates and _cycle_positions(
+                    conn, key, cycle, ("pending", "prepared")
+                ):
+                    return Choice(None, cycle, "blocked")
+                if repeat == "none":
+                    return Choice(None, cycle, "exhausted")
             order = list(ids)
             if shuffle:
                 random.SystemRandom().shuffle(order)
@@ -579,10 +785,52 @@ def _cycle_next(
             _cycle_setting_key(key),
             {"cycle": cycle, "remaining": [], "started": True, "tail": state.get("tail")},
         )
+        if not allow_duplicates and _cycle_positions(
+            conn, key, cycle, ("pending", "prepared")
+        ):
+            return Choice(None, cycle, "blocked")
         if repeat == "all" and attempt == 0:
             continue
         return Choice(None, cycle, "blocked")
     return Choice(None, 0, "blocked")
+
+
+def _append_library_tracks(conn: sqlite3.Connection, key: str, ids: list[str]) -> None:
+    """Append new library tracks to the remaining part of the current cycle."""
+
+    state = db.get_json_setting(conn, _cycle_setting_key(key), None)
+    if not state or not state.get("started"):
+        return
+    valid = set(ids)
+    cycle = int(state.get("cycle") or 0)
+    remaining = [item for item in state.get("remaining") or [] if item in valid]
+    played = {
+        str(row["track_id"])
+        for row in conn.execute(
+            "SELECT track_id FROM history WHERE source_ref LIKE ?",
+            (f"{key}:cycle:{cycle}",),
+        ).fetchall()
+        if row["track_id"]
+    }
+    queued = _all_queued_track_ids(conn)
+    appended = False
+    for track_id in ids:
+        if (
+            track_id not in remaining
+            and track_id not in played
+            and track_id not in queued
+        ):
+            remaining.append(track_id)
+            appended = True
+    db.set_json_setting(
+        conn,
+        _cycle_setting_key(key),
+        {
+            **state,
+            "remaining": remaining,
+            "tail": remaining[-1] if appended and remaining else state.get("tail"),
+        },
+    )
 
 
 def next_track(
@@ -591,18 +839,19 @@ def next_track(
     now: datetime,
     exclude_ids: set[str],
 ) -> Choice:
-    if source.kind == "library":
-        ids = library_track_ids(conn)
+    if source.playlist_id == SYSTEM_PLAYLIST_ID and not source.rotation_item_id:
+        ids = playlist_track_ids(conn, SYSTEM_PLAYLIST_ID)
         if not ids:
-            return Choice(None, reason="exhausted")
+            return Choice(None, reason="empty")
+        _append_library_tracks(conn, source.key, ids)
         return _cycle_next(
             conn,
-            "library",
+            source.key,
             ids,
-            shuffle=True,
-            repeat="none",
+            shuffle=source.shuffle,
+            repeat=source.repeat_mode,
             exclude_ids=exclude_ids,
-            allow_duplicates=False,
+            allow_duplicates=source.repeat_mode == "one",
         )
 
     if not source.playlist_id:
@@ -610,6 +859,8 @@ def next_track(
     ids = playlist_track_ids(conn, source.playlist_id)
     if not ids:
         return Choice(None, reason="exhausted")
+    if source.playlist_id == SYSTEM_PLAYLIST_ID:
+        _append_library_tracks(conn, source.key, ids)
 
     if source.rotation_item_id:
         rotation = get_rotation(conn)
@@ -629,7 +880,15 @@ def next_track(
             exclude_ids=exclude_ids,
             allow_duplicates=source.by_count,
         )
-        if choice.reason in ("ok", "blocked"):
+        if choice.reason == "ok":
+            return choice
+        if choice.reason == "blocked" and not source.by_count:
+            # The current playlist pass is scheduled; plan the next rotation item.
+            advanced = _advance_rotation(conn, rotation, source.rotation_item_id)
+            if advanced is not None and str(advanced["id"]) != source.rotation_item_id:
+                return Choice(None, reason="advanced")
+            return choice
+        if choice.reason == "blocked":
             return choice
         advanced = _advance_rotation(conn, rotation, source.rotation_item_id)
         if advanced is None:
@@ -657,10 +916,6 @@ def next_track(
         return Choice(last, cycle, "ok")
 
     repeat = source.repeat_mode
-    if source.kind == "override" and repeat == "none":
-        # An owner override stays in force until its scope expires; a single
-        # playlist pass must not silently fall back to the scheduled source.
-        repeat = "all"
     return _cycle_next(
         conn,
         source.key,
@@ -668,7 +923,7 @@ def next_track(
         shuffle=source.shuffle,
         repeat=repeat,
         exclude_ids=exclude_ids,
-        allow_duplicates=False,
+        allow_duplicates=repeat == "one",
     )
 
 
@@ -750,10 +1005,13 @@ def ensure_queue(conn: sqlite3.Connection, settings: Settings, now: datetime) ->
     depth = max(1, db.get_int_setting(conn, "queue_depth", 6))
     source = resolve_source(conn, now)
     if source is None:
-        conn.execute("DELETE FROM queue_positions WHERE state = 'pending' AND manual = 0")
+        conn.execute(
+            "DELETE FROM queue_positions WHERE state IN ('pending', 'prepared') AND manual = 0"
+        )
         _renumber(conn)
         conn.commit()
         return []
+    _apply_source_signature(conn, source)
     future = future_positions(conn)
     planned_keys = {key_of(row["source_ref"]) for row in future if not row["manual"]}
     head = next(
@@ -771,9 +1029,11 @@ def ensure_queue(conn: sqlite3.Connection, settings: Settings, now: datetime) ->
         dropped_keys = {
             key_of(row["source_ref"])
             for row in future
-            if row["state"] == "pending" and not row["manual"]
+            if row["state"] in ("pending", "prepared") and not row["manual"]
         }
-        conn.execute("DELETE FROM queue_positions WHERE state = 'pending' AND manual = 0")
+        conn.execute(
+            "DELETE FROM queue_positions WHERE state IN ('pending', 'prepared') AND manual = 0"
+        )
         for key in dropped_keys:
             if key:
                 db.delete_setting(conn, f"_cycle:{key}")
@@ -809,9 +1069,11 @@ def ensure_queue(conn: sqlite3.Connection, settings: Settings, now: datetime) ->
             continue
         if choice.reason == "blocked":
             break
-        if choice.reason == "exhausted" or not choice.track_id:
-            excluded_sources.add(source.key)
-            continue
+        if choice.reason in ("exhausted", "empty") or not choice.track_id:
+            if source.fallback_allowed:
+                excluded_sources.add(source.key)
+                continue
+            break
         created.append(
             _insert_position(
                 conn,
@@ -1049,6 +1311,23 @@ def sync_engine(
     content = "\n".join(lines)
     if content:
         content += "\n"
+    if not lines:
+        diagnostic = source_diagnostic(conn, now)
+        if (
+            diagnostic.get("source") is not None
+            and diagnostic.get("reason") is None
+            and playlist_track_ids(conn, diagnostic["source"].playlist_id)
+        ):
+            db.set_setting(conn, "_engine_sync_error", to_iso(now) or "")
+            db.log_event(
+                conn,
+                "error",
+                "engine",
+                "Пустая синхронизация при наличии источника отклонена",
+                None,
+            )
+            conn.commit()
+            return False
     current = current_position(conn)
     keep_ids = [Path(line).stem for line in lines]
     if current is not None:
@@ -1063,29 +1342,61 @@ def sync_engine(
         db.log_event(conn, "error", "engine", "Не удалось записать файл очереди движка", None)
         conn.commit()
         return False
-    ok = bool(engine and engine.sync())
+    if hasattr(engine, "sync_report"):
+        report = engine.sync_report()
+        ok = bool(report.get("ok"))
+        resolved = report.get("resolved")
+        failed = report.get("failed")
+    else:
+        ok = bool(engine and engine.sync())
+        resolved = len(lines)
+        failed = 0
+    if ok and resolved is None:
+        resolved = len(lines)
+    if ok and lines and (resolved or 0) == 0:
+        ok = False
+        db.set_setting(conn, "_engine_sync_error", to_iso(now) or "")
+        db.log_event(
+            conn,
+            "error",
+            "engine",
+            "Движок не разрешил ни одной позиции очереди",
+            {"lines": len(lines), "failed": failed},
+        )
     if ok:
         if sync_state is not None:
             sync_state["signature"] = signature
             sync_state["at"] = now
         ids = [Path(line).stem for line in lines]
-        if ids:
-            placeholders = ",".join("?" for _ in ids)
+        prepared_ids = ids[: int(resolved or 0)] if resolved is not None else ids
+        if prepared_ids:
+            placeholders = ",".join("?" for _ in prepared_ids)
             conn.execute(
                 f"UPDATE queue_positions SET state = 'prepared' WHERE id IN ({placeholders})",
-                ids,
+                prepared_ids,
             )
             conn.execute(
                 f"UPDATE queue_positions SET state = 'pending' WHERE state = 'prepared' "
                 f"AND id NOT IN ({placeholders})",
-                ids,
+                prepared_ids,
             )
         else:
             conn.execute("UPDATE queue_positions SET state = 'pending' WHERE state = 'prepared'")
+        if failed:
+            db.log_event(
+                conn,
+                "warning",
+                "engine",
+                "Движок не подготовил часть очереди",
+                {"failed": failed, "resolved": resolved, "positions": len(ids)},
+            )
+        db.delete_setting(conn, "_engine_sync_error")
         if db.get_setting(conn, "_sync_warned") == "1":
             db.delete_setting(conn, "_sync_warned")
             db.log_event(conn, "info", "engine", "Синхронизация очереди с движком восстановлена", None)
     else:
+        conn.execute("UPDATE queue_positions SET state = 'pending' WHERE state = 'prepared'")
+        db.set_setting(conn, "_engine_sync_error", to_iso(now) or "")
         if db.get_setting(conn, "_sync_warned") != "1":
             db.set_setting(conn, "_sync_warned", "1")
             db.log_event(
@@ -1220,6 +1531,7 @@ def queue_snapshot(conn: sqlite3.Connection, settings: Settings, now: datetime) 
             duration = float(track["duration"] or 0.0)
             remaining_current = max(0.0, duration - elapsed) if duration else 0.0
             current = {
+                "id": state["position_id"],
                 "position_id": state["position_id"],
                 "track": track_payload(track, settings),
                 "source": source_payload(conn, state["source_kind"], state["source_ref"]),

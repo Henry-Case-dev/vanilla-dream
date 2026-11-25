@@ -60,7 +60,7 @@ if ! id "$RADIO_USER" >/dev/null 2>&1; then
 fi
 
 install -d -o root -g root -m 0755 "$APP_DIR" "$APP_DIR/releases" "$APP_DIR/frontend-dist"
-install -d -o "$RADIO_USER" -g "$RADIO_GROUP" -m 0755 "$MUSIC_DIR" "$COVER_DIR" "$STATE_DIR" "$LOG_DIR" "$LOG_DIR/icecast" "$BACKUP_DIR"
+install -d -o "$RADIO_USER" -g "$RADIO_GROUP" -m 0755 "$MUSIC_DIR" "$COVER_DIR" "$COVER_DIR/playlists" "$STATE_DIR" "$LOG_DIR" "$LOG_DIR/icecast" "$BACKUP_DIR"
 install -d -o root -g "$RADIO_GROUP" -m 0770 "$ETC_DIR"
 # The backend rewrites encoder.liq / station.liq atomically, which needs a
 # writable directory; an existing installation may still have 0750.
@@ -109,6 +109,7 @@ if [[ ! -f "$ETC_DIR/env" ]]; then
 VD_DB_PATH=$STATE_DIR/app.db
 VD_MUSIC_DIR=$MUSIC_DIR
 VD_COVER_DIR=$COVER_DIR
+VD_PLAYLIST_COVER_DIR=$COVER_DIR/playlists
 VD_ENGINE_DIR=$RUN_DIR
 VD_ENGINE_QUEUE_FILE=$RUN_DIR/engine-queue.txt
 VD_ENGINE_SOCKET=$RUN_DIR/liquidsoap.sock

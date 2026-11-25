@@ -210,3 +210,8 @@ svg {
   color: var(--text-secondary);
   max-width: 460px;
 }
+
+.dot--pending {
+  background: #e0be83;
+  box-shadow: 0 0 0 3px rgba(224, 190, 131, 0.14);
+}

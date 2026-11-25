@@ -134,6 +134,40 @@ def list_tracks(
     }
 
 
+@router.get("/tracks/ids")
+def list_track_ids(
+    request: Request,
+    q: str = "",
+    exclude_playlist_id: str = "",
+    conn: sqlite3.Connection = Depends(get_conn),
+):
+    where = "WHERE pending_delete = 0"
+    params: list = []
+    text = (q or "").strip().lower()
+    if text:
+        escaped = text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = f"%{escaped}%"
+        where += (
+            " AND (py_lower(title) LIKE ? ESCAPE '\\' "
+            "OR py_lower(COALESCE(artist, '')) LIKE ? ESCAPE '\\' "
+            "OR py_lower(COALESCE(album, '')) LIKE ? ESCAPE '\\')"
+        )
+        params.extend([pattern, pattern, pattern])
+    if exclude_playlist_id:
+        if exclude_playlist_id == "library":
+            where += " AND 0"
+        else:
+            where += (
+                " AND id NOT IN (SELECT track_id FROM playlist_tracks WHERE playlist_id = ?)"
+            )
+            params.append(exclude_playlist_id)
+    rows = conn.execute(
+        f"SELECT id FROM tracks {where} ORDER BY created_at ASC, id ASC", params
+    ).fetchall()
+    ids = [str(row["id"]) for row in rows]
+    return {"ids": ids, "total": len(ids)}
+
+
 @router.post("/tracks/upload", status_code=201)
 def upload_track(
     request: Request,
@@ -146,6 +180,8 @@ def upload_track(
         conn, settings, file.file, file.filename, _now(request)
     )
     row = result["track"]
+    queue_engine.ensure_queue(conn, settings, _now(request))
+    _sync(request, conn)
     request.app.state.scheduler.wake()
     return {"track": track_payload(row, settings, include_source=True), "duplicate": False}
 
@@ -323,12 +359,32 @@ def post_playlist(
     )
     return {"playlist": payload}
 
-
 @router.get("/playlists/{playlist_id}")
 def get_playlist(
-    playlist_id: str, request: Request, conn: sqlite3.Connection = Depends(get_conn)
+    playlist_id: str,
+    request: Request,
+    tracks_limit: int = 500,
+    tracks_offset: int = 0,
+    conn: sqlite3.Connection = Depends(get_conn),
 ):
-    return {"playlist": playlists.playlist_detail(conn, _settings(request), playlist_id)}
+    return {
+        "playlist": playlists.playlist_detail(
+            conn,
+            _settings(request),
+            playlist_id,
+            tracks_limit=tracks_limit,
+            tracks_offset=tracks_offset,
+        )
+    }
+
+
+def _refresh_playlist_queue(request: Request, conn, playlist_id: str) -> None:
+    settings = _settings(request)
+    now = _now(request)
+    queue_engine.invalidate_playlist_sources(conn, playlist_id)
+    queue_engine.ensure_queue(conn, settings, now)
+    _sync(request, conn)
+    request.app.state.scheduler.wake()
 
 
 @router.patch("/playlists/{playlist_id}")
@@ -339,11 +395,12 @@ def patch_playlist(
     conn: sqlite3.Connection = Depends(get_conn),
     session: dict = Depends(require_csrf),
 ):
-    return {
-        "playlist": playlists.update_playlist(
-            conn, _settings(request), playlist_id, body or {}, _now(request)
-        )
-    }
+    payload = playlists.update_playlist(
+        conn, _settings(request), playlist_id, body or {}, _now(request)
+    )
+    if isinstance(body, dict) and ("shuffle" in body or "repeat_mode" in body):
+        _refresh_playlist_queue(request, conn, playlist_id)
+    return {"playlist": payload}
 
 
 @router.delete("/playlists/{playlist_id}")
@@ -354,7 +411,17 @@ def delete_playlist(
     session: dict = Depends(require_csrf),
 ):
     settings = _settings(request)
+    rotation_item_ids = [
+        str(row["id"])
+        for row in conn.execute(
+            "SELECT id FROM rotation_items WHERE playlist_id = ?", (playlist_id,)
+        ).fetchall()
+    ]
     result = playlists.delete_playlist(conn, settings, playlist_id, _now(request))
+    queue_engine.invalidate_playlist_sources(conn, playlist_id)
+    queue_engine.invalidate_position_refs(
+        conn, [f":item:{item_id}:" for item_id in rotation_item_ids]
+    )
     queue_engine.ensure_queue(conn, settings, _now(request))
     _sync(request, conn)
     request.app.state.scheduler.wake()
@@ -370,9 +437,11 @@ def add_playlist_tracks(
     session: dict = Depends(require_csrf),
 ):
     ids = body.get("track_ids") if isinstance(body, dict) else None
-    return playlists.add_tracks(
+    result = playlists.add_tracks(
         conn, _settings(request), playlist_id, ids or [], _now(request)
     )
+    _refresh_playlist_queue(request, conn, playlist_id)
+    return result
 
 
 @router.delete("/playlists/{playlist_id}/tracks/{track_id}")
@@ -383,9 +452,11 @@ def remove_playlist_track(
     conn: sqlite3.Connection = Depends(get_conn),
     session: dict = Depends(require_csrf),
 ):
-    return playlists.remove_track(
+    result = playlists.remove_track(
         conn, _settings(request), playlist_id, track_id, _now(request)
     )
+    _refresh_playlist_queue(request, conn, playlist_id)
+    return result
 
 
 @router.put("/playlists/{playlist_id}/order")
@@ -396,13 +467,63 @@ def reorder_playlist(
     conn: sqlite3.Connection = Depends(get_conn),
     session: dict = Depends(require_csrf),
 ):
-    return playlists.reorder(
+    result = playlists.reorder(
         conn,
         _settings(request),
         playlist_id,
         body.get("track_ids") or [],
         _now(request),
     )
+    _refresh_playlist_queue(request, conn, playlist_id)
+    return result
+
+
+@router.post("/playlists/{playlist_id}/cover")
+def upload_playlist_cover(
+    playlist_id: str,
+    request: Request,
+    file: UploadFile = File(...),
+    conn: sqlite3.Connection = Depends(get_conn),
+    session: dict = Depends(require_csrf),
+):
+    settings = _settings(request)
+    row = playlists.require_playlist(conn, playlist_id)
+    old_cover = row["cover_path"]
+    name = media.save_playlist_cover(settings, playlist_id, file.file)
+    if old_cover and old_cover != name:
+        playlists.remove_playlist_cover(settings, {"cover_path": old_cover})
+    conn.execute(
+        "UPDATE playlists SET cover_path = ?, updated_at = ? WHERE id = ?",
+        (name, to_iso(_now(request)), playlist_id),
+    )
+    conn.commit()
+    return {
+        "playlist": playlist_payload(
+            conn, playlists.require_playlist(conn, playlist_id), settings
+        )
+    }
+
+
+@router.delete("/playlists/{playlist_id}/cover")
+def delete_playlist_cover(
+    playlist_id: str,
+    request: Request,
+    conn: sqlite3.Connection = Depends(get_conn),
+    session: dict = Depends(require_csrf),
+):
+    settings = _settings(request)
+    row = playlists.require_playlist(conn, playlist_id)
+    playlists.remove_playlist_cover(settings, row)
+    conn.execute(
+        "UPDATE playlists SET cover_path = NULL, updated_at = ? WHERE id = ?",
+        (to_iso(_now(request)), playlist_id),
+    )
+    conn.commit()
+    return {
+        "playlist": playlist_payload(
+            conn, playlists.require_playlist(conn, playlist_id), settings
+        )
+    }
 
 
 @router.post("/playlists/{playlist_id}/play")
@@ -417,7 +538,10 @@ def play_playlist(
     now = _now(request)
     playlists.require_playlist(conn, playlist_id)
     if not queue_engine.playlist_track_ids(conn, playlist_id):
-        raise ApiError(422, "empty_playlist", "Плейлист пуст: добавьте треки перед запуском.")
+        raise ApiError(422, "playlist_empty", "Плейлист пуст: добавьте треки перед запуском.")
+    mode = str((body or {}).get("mode") or "now")
+    if mode not in ("now", "next"):
+        raise ApiError(422, "invalid_mode", "Недопустимый режим запуска плейлиста.")
     conn.execute("UPDATE overrides SET active = 0 WHERE active = 1")
     override_id = uuid.uuid4().hex
     conn.execute(
@@ -425,13 +549,24 @@ def play_playlist(
         "VALUES(?, 'playlist', ?, 'indefinite', NULL, 1, ?, ?)",
         (override_id, playlist_id, to_iso(now), "Запуск плейлиста из панели"),
     )
+    db.delete_setting(conn, f"_cycle:override:{override_id}:playlist:{playlist_id}")
     conn.commit()
-    queue_engine.ensure_queue(conn, settings, now)
-    _sync(request, conn)
+    current_status = request.app.state.station.status(conn, now)
+    was_stopped = request.app.state.station.desired(conn) != "playing"
+    if was_stopped or not current_status.get("unit_active"):
+        status = request.app.state.station.start(conn, now)
+    else:
+        queue_engine.ensure_queue(conn, settings, now)
+        _sync(request, conn)
+        status = request.app.state.station.status(conn, now)
+    request.app.state.station_status = status
     request.app.state.scheduler.wake()
     return {
-        "override": _override_payload(conn, override_id),
-        "queue": queue_engine.queue_snapshot(conn, settings, now),
+        "started": True,
+        "station": status,
+        "playlist": playlist_payload(
+            conn, playlists.require_playlist(conn, playlist_id), settings
+        ),
     }
 
 
@@ -1262,12 +1397,13 @@ def storage(request: Request, conn: sqlite3.Connection = Depends(get_conn)):
     settings = _settings(request)
     totals = db.library_totals(conn)
     cover_bytes = 0
-    try:
-        for entry in os.scandir(settings.cover_dir):
-            if entry.is_file():
-                cover_bytes += entry.stat().st_size
-    except OSError:
-        cover_bytes = 0
+    for directory in (settings.cover_dir, settings.playlist_cover_dir):
+        try:
+            for entry in os.scandir(directory):
+                if entry.is_file():
+                    cover_bytes += entry.stat().st_size
+        except OSError:
+            continue
     free_bytes = total_bytes = 0
     try:
         statvfs = os.statvfs(str(settings.music_dir))
@@ -1288,17 +1424,12 @@ def storage(request: Request, conn: sqlite3.Connection = Depends(get_conn)):
         "free_bytes": free_bytes,
         "total_bytes": total_bytes,
         "limit_gb": db.get_float_setting(conn, "max_library_gb", 0.0),
-        "music_dir": str(settings.music_dir),
     }
 
 
 @router.get("/services")
 def services(request: Request, conn: sqlite3.Connection = Depends(get_conn)):
-    return {
-        "services": request.app.state.station.services(conn),
-        "last_start": db.get_setting(conn, "engine_last_start") or None,
-        "last_error": db.get_setting(conn, "engine_last_error") or None,
-    }
+    return {"services": request.app.state.station.services(conn)}
 
 
 @router.get("/history")
@@ -1343,16 +1474,50 @@ def links(request: Request, conn: sqlite3.Connection = Depends(get_conn)):
     settings = _settings(request)
     base = (db.get_setting(conn, "public_base_url") or settings.public_base_url).rstrip("/")
     stream = f"{base}/radio.mp3"
-    http_stream = (
-        "http://" + stream[len("https://"):] if stream.startswith("https://") else stream
+    items = [
+        {
+            "key": "mp3",
+            "label": "Прямая ссылка на поток",
+            "url": stream,
+            "description": "Прямая ссылка на аудиопоток для интернет-радиоплееров и совместимых приложений",
+            "primary": True,
+        }
+    ]
+    if settings.public_http_base_url:
+        items.append(
+            {
+                "key": "http_mp3",
+                "label": "HTTP-поток",
+                "url": f"{settings.public_http_base_url}/radio.mp3",
+                "description": "Дополнительная HTTP-ссылка на тот же аудиопоток",
+            }
+        )
+    items.extend(
+        [
+            {
+                "key": "player",
+                "label": "Публичный плеер",
+                "url": f"{base}/",
+                "description": "Страница прослушивания в браузере",
+            },
+            {
+                "key": "m3u",
+                "label": "Плейлист M3U",
+                "url": f"{base}/radio.m3u",
+                "description": "Файл плейлиста для VLC и других плееров",
+            },
+            {
+                "key": "pls",
+                "label": "Плейлист PLS",
+                "url": f"{base}/radio.pls",
+                "description": "Файл плейлиста PLS для совместимых плееров",
+            },
+            {
+                "key": "metadata",
+                "label": "Метаданные эфира",
+                "url": f"{base}/api/public/now-playing",
+                "description": "Текущий трек, источник и статистика станции в JSON",
+            },
+        ]
     )
-    return {
-        "world_radio": stream,
-        "mp3": stream,
-        "http_mp3": http_stream,
-        "m3u": f"{base}/radio.m3u",
-        "pls": f"{base}/radio.pls",
-        "player": f"{base}/",
-        "admin": f"{base}/admin/",
-        "now_playing": f"{base}/api/public/now-playing",
-    }
+    return {"links": items}

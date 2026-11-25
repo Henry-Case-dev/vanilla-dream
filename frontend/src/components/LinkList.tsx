@@ -16,7 +16,7 @@ function LinkRow({ link }: { link: RadioLink }) {
     <div className={`link-row ${link.primary ? 'link-row--primary' : ''}`.trim()}>
       <div className="link-row__text">
         <span className="link-row__label">{link.label}</span>
-        {link.hint && <span className="link-row__hint">{link.hint}</span>}
+        {link.description && <span className="link-row__hint">{link.description}</span>}
       </div>
       <button
         type="button"
@@ -43,18 +43,15 @@ function LinkRow({ link }: { link: RadioLink }) {
   );
 }
 
-/** Блок ссылок на трансляцию — основной рабочий блок панели. */
+/** Блок ссылок на трансляцию — только данные серверного `links`. */
 export function LinkList({ links, emptyHint = 'Сервер ещё не сформировал ссылки' }: LinkListProps) {
   if (links.length === 0) {
     return <EmptyState compact title="Ссылки недоступны" description={emptyHint} />;
   }
   return (
     <div className="link-list">
-      {links.map((link, index) => (
-        <LinkRow
-          key={`${link.id}-${link.url}`}
-          link={!links.some((entry) => entry.primary) && index === 0 ? { ...link, primary: true } : link}
-        />
+      {links.map((link) => (
+        <LinkRow key={`${link.key}-${link.url}`} link={link} />
       ))}
     </div>
   );

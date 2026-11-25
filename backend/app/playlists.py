@@ -7,9 +7,15 @@ import uuid
 from datetime import datetime
 
 from . import db
-from .config import Settings
-from .models import REPEAT_MODES, playlist_payload, track_payload
-from .util import ApiError, to_iso
+from .config import SYSTEM_PLAYLIST_ID, Settings
+from .models import (
+    REPEAT_MODES,
+    playlist_available_ids,
+    playlist_available_rows,
+    playlist_payload,
+    track_payload,
+)
+from .util import ApiError, is_relative_to, to_iso
 
 
 def require_playlist(conn: sqlite3.Connection, playlist_id: str) -> sqlite3.Row:
@@ -17,6 +23,36 @@ def require_playlist(conn: sqlite3.Connection, playlist_id: str) -> sqlite3.Row:
     if row is None:
         raise ApiError(404, "playlist_not_found", "Плейлист не найден.")
     return row
+
+
+def is_system(row: sqlite3.Row | dict) -> bool:
+    value = row["system"] if isinstance(row, sqlite3.Row) else row.get("system", 0)
+    playlist_id = row["id"] if isinstance(row, sqlite3.Row) else row.get("id")
+    return bool(value) or playlist_id == SYSTEM_PLAYLIST_ID
+
+
+def require_mutable(conn: sqlite3.Connection, playlist_id: str) -> sqlite3.Row:
+    row = require_playlist(conn, playlist_id)
+    if is_system(row):
+        raise ApiError(
+            409,
+            "system_playlist",
+            "Системный плейлист «Вся медиатека» изменяется только через медиатеку.",
+        )
+    return row
+
+
+def remove_playlist_cover(settings: Settings, row: sqlite3.Row | dict) -> None:
+    cover = row["cover_path"] if isinstance(row, sqlite3.Row) else row.get("cover_path")
+    if not cover:
+        return
+    path = settings.playlist_cover_dir / str(cover)
+    if not is_relative_to(path, settings.playlist_cover_dir):
+        return
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        return
 
 
 def _validate_name(name: str | None) -> str:
@@ -38,7 +74,11 @@ def _validate_repeat(value: str | None, current: str = "none") -> str:
 
 
 def list_playlists(conn: sqlite3.Connection, settings: Settings) -> list[dict]:
-    rows = conn.execute("SELECT * FROM playlists ORDER BY lower(name) ASC, created_at ASC").fetchall()
+    rows = conn.execute(
+        "SELECT * FROM playlists ORDER BY CASE WHEN system = 1 OR id = ? THEN 0 ELSE 1 END, "
+        "lower(name) ASC, created_at ASC",
+        (SYSTEM_PLAYLIST_ID,),
+    ).fetchall()
     return [playlist_payload(conn, row, settings) for row in rows]
 
 
@@ -55,7 +95,7 @@ def create_playlist(
     playlist_id = uuid.uuid4().hex
     conn.execute(
         "INSERT INTO playlists(id, name, description, cover_path, shuffle, repeat_mode, "
-        "created_at, updated_at) VALUES(?, ?, ?, NULL, ?, ?, ?, ?)",
+        "system, created_at, updated_at) VALUES(?, ?, ?, NULL, ?, ?, 0, ?, ?)",
         (
             playlist_id,
             _validate_name(name),
@@ -79,11 +119,17 @@ def update_playlist(
     now: datetime,
 ) -> dict:
     row = require_playlist(conn, playlist_id)
+    system = is_system(row)
     updates: dict = {}
     if "name" in fields:
+        if system and str(fields.get("name") or "").strip() != row["name"]:
+            raise ApiError(409, "system_playlist", "Название системного плейлиста изменить нельзя.")
         updates["name"] = _validate_name(fields.get("name"))
     if "description" in fields:
-        updates["description"] = str(fields.get("description") or "").strip() or None
+        description = str(fields.get("description") or "").strip() or None
+        if system and description != row["description"]:
+            raise ApiError(409, "system_playlist", "Описание системного плейлиста изменить нельзя.")
+        updates["description"] = description
     if "shuffle" in fields:
         updates["shuffle"] = 1 if fields.get("shuffle") else 0
     if "repeat_mode" in fields:
@@ -100,7 +146,14 @@ def update_playlist(
 
 
 def delete_playlist(conn: sqlite3.Connection, settings: Settings, playlist_id: str, now: datetime) -> dict:
-    require_playlist(conn, playlist_id)
+    row = require_playlist(conn, playlist_id)
+    if is_system(row):
+        raise ApiError(
+            409,
+            "system_playlist",
+            "Системный плейлист «Вся медиатека» удалить нельзя.",
+        )
+    remove_playlist_cover(settings, row)
     conn.execute("DELETE FROM playlist_tracks WHERE playlist_id = ?", (playlist_id,))
     conn.execute("DELETE FROM rotation_items WHERE playlist_id = ?", (playlist_id,))
     conn.execute(
@@ -120,26 +173,56 @@ def delete_playlist(conn: sqlite3.Connection, settings: Settings, playlist_id: s
     return {"deleted": True}
 
 
-def playlist_tracks(conn: sqlite3.Connection, settings: Settings, playlist_id: str) -> list[dict]:
+def playlist_tracks(
+    conn: sqlite3.Connection,
+    settings: Settings,
+    playlist_id: str,
+    *,
+    limit: int | None = None,
+    offset: int = 0,
+) -> list[dict]:
     require_playlist(conn, playlist_id)
-    rows = conn.execute(
-        "SELECT t.*, pt.position AS playlist_position FROM playlist_tracks pt "
-        "JOIN tracks t ON t.id = pt.track_id WHERE pt.playlist_id = ? "
-        "ORDER BY pt.position ASC",
-        (playlist_id,),
-    ).fetchall()
+    rows = playlist_available_rows(conn, playlist_id, limit=limit, offset=offset)
     items = []
-    for row in rows:
+    for index, row in enumerate(rows):
         item = track_payload(row, settings)
-        item["position"] = int(row["playlist_position"])
+        stored_position = row["playlist_position"]
+        item["position"] = (
+            int(stored_position) if stored_position is not None else offset + index
+        )
         items.append(item)
     return items
 
 
-def playlist_detail(conn: sqlite3.Connection, settings: Settings, playlist_id: str) -> dict:
-    payload = playlist_payload(conn, require_playlist(conn, playlist_id), settings)
-    payload["tracks"] = playlist_tracks(conn, settings, playlist_id)
+def playlist_detail(
+    conn: sqlite3.Connection,
+    settings: Settings,
+    playlist_id: str,
+    *,
+    tracks_limit: int = 500,
+    tracks_offset: int = 0,
+) -> dict:
+    row = require_playlist(conn, playlist_id)
+    payload = playlist_payload(conn, row, settings)
+    limit = max(0, min(int(tracks_limit), 2000))
+    offset = max(0, int(tracks_offset))
+    payload["tracks"] = playlist_tracks(
+        conn, settings, playlist_id, limit=limit, offset=offset
+    )
+    payload["tracks_total"] = payload["track_count"]
     return payload
+
+
+def _track_file_available(
+    conn: sqlite3.Connection, settings: Settings, track: sqlite3.Row
+) -> bool:
+    from . import media
+
+    try:
+        path = media.resolve_track_path(settings, track)
+    except ApiError:
+        return False
+    return path.exists()
 
 
 def add_tracks(
@@ -149,11 +232,13 @@ def add_tracks(
     track_ids: list[str],
     now: datetime,
 ) -> dict:
-    require_playlist(conn, playlist_id)
+    require_mutable(conn, playlist_id)
     if not isinstance(track_ids, list) or not track_ids:
         raise ApiError(422, "invalid_tracks", "Передайте список треков.")
     added = 0
     skipped = 0
+    unavailable = 0
+    seen: set[str] = set()
     position_row = conn.execute(
         "SELECT COALESCE(MAX(position), -1) AS position FROM playlist_tracks WHERE playlist_id = ?",
         (playlist_id,),
@@ -161,21 +246,26 @@ def add_tracks(
     position = int(position_row["position"]) if position_row["position"] is not None else -1
     for raw_id in track_ids:
         track_id = str(raw_id or "").strip()
-        if not track_id:
-            skipped += 1
+        if not track_id or track_id in seen:
             continue
+        seen.add(track_id)
         track = conn.execute(
-            "SELECT id FROM tracks WHERE id = ? AND pending_delete = 0", (track_id,)
+            "SELECT * FROM tracks WHERE id = ? AND pending_delete = 0", (track_id,)
         ).fetchone()
         if track is None:
-            skipped += 1
+            unavailable += 1
             continue
         existing = conn.execute(
             "SELECT 1 FROM playlist_tracks WHERE playlist_id = ? AND track_id = ?",
             (playlist_id, track_id),
         ).fetchone()
         if existing is not None:
+            # A stored relation stays "skipped" even if the file is currently
+            # missing; it is still present in the playlist.
             skipped += 1
+            continue
+        if not _track_file_available(conn, settings, track):
+            unavailable += 1
             continue
         position += 1
         conn.execute(
@@ -187,7 +277,12 @@ def add_tracks(
         "UPDATE playlists SET updated_at = ? WHERE id = ?", (to_iso(now), playlist_id)
     )
     conn.commit()
-    return {"added": added, "skipped": skipped, "playlist": playlist_detail(conn, settings, playlist_id)}
+    return {
+        "added": added,
+        "skipped": skipped,
+        "unavailable": unavailable,
+        "playlist": playlist_payload(conn, require_playlist(conn, playlist_id), settings),
+    }
 
 
 def remove_track(
@@ -197,14 +292,17 @@ def remove_track(
     track_id: str,
     now: datetime,
 ) -> dict:
-    require_playlist(conn, playlist_id)
+    require_mutable(conn, playlist_id)
     conn.execute(
         "DELETE FROM playlist_tracks WHERE playlist_id = ? AND track_id = ?",
         (playlist_id, track_id),
     )
     conn.execute("UPDATE playlists SET updated_at = ? WHERE id = ?", (to_iso(now), playlist_id))
     conn.commit()
-    return {"removed": True, "playlist": playlist_detail(conn, settings, playlist_id)}
+    return {
+        "removed": True,
+        "playlist": playlist_payload(conn, require_playlist(conn, playlist_id), settings),
+    }
 
 
 def reorder(
@@ -214,7 +312,7 @@ def reorder(
     track_ids: list[str],
     now: datetime,
 ) -> dict:
-    require_playlist(conn, playlist_id)
+    require_mutable(conn, playlist_id)
     current = {
         str(row["track_id"])
         for row in conn.execute(
@@ -235,4 +333,6 @@ def reorder(
         )
     conn.execute("UPDATE playlists SET updated_at = ? WHERE id = ?", (to_iso(now), playlist_id))
     conn.commit()
-    return {"playlist": playlist_detail(conn, settings, playlist_id)}
+    return {
+        "playlist": playlist_payload(conn, require_playlist(conn, playlist_id), settings)
+    }

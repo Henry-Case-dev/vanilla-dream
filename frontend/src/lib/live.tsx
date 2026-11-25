@@ -1,6 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { api, errorMessage, normalizeNowPlaying } from './api';
+import { useDataChanged } from './refresh';
 import type { NowPlaying } from './types';
 
 export type FeedState = 'connecting' | 'live' | 'polling';
@@ -136,6 +137,10 @@ export function LiveProvider({ children }: { children: ReactNode }) {
   const reload = useCallback(() => {
     void loadOnce();
   }, [loadOnce]);
+
+  useDataChanged(() => {
+    void loadOnce();
+  });
 
   const value = useMemo<LiveContextValue>(
     () => ({ now, loading, error, feed, reload }),

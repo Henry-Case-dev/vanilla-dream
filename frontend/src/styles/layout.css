@@ -325,6 +325,13 @@
   color: var(--text-muted);
 }
 
+.pb-air__text {
+  max-width: 116px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .pb-air__buttons {
   display: flex;
   align-items: center;
@@ -874,6 +881,10 @@
     border-left: 0;
     padding-left: 0;
     gap: 8px;
+  }
+
+  .pb-air__text {
+    max-width: 86px;
   }
 
   .pb-local {

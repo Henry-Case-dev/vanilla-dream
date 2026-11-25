@@ -69,14 +69,26 @@ end
 
 thread.run(every=0.5, fast=false, flush)
 
+# Replace the prepared queue. The reply reports how many requests Liquidsoap
+# could actually resolve, so the backend never marks an unplayable file as
+# prepared: "OK <resolved> <failed>".
+sync_counts = fun (flags) -> begin
+  let ok = list.length(list.filter(fun (flag) -> flag, flags))
+  "OK #{string(ok)} #{string(list.length(flags) - ok)}"
+end
+
+sync_apply = fun (lines) -> begin
+  let reqs = list.map(fun (line) -> request.create(line), lines)
+  let flags = list.map(fun (request_item) -> request.resolve(request_item), reqs)
+  queue.set_queue(reqs)
+  log("vd_sync: #{sync_counts(flags)} of #{string(list.length(reqs))} request(s), queue length #{string(queue.length())}")
+  sync_counts(flags)
+end
+
 server.register(description="Replace the prepared queue from the backend file", "vd_sync", fun (_) ->
   begin
     let lines = if file.exists(radio_queue_file) then file.lines(radio_queue_file) else [] end
-    let reqs = list.map(fun (line) -> request.create(line), lines)
-    list.iter(fun (request_item) -> ignore(request.resolve(request_item)), reqs)
-    queue.set_queue(reqs)
-    log("vd_sync: #{string_of(list.length(reqs))} request(s), queue length #{string_of(queue.length())}")
-    "OK #{string_of(list.length(reqs))}"
+    sync_apply(lines)
   end
 )
 

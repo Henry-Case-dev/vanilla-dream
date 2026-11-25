@@ -10,6 +10,7 @@ import { useResource } from '../lib/hooks';
 import { api, errorMessage } from '../lib/api';
 import { formatCount, formatLongDuration, pluralRu, tracksLabel, repeatLabel } from '../lib/format';
 import { RotationPanel } from './RotationPanel';
+import { notifyDataChanged } from '../lib/refresh';
 
 export function PlaylistsPage() {
   const navigate = useNavigate();
@@ -42,6 +43,7 @@ export function PlaylistsPage() {
       });
       toast.notify('success', 'Плейлист создан');
       setCreateOpen(false);
+      notifyDataChanged();
       navigate(`/admin/playlists/${playlist.id}`);
     } catch (caught) {
       toast.notify('error', errorMessage(caught));
@@ -136,7 +138,12 @@ export function PlaylistsPage() {
                 <Cover src={playlist.coverUrl} alt={`Обложка плейлиста ${playlist.name}`} size="fill" rounded="md" />
               </div>
               <div className="playlist-card__body">
-                <h3 className="playlist-card__name">{playlist.name}</h3>
+                <div className="playlist-card__title-row">
+                  <h3 className="playlist-card__name">{playlist.name}</h3>
+                  {playlist.system && (
+                    <span className="playlist-system-label">Системный плейлист</span>
+                  )}
+                </div>
                 <p className="playlist-card__desc">{playlist.description || 'Без описания'}</p>
                 <div className="playlist-card__meta">
                   <span>{tracksLabel(playlist.trackCount)}</span>

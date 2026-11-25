@@ -97,6 +97,18 @@ def active_rule(conn: sqlite3.Connection, now_utc: datetime) -> sqlite3.Row | No
     return None
 
 
+def active_rules(conn: sqlite3.Connection, now_utc: datetime) -> list[sqlite3.Row]:
+    """All active rules in deterministic priority order (first = winner)."""
+
+    if db.get_setting(conn, "schedule_enabled", "1") != "1":
+        return []
+    local = local_now(now_utc, station_tz(conn))
+    rows = conn.execute(
+        "SELECT * FROM schedule_rules WHERE enabled = 1 ORDER BY priority DESC, start_min ASC, id ASC"
+    ).fetchall()
+    return [row for row in rows if rule_matches(row, local)]
+
+
 def _rule_occurrences(rule: sqlite3.Row, zone: ZoneInfo, start_date: date, days_ahead: int = 10):
     """Yield (utc_dt, event, name) for rule starts and ends."""
 
@@ -275,6 +287,16 @@ class SchedulerLoop:
             if new_rule_id != db.get_setting(conn, "_active_rule"):
                 db.set_setting(conn, "_active_rule", new_rule_id)
                 db.set_setting(conn, "last_schedule_change", to_iso(now) or "")
+                if new_rule_id:
+                    # A new schedule block is a fresh pass even for repeat=none
+                    # sources and even when the same rule returns the next day.
+                    queue_engine.invalidate_position_refs(
+                        conn, [f"schedule:{new_rule_id}:"]
+                    )
+                    conn.execute(
+                        "DELETE FROM settings WHERE key LIKE ?",
+                        (f"_cycle:schedule:{new_rule_id}:%",),
+                    )
                 if (
                     rule is not None
                     and str(rule["transition"] or "after_track") == "immediate"
@@ -296,6 +318,9 @@ class SchedulerLoop:
                     status = self.station.status(conn, now, stats)
             else:
                 queue_engine.ensure_queue(conn, self.settings, now)
+            # Status is computed after queue/engine work so reason and
+            # playback_stalled reflect the actual queue state of this tick.
+            status = self.station.status(conn, now, stats)
             change_at, rule_name = schedule_module.next_schedule_change(conn, now)
             self.app_state.station_status = status
             self.app_state.stats = stats

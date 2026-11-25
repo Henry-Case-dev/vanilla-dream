@@ -41,7 +41,8 @@ def test_playlist_crud(env, admin):
     assert "режим повторения" in invalid.json()["detail"]["message"].lower()
 
     listing = env.client.get("/api/admin/playlists").json()["items"]
-    assert [item["id"] for item in listing] == [playlist["id"]]
+    assert listing[0]["id"] == "library" and listing[0]["system"] is True
+    assert [item["id"] for item in listing[1:]] == [playlist["id"]]
 
     deleted = env.client.delete(f"/api/admin/playlists/{playlist['id']}")
     assert deleted.status_code == 200
@@ -63,7 +64,9 @@ def test_tracks_add_order_and_totals(env, admin):
         json={"track_ids": [third["id"], first["id"], second["id"]]},
     )
     assert reordered.status_code == 200
-    tracks = reordered.json()["playlist"]["tracks"]
+    tracks = env.client.get(
+        f"/api/admin/playlists/{playlist['id']}"
+    ).json()["playlist"]["tracks"]
     assert [track["id"] for track in tracks] == [third["id"], first["id"], second["id"]]
     assert [track["position"] for track in tracks] == [0, 1, 2]
 
@@ -84,7 +87,8 @@ def test_tracks_add_order_and_totals(env, admin):
         json={"track_ids": [first["id"], "missing"]},
     ).json()
     assert duplicate_add["added"] == 0
-    assert duplicate_add["skipped"] == 2
+    assert duplicate_add["skipped"] == 1
+    assert duplicate_add["unavailable"] == 1
 
 
 def test_shared_track_is_not_copied(env, admin):
@@ -136,18 +140,57 @@ def test_delete_playlist_keeps_audio_and_cleans_references(env, admin):
         conn.close()
 
 
+def test_add_tracks_counts_existing_relation_before_file_check(env, admin):
+    offline = _upload(env, "relation-offline", "Relation offline")
+    readable = _upload(env, "relation-readable", "Relation readable")
+    offline_playlist = make_playlist(env.client, "Offline relation", [offline["id"]])
+    readable_playlist = make_playlist(env.client, "Readable relation", [readable["id"]])
+
+    conn = db.open_db(env.settings)
+    try:
+        path = conn.execute(
+            "SELECT path FROM tracks WHERE id = ?", (offline["id"],)
+        ).fetchone()["path"]
+    finally:
+        conn.close()
+    (env.settings.music_dir / path).unlink()
+
+    offline_result = env.client.post(
+        f"/api/admin/playlists/{offline_playlist['id']}/tracks",
+        json={"track_ids": [offline["id"], offline["id"]]},
+    ).json()
+    assert offline_result["added"] == 0
+    assert offline_result["skipped"] == 1
+    assert offline_result["unavailable"] == 0
+
+    readable_result = env.client.post(
+        f"/api/admin/playlists/{readable_playlist['id']}/tracks",
+        json={"track_ids": [readable["id"], readable["id"]]},
+    ).json()
+    assert readable_result["added"] == 0
+    assert readable_result["skipped"] == 1
+    assert readable_result["unavailable"] == 0
+
+
 def test_playlist_play_sets_override_and_plays(env, admin):
     track = _upload(env, "play", "Запуск")
     playlist = make_playlist(env.client, "Эфир", [track["id"]])
-    response = env.client.post(f"/api/admin/playlists/{playlist['id']}/play")
+    response = env.client.post(f"/api/admin/playlists/{playlist['id']}/play", json={"mode": "now"})
     assert response.status_code == 200
     body = response.json()
-    assert body["override"]["kind"] == "playlist"
-    assert body["override"]["scope"] == "indefinite"
-    assert body["queue"]["items"], body
-    assert body["queue"]["items"][0]["track"]["id"] == track["id"]
+    assert body["started"] is True
+    assert body["playlist"]["id"] == playlist["id"]
+    assert body["station"]["desired"] == "playing"
+    queue = env.client.get("/api/admin/queue").json()["items"]
+    assert queue and queue[0]["track"]["id"] == track["id"]
     started = play_next(env)
     assert started["track"]["id"] == track["id"]
+
+    conn = db.open_db(env.settings)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM overrides WHERE active = 1").fetchone()[0] == 1
+    finally:
+        conn.close()
 
     cleared = env.client.delete("/api/admin/station/override")
     assert cleared.status_code == 200
@@ -166,7 +209,11 @@ def test_playlist_cover_uses_first_track_cover(env, admin):
         write_mp3(env.settings.music_dir.parent / "covered.mp3", title="С обложкой", cover=True),
     )
     playlist = make_playlist(env.client, "Обложки", [plain["id"], with_cover["id"]])
-    assert playlist["cover_url"].endswith(f"/api/public/playlist-cover/{playlist['id']}")
+    playlist = env.client.get(f"/api/admin/playlists/{playlist['id']}").json()["playlist"]
+    assert playlist["cover_kind"] == "auto"
+    assert playlist["cover_url"].split("?")[0].endswith(
+        f"/api/public/playlist-cover/{playlist['id']}"
+    )
     response = env.client.get(f"/api/public/playlist-cover/{playlist['id']}")
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("image/jpeg")

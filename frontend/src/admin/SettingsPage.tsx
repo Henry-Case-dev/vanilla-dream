@@ -33,6 +33,8 @@ import { useLive } from '../lib/live';
 import { useResource } from '../lib/hooks';
 import { useAuth } from '../lib/auth';
 import { api, errorMessage } from '../lib/api';
+import { StatusPill } from '../components/StatusPill';
+import { notifyDataChanged, useDataChanged } from '../lib/refresh';
 import {
   formatBytes,
   formatCount,
@@ -63,13 +65,6 @@ interface ScheduleForm {
   transition: string;
 }
 
-const serviceStateLabel: Record<string, string> = {
-  active: 'Работает',
-  inactive: 'Остановлена',
-  failed: 'Ошибка',
-  unknown: 'Неизвестно',
-};
-
 const serviceStateTone: Record<string, string> = {
   active: 'dot--live',
   inactive: 'dot--idle',
@@ -86,6 +81,12 @@ export function SettingsPage() {
   const storage = useResource(() => api.admin.storage(), [], { pollMs: 60000 });
   const services = useResource(() => api.admin.services(), [], { pollMs: 30000 });
   const playlists = useResource(() => api.admin.playlists.list(), []);
+  useDataChanged(() => {
+    void settings.reload(true);
+    void storage.reload(true);
+    void services.reload(true);
+    void playlists.reload(true);
+  });
 
   const [broadcast, setBroadcast] = useState<BroadcastForm | null>(null);
   const [schedule, setSchedule] = useState<ScheduleForm | null>(null);
@@ -151,6 +152,7 @@ export function SettingsPage() {
       );
       toast.notify('success', 'Настройки вещания сохранены');
       reloadLive();
+      notifyDataChanged();
       void settings.reload(true);
     } catch (caught) {
       toast.notify('error', errorMessage(caught));
@@ -191,6 +193,7 @@ export function SettingsPage() {
       );
       toast.notify('success', 'Настройки расписания сохранены');
       reloadLive();
+      notifyDataChanged();
       void settings.reload(true);
     } catch (caught) {
       toast.notify('error', errorMessage(caught));
@@ -226,7 +229,7 @@ export function SettingsPage() {
     }
   };
 
-  const storageUsed = storage.data?.libraryBytes ?? 0;
+  const storageUsed = storage.data?.bytes ?? 0;
   const free = storage.data?.freeBytes ?? null;
   const total = storage.data?.totalBytes ?? null;
   const diskUsed = total && free !== null ? Math.max(0, total - free) : null;
@@ -281,7 +284,7 @@ export function SettingsPage() {
               </h2>
               <p className="panel-subtitle">Название, описание и параметры эфира</p>
             </div>
-            <Chip tone="neutral">Движок: {now?.station.bitrate ?? settings.data?.bitrate ?? '—'} кбит/с</Chip>
+            <><StatusPill status={now?.station.status ?? "unknown"} reason={now?.station.reason} /><Chip tone="neutral">Движок: {now?.station.bitrate ?? settings.data?.bitrate ?? "—"} кбит/с</Chip></>
           </div>
 
           {broadcast ? (
@@ -323,17 +326,18 @@ export function SettingsPage() {
               <div className="form-grid form-grid--2">
                 <SelectField
                   label="Плейлист по умолчанию"
+                  className="settings-source-select"
                   value={broadcast.defaultPlaylistId}
                   onChange={(event) => setBroadcast({ ...broadcast, defaultPlaylistId: event.target.value })}
                   hint="Если ротация и расписание не задают источник"
                 >
-                  <option value="">Вся медиатека</option>
+                  <option value="">Вся медиатека (автоматически)</option>
                   {broadcast.defaultPlaylistId &&
                     playlists.data &&
                     !playlists.data.some((playlist) => playlist.id === broadcast.defaultPlaylistId) && (
                       <option value={broadcast.defaultPlaylistId}>Плейлист недоступен</option>
                     )}
-                  {(playlists.data ?? []).map((playlist) => (
+                  {(playlists.data ?? []).filter((playlist) => !playlist.system).map((playlist) => (
                     <option key={playlist.id} value={playlist.id}>
                       {playlist.name}
                     </option>
@@ -442,23 +446,31 @@ export function SettingsPage() {
                   <span className="storage__value">{formatCount(storage.data.tracks)}</span>
                 </div>
                 <div className="storage__stat">
-                  <span className="storage__label">Занято музыкой</span>
+                  <span className="storage__label">Музыка</span>
                   <span className="storage__value">{formatBytes(storageUsed)}</span>
+                </div>
+                <div className="storage__stat">
+                  <span className="storage__label">Обложки</span>
+                  <span className="storage__value">{formatBytes(storage.data.coverBytes)}</span>
                 </div>
                 <div className="storage__stat">
                   <span className="storage__label">Свободно на диске</span>
                   <span className="storage__value">{formatBytes(free)}</span>
+                </div>
+                <div className="storage__stat">
+                  <span className="storage__label">Всего на диске</span>
+                  <span className="storage__value">{formatBytes(total)}</span>
                 </div>
               </div>
               {diskProgress !== null && (
                 <div className="storage__disk">
                   <ProgressBar value={diskProgress} label="Занято дискового пространства" />
                   <span className="muted">
-                    {formatBytes(diskUsed)} из {formatBytes(total)}
+                    {formatBytes(diskUsed)} из {formatBytes(total)} занято на диске
                   </span>
                 </div>
               )}
-              {storage.data.freeBytes !== null && storage.data.freeBytes < 3 * 1024 * 1024 * 1024 && (
+              {storage.data.freeBytes < 3 * 1024 * 1024 * 1024 && (
                 <div className="banner banner--warning" role="status">
                   <AlertTriangle size={16} aria-hidden="true" />
                   <div>
@@ -467,14 +479,11 @@ export function SettingsPage() {
                   </div>
                 </div>
               )}
-              {settings.data?.maxLibraryGb ? (
-                <p className="panel-note">
-                  Лимит библиотеки: {settings.data.maxLibraryGb} ГБ · лимит файла:{' '}
-                  {settings.data.maxUploadMb} МБ
-                </p>
-              ) : (
-                <p className="panel-note">Лимит файла: {settings.data?.maxUploadMb ?? '—'} МБ</p>
-              )}
+              <p className="panel-note storage__breakdown">
+                База данных: {formatBytes(storage.data.dbBytes)} · музыка хранится отдельно от
+                системного диска
+                {storage.data.limitGb > 0 ? ` · лимит медиатеки: ${storage.data.limitGb} ГБ` : ''}
+              </p>
             </div>
           ) : null}
         </Panel>
@@ -499,19 +508,27 @@ export function SettingsPage() {
               {services.data.map((service) => (
                 <li key={service.id} className="service-row">
                   <span className={`dot ${serviceStateTone[service.state]}`} aria-hidden="true" />
-                  <span className="service-row__name">{service.name}</span>
+                  <span className="service-row__name">
+                    {service.label}
+                    {service.unit && <code className="service-row__unit">{service.unit}</code>}
+                  </span>
                   <span className="service-row__state">
                     {service.state === 'active' ? (
                       <CheckCircle2 size={14} aria-hidden="true" />
                     ) : service.state === 'failed' ? (
                       <XCircle size={14} aria-hidden="true" />
                     ) : null}
-                    {serviceStateLabel[service.state]}
+                    {service.stateLabel}
                   </span>
                   <span className="service-row__time">
-                    {service.lastStart ? `Запуск: ${formatDateTime(service.lastStart, settings.data?.timezone)}` : '—'}
+                    {service.lastStart
+                      ? `Последний запуск: ${formatDateTime(service.lastStart, settings.data?.timezone)}`
+                      : 'Запуск ещё не зафиксирован'}
                   </span>
-                  {service.lastError && <span className="service-row__error">{service.lastError}</span>}
+                  {service.detail && <span className="service-row__detail">{service.detail}</span>}
+                  {service.lastError && (
+                    <span className="service-row__error">Ошибка: {service.lastError}</span>
+                  )}
                 </li>
               ))}
             </ul>

@@ -39,6 +39,7 @@ export interface NowStation {
   description: string | null;
   status: StationStatus;
   statusLabel: string | null;
+  reason: string | null;
   desired: DesiredState;
   streamUrl: string;
   m3uUrl: string;
@@ -93,22 +94,45 @@ export interface TrackQuery {
   offset?: number;
 }
 
+export type PlaylistCoverKind = 'custom' | 'auto' | 'none';
+
 export interface Playlist {
   id: string;
   name: string;
   description: string | null;
+  system: boolean;
   coverUrl: string | null;
-  trackCount: number | null;
-  duration: number | null;
+  coverKind: PlaylistCoverKind;
+  trackCount: number;
+  duration: number;
   shuffle: boolean;
   repeatMode: RepeatMode;
   createdAt: string | null;
   updatedAt: string | null;
+  pendingDeleteCount: number | null;
 }
 
 export interface PlaylistDetail {
   playlist: Playlist;
   tracks: Track[];
+  tracksTotal: number;
+}
+
+export interface AddTracksResult {
+  added: number;
+  skipped: number;
+  unavailable: number;
+  playlist: Playlist;
+}
+
+export interface RemoveTrackResult {
+  removed: boolean;
+  playlist: Playlist;
+}
+
+export interface TrackIdPage {
+  ids: string[];
+  total: number;
 }
 
 export interface ScheduleRule {
@@ -192,24 +216,30 @@ export interface Settings {
 
 export interface StorageInfo {
   tracks: number;
-  libraryBytes: number;
-  freeBytes: number | null;
-  totalBytes: number | null;
+  bytes: number;
+  coverBytes: number;
+  dbBytes: number;
+  freeBytes: number;
+  totalBytes: number;
+  limitGb: number;
 }
 
 export interface ServiceInfo {
   id: string;
-  name: string;
+  unit: string | null;
+  label: string;
   state: 'active' | 'inactive' | 'failed' | 'unknown';
+  stateLabel: string;
+  detail: string | null;
   lastStart: string | null;
   lastError: string | null;
 }
 
 export interface RadioLink {
-  id: string;
+  key: string;
   label: string;
   url: string;
-  hint: string | null;
+  description: string | null;
   primary: boolean;
 }
 

@@ -12,8 +12,9 @@ import { VolumeControl } from '../components/VolumeControl';
 import { useAudio } from '../lib/audio';
 import { useLive } from '../lib/live';
 import { useResource } from '../lib/hooks';
-import { api, linksFromStation } from '../lib/api';
-import { formatDuration, formatTime, formatUntil } from '../lib/format';
+import { api, publicLinksFromStation } from '../lib/api';
+import { formatDuration, formatTime, formatUntil, sourceDisplayName } from '../lib/format';
+import { describeStationStatus } from '../lib/status';
 
 /**
  * Публичный плеер: без авторизации, только чтение.
@@ -26,13 +27,12 @@ export function PublicPlayerPage() {
 
   const station = now?.station ?? null;
   const track = now?.track ?? null;
-  const sourceName = now?.source?.name ?? now?.source?.label ?? null;
+  const sourceName = sourceDisplayName(now?.source);
+  const statusView = describeStationStatus(station?.status, station?.reason);
 
   const links = useMemo(() => {
     if (!station) return [];
-    return linksFromStation(station).filter((link) =>
-      ['world_radio', 'm3u', 'pls'].includes(link.id),
-    );
+    return publicLinksFromStation(station);
   }, [station]);
 
   const progress = useMemo(() => {
@@ -101,7 +101,7 @@ export function PublicPlayerPage() {
       <header className="public__top">
         <Logo />
         <div className="public__top-right">
-          {station && <StatusPill status={station.status} label={station.statusLabel} />}
+          {station && <StatusPill status={station.status} reason={station.reason} />}
           <Link className="public__admin-link" to="/admin">
             Вход в панель
           </Link>
@@ -120,12 +120,12 @@ export function PublicPlayerPage() {
           </div>
 
           <div className="public-hero__info">
-            <span className="eyebrow">{track ? 'Сейчас в эфире' : 'Прямой эфир'}</span>
+            <span className="eyebrow">{track ? 'Сейчас в эфире' : 'Состояние эфира'}</span>
             <h1 className="public-hero__title" id="now-title">
-              {track ? track.title : 'Сейчас тишина'}
+              {track ? track.title : statusView.label}
             </h1>
             <p className="public-hero__artist">
-              {track?.artist ?? station?.name ?? 'Vanilla Dream Radio'}
+              {track?.artist ?? statusView.detail}
               {track?.album ? <span className="public-hero__album"> · {track.album}</span> : null}
             </p>
 
@@ -140,7 +140,11 @@ export function PublicPlayerPage() {
             )}
 
             <MetaRow className="public-hero__meta">
-              {sourceName && <span className="meta-item">Источник: {sourceName}</span>}
+              {sourceName && (
+                <span className="meta-item">
+                  Источник: {now?.source?.kind === 'override' ? `Ручной выбор · ${sourceName}` : sourceName}
+                </span>
+              )}
               {station?.bitrate ? <span className="meta-item">{station.bitrate} кбит/с</span> : null}
               {now?.listeners.available ? (
                 <span className="meta-item">{now.listeners.count ?? 0} слушателей</span>
@@ -174,7 +178,15 @@ export function PublicPlayerPage() {
               </button>
               <div className="public-hero__controls-text">
                 <span className="public-hero__controls-title">
-                  {audio.busy ? 'Подключение…' : audio.playing ? 'Играет локально' : 'Слушать эфир'}
+                  {!audio.canPlay
+                    ? audio.unavailableReason ?? 'Прослушивание недоступно'
+                    : audio.busy
+                      ? 'Подключение…'
+                      : audio.state === 'reconnecting'
+                        ? 'Переподключение…'
+                        : audio.playing
+                          ? 'Играет локально'
+                          : 'Слушать эфир'}
                 </span>
                 <span className="public-hero__controls-sub">Звук только в вашем браузере</span>
               </div>
@@ -184,7 +196,9 @@ export function PublicPlayerPage() {
             {audio.error && <InlineError message={audio.error} />}
             {!audio.canPlay && !audio.error && (
               <p className="public-hero__hint">
-                Прямая ссылка на поток появится, когда станция начнёт вещание.
+                {audio.unavailableReason === 'Сначала запустите эфир'
+                  ? 'Локальное прослушивание включается после старта эфира.'
+                  : audio.unavailableReason}
               </p>
             )}
           </div>
@@ -193,7 +207,7 @@ export function PublicPlayerPage() {
         <section className="public-section" aria-labelledby="links-title">
           <div className="public-section__head">
             <h2 id="links-title">Слушать в других плеерах</h2>
-            <p>Прямые ссылки для Minecraft, World Radio и медиаплееров.</p>
+            <p>Прямые ссылки для интернет-радиоплееров и совместимых приложений.</p>
           </div>
           {links.length > 0 ? (
             <LinkList links={links} />

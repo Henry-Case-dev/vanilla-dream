@@ -13,6 +13,8 @@ import { useAuth } from '../lib/auth';
 import { useLive } from '../lib/live';
 import { useResource } from '../lib/hooks';
 import { api } from '../lib/api';
+import { describeStationStatus, statusDotClass } from '../lib/status';
+import { useDataChanged } from '../lib/refresh';
 import { PlayerBar } from './PlayerBar';
 
 interface NavItem {
@@ -34,6 +36,9 @@ export function AdminLayout() {
   const { logout } = useAuth();
   const { now } = useLive();
   const playlists = useResource(() => api.admin.playlists.list(), [], { pollMs: 60000 });
+  useDataChanged(() => void playlists.reload(true));
+
+  const statusView = describeStationStatus(now?.station.status, now?.station.reason);
 
   const handleLogout = async () => {
     await logout();
@@ -85,6 +90,9 @@ export function AdminLayout() {
                     className={({ isActive }) => `sidebar__playlist ${isActive ? 'is-active' : ''}`.trim()}
                   >
                     <span className="sidebar__playlist-name">{playlist.name}</span>
+                    {playlist.system && (
+                      <span className="sidebar__playlist-system">системный</span>
+                    )}
                   </NavLink>
                 </li>
               ))}
@@ -95,12 +103,9 @@ export function AdminLayout() {
         </div>
 
         <div className="sidebar__footer">
-          <span className="sidebar__status">
-            <span
-              className={`dot ${now?.station.status === 'on_air' ? 'dot--live' : 'dot--idle'}`}
-              aria-hidden="true"
-            />
-            {now ? (now.station.status === 'on_air' ? 'В эфире' : 'Не в эфире') : 'Нет данных'}
+          <span className="sidebar__status" title={statusView.detail}>
+            <span className={`dot ${statusDotClass(statusView.tone)}`} aria-hidden="true" />
+            {now ? statusView.shortLabel : 'Нет данных'}
           </span>
           <div className="sidebar__footer-links">
             <Link to="/" className="sidebar__footer-link">

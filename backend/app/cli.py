@@ -146,6 +146,7 @@ def cmd_check_config(_args) -> int:
     for label, directory in (
         ("музыки", settings.music_dir),
         ("обложек", settings.cover_dir),
+        ("обложек плейлистов", settings.playlist_cover_dir),
         ("состояния движка", settings.engine_dir),
         ("ссылок очереди", settings.queue_link_dir),
         ("базы данных", settings.db_path.parent),

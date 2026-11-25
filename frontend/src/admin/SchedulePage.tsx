@@ -685,7 +685,7 @@ export function SchedulePage() {
                       <Switch
                         checked={rule.enabled}
                         label=""
-                        ariaLabel={`???????? ??????? ${rule.name}`}
+                        ariaLabel={`Включить правило ${rule.name}`}
                         onChange={() => void toggleRuleEnabled(rule)}
                         disabled={ruleBusy === rule.id}
                       />

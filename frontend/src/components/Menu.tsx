@@ -64,7 +64,18 @@ export function MenuButton({ label, items, align = 'end', icon: Icon = MoreHoriz
       close();
     };
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') close();
+      if (event.key !== 'Escape') return;
+      const target = event.target;
+      if (
+        target instanceof HTMLElement &&
+        (target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.tagName === 'SELECT' ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
+      close();
     };
     const onScrollOrResize = () => close();
     document.addEventListener('mousedown', onPointerDown);

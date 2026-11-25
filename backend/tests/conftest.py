@@ -42,11 +42,20 @@ class FakeEngine:
         self.sync_calls = 0
         self.skip_calls = 0
         self.commands: list[str] = []
+        self.sync_report_result: dict | None = None
 
     def sync(self) -> bool:
         self.sync_calls += 1
         self.commands.append("vd_sync")
         return self.sync_ok
+
+    def sync_report(self) -> dict:
+        if self.sync_report_result is not None:
+            self.sync_calls += 1
+            self.commands.append("vd_sync")
+            return dict(self.sync_report_result)
+        ok = self.sync()
+        return {"ok": ok, "resolved": None, "failed": 0, "reply": "OK" if ok else ""}
 
     def skip(self) -> bool:
         self.skip_calls += 1
@@ -90,6 +99,10 @@ class FakeRunner:
         unit = command[-1]
         if action in self.fail_actions:
             return subprocess.CompletedProcess(command, 1, "", "boom")
+        if action == "ActiveEnterTimestamp":
+            return subprocess.CompletedProcess(
+                command, 0, "ActiveEnterTimestamp=Wed 2026-11-25 12:00:00 UTC\n", ""
+            )
         if action == "is-active":
             state = self.units.get(unit, "inactive")
             code = 0 if state == "active" else 3
@@ -120,6 +133,7 @@ def settings(tmp_path: Path) -> Settings:
         db_path=tmp_path / "app.db",
         music_dir=music,
         cover_dir=covers,
+        playlist_cover_dir=tmp_path / "covers" / "playlists",
         engine_dir=engine_dir,
         engine_queue_file=engine_dir / "engine-queue.txt",
         engine_socket=engine_dir / "liquidsoap.sock",

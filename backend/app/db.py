@@ -8,9 +8,14 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-from .config import Settings
+from .config import (
+    SYSTEM_PLAYLIST_DESCRIPTION,
+    SYSTEM_PLAYLIST_ID,
+    SYSTEM_PLAYLIST_NAME,
+    Settings,
+)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
 DEFAULT_SETTINGS: dict[str, str] = {
@@ -56,8 +61,9 @@ def init_db(settings: Settings) -> None:
     settings.ensure_directories()
     conn = open_db(settings)
     try:
+        previous_version = int(conn.execute("PRAGMA user_version").fetchone()[0] or 0)
         conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
-        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        _migrate(conn, previous_version)
         for key, value in DEFAULT_SETTINGS.items():
             seeded = value
             if key == "public_base_url" and settings.public_base_url:
@@ -68,9 +74,40 @@ def init_db(settings: Settings) -> None:
                 "INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO NOTHING",
                 (key, seeded),
             )
+        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         conn.commit()
     finally:
         conn.close()
+
+
+def _migrate(conn: sqlite3.Connection, previous_version: int) -> None:
+    """Apply non-destructive schema migrations (currently v1 -> v2)."""
+
+    from .util import to_iso, utcnow
+
+    columns = {
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(playlists)").fetchall()
+    }
+    if "system" not in columns:
+        conn.execute(
+            "ALTER TABLE playlists ADD COLUMN system INTEGER NOT NULL DEFAULT 0"
+        )
+    stamp = to_iso(utcnow()) or ""
+    conn.execute(
+        "INSERT INTO playlists(id, name, description, cover_path, shuffle, repeat_mode, "
+        "system, created_at, updated_at) VALUES(?, ?, ?, NULL, 1, 'all', 1, ?, ?) "
+        "ON CONFLICT(id) DO UPDATE SET "
+        "name = excluded.name, description = excluded.description, system = 1",
+        (SYSTEM_PLAYLIST_ID, SYSTEM_PLAYLIST_NAME, SYSTEM_PLAYLIST_DESCRIPTION, stamp, stamp),
+    )
+    if previous_version < 2:
+        # The v1 backend hardcoded an exhausted library cycle; it must start
+        # fresh on the system playlist row. User data is untouched.
+        conn.execute(
+            "DELETE FROM settings WHERE key IN (?, ?)",
+            ("_cycle:library", "_cycle:playlist:library"),
+        )
 
 
 @contextmanager

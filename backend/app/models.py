@@ -6,10 +6,15 @@ import json
 import sqlite3
 from typing import Any
 
-from .config import Settings
+from .config import (
+    SYSTEM_PLAYLIST_DESCRIPTION,
+    SYSTEM_PLAYLIST_ID,
+    SYSTEM_PLAYLIST_NAME,
+    Settings,
+)
 
 SOURCE_LABELS = {
-    "override": "Переопределение",
+    "override": "Ручной выбор",
     "schedule": "Расписание",
     "rotation": "Ротация",
     "playlist": "Плейлист",
@@ -76,42 +81,121 @@ def track_payload(
     return payload
 
 
+def playlist_available_rows(
+    conn: sqlite3.Connection,
+    playlist_id: str,
+    *,
+    limit: int | None = None,
+    offset: int = 0,
+) -> list[sqlite3.Row]:
+    if playlist_id == SYSTEM_PLAYLIST_ID:
+        sql = (
+            "SELECT t.*, NULL AS playlist_position FROM tracks t "
+            "WHERE t.pending_delete = 0 ORDER BY t.created_at ASC, t.id ASC"
+        )
+        params: list[Any] = []
+    else:
+        sql = (
+            "SELECT t.*, pt.position AS playlist_position FROM playlist_tracks pt "
+            "JOIN tracks t ON t.id = pt.track_id WHERE pt.playlist_id = ? "
+            "AND t.pending_delete = 0 ORDER BY pt.position ASC"
+        )
+        params = [playlist_id]
+    if limit is not None:
+        sql += " LIMIT ? OFFSET ?"
+        params.extend([max(0, int(limit)), max(0, int(offset))])
+    return conn.execute(sql, params).fetchall()
+
+
+def playlist_available_ids(conn: sqlite3.Connection, playlist_id: str) -> list[str]:
+    return [str(row["id"]) for row in playlist_available_rows(conn, playlist_id)]
+
+
+def playlist_stats(conn: sqlite3.Connection, playlist_id: str) -> dict[str, int | float]:
+    if playlist_id == SYSTEM_PLAYLIST_ID:
+        row = conn.execute(
+            "SELECT COUNT(*) AS count, COALESCE(SUM(duration), 0) AS duration, "
+            "0 AS pending FROM tracks WHERE pending_delete = 0"
+        ).fetchone()
+        pending = 0
+    else:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(CASE WHEN t.pending_delete = 0 THEN 1 ELSE 0 END), 0) AS count, "
+            "COALESCE(SUM(CASE WHEN t.pending_delete = 0 THEN t.duration ELSE 0 END), 0) AS duration, "
+            "COALESCE(SUM(CASE WHEN t.pending_delete = 1 THEN 1 ELSE 0 END), 0) AS pending "
+            "FROM playlist_tracks pt JOIN tracks t ON t.id = pt.track_id "
+            "WHERE pt.playlist_id = ?",
+            (playlist_id,),
+        ).fetchone()
+        pending = int(row["pending"] or 0)
+    return {
+        "count": int(row["count"] or 0),
+        "duration": float(row["duration"] or 0.0),
+        "pending_delete_count": pending,
+    }
+
+
+def playlist_auto_cover(conn: sqlite3.Connection, playlist_id: str) -> str | None:
+    if playlist_id == SYSTEM_PLAYLIST_ID:
+        row = conn.execute(
+            "SELECT cover_path FROM tracks WHERE pending_delete = 0 "
+            "AND cover_path IS NOT NULL AND cover_path != '' "
+            "ORDER BY created_at ASC, id ASC LIMIT 1"
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT t.cover_path FROM playlist_tracks pt JOIN tracks t ON t.id = pt.track_id "
+            "WHERE pt.playlist_id = ? AND t.pending_delete = 0 "
+            "AND t.cover_path IS NOT NULL AND t.cover_path != '' "
+            "ORDER BY pt.position ASC LIMIT 1",
+            (playlist_id,),
+        ).fetchone()
+    return str(row["cover_path"]) if row and row["cover_path"] else None
+
+
 def playlist_payload(
     conn: sqlite3.Connection,
     row: sqlite3.Row | dict[str, Any],
     settings: Settings,
 ) -> dict[str, Any]:
-    playlist_id = _value(row, "id")
-    stats = conn.execute(
-        "SELECT COUNT(*) AS count, COALESCE(SUM(t.duration), 0) AS duration "
-        "FROM playlist_tracks pt JOIN tracks t ON t.id = pt.track_id "
-        "WHERE pt.playlist_id = ? AND t.pending_delete = 0",
-        (playlist_id,),
-    ).fetchone()
-    cover = conn.execute(
-        "SELECT t.cover_path FROM playlist_tracks pt JOIN tracks t ON t.id = pt.track_id "
-        "WHERE pt.playlist_id = ? AND t.cover_path IS NOT NULL AND t.pending_delete = 0 "
-        "ORDER BY pt.position ASC LIMIT 1",
-        (playlist_id,),
-    ).fetchone()
-    cover_url = (
-        f"{settings.public_base_url}/api/public/cover/{playlist_id}" if cover else None
-    )
-    if cover:
-        # Playlist covers are represented by the first track cover; the public
-        # cover endpoint understands playlist ids too.
-        cover_url = f"{settings.public_base_url}/api/public/playlist-cover/{playlist_id}"
+    from .util import parse_iso
+
+    playlist_id = str(_value(row, "id"))
+    stats = playlist_stats(conn, playlist_id)
+    custom_cover = _value(row, "cover_path")
+    auto_cover = None if custom_cover else playlist_auto_cover(conn, playlist_id)
+    cover_kind = "custom" if custom_cover else ("auto" if auto_cover else "none")
+    updated_at = _value(row, "updated_at")
+    version = 0
+    parsed = parse_iso(updated_at)
+    if parsed is not None:
+        version = int(parsed.timestamp())
+    cover_url = None
+    if cover_kind != "none":
+        cover_url = (
+            f"{settings.public_base_url}/api/public/playlist-cover/{playlist_id}"
+            f"?v={version}"
+        )
+    system = bool(_value(row, "system", 0)) or playlist_id == SYSTEM_PLAYLIST_ID
+    name = _value(row, "name")
+    description = _value(row, "description")
+    if system:
+        name = SYSTEM_PLAYLIST_NAME
+        description = SYSTEM_PLAYLIST_DESCRIPTION
     return {
         "id": playlist_id,
-        "name": _value(row, "name"),
-        "description": _value(row, "description"),
+        "name": name,
+        "description": description,
+        "system": system,
         "shuffle": bool(_value(row, "shuffle", 0)),
         "repeat_mode": _value(row, "repeat_mode", "none") or "none",
         "cover_url": cover_url,
-        "track_count": int(stats["count"] or 0),
-        "duration": float(stats["duration"] or 0.0),
+        "cover_kind": cover_kind,
+        "track_count": stats["count"],
+        "duration": stats["duration"],
+        "pending_delete_count": stats["pending_delete_count"],
         "created_at": _value(row, "created_at"),
-        "updated_at": _value(row, "updated_at"),
+        "updated_at": updated_at,
     }
 
 

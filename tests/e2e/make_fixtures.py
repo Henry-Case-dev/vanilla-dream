@@ -77,6 +77,9 @@ def main() -> None:
 
     cover_file = out / "cover.jpg"
     cover(cover_file)
+    # A second, visibly different image used to test playlist covers.
+    playlist_cover = out / "playlist-cover.png"
+    Image.new("RGB", (500, 320), (36, 34, 47)).save(playlist_cover, "PNG")
 
     tag(first, "Первый тест", "Ваниль", "Сиреневый эфир", "Ambient", "2026", cover_file)
     tag(second, "Second Track", "Vanilla Dream", "Test Album", "Chill", "2026")

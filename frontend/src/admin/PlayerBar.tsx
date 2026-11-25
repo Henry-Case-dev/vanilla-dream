@@ -19,7 +19,9 @@ import { useAudio } from '../lib/audio';
 import { useLive } from '../lib/live';
 import { useResource } from '../lib/hooks';
 import { api, errorMessage } from '../lib/api';
-import { repeatLabel } from '../lib/format';
+import { repeatLabel, sourceDisplayName } from '../lib/format';
+import { describeStationStatus, statusDotClass } from '../lib/status';
+import { notifyDataChanged } from '../lib/refresh';
 import type { RepeatMode } from '../lib/types';
 
 function nextRepeat(mode: RepeatMode): RepeatMode {
@@ -29,8 +31,8 @@ function nextRepeat(mode: RepeatMode): RepeatMode {
 }
 
 /**
- * Постоянная нижняя панель. Локальное прослушивание (слева/в центре)
- * отделено от управления эфиром (справа) вертикальным разделителем.
+ * Постоянная нижняя панель. Локальное прослушивание отделено от управления
+ * эфиром; зелёный индикатор и подпись берутся из общего маппинга статусов.
  */
 export function PlayerBar() {
   const { now, reload } = useLive();
@@ -42,6 +44,8 @@ export function PlayerBar() {
   const track = now?.track ?? null;
   const desired = station?.desired ?? 'stopped';
   const sourcePlaylistId = now?.source?.playlistId ?? null;
+  const statusView = describeStationStatus(station?.status, station?.reason);
+  const sourceName = sourceDisplayName(now?.source);
 
   const playlistResource = useResource(
     () => (sourcePlaylistId ? api.admin.playlists.get(sourcePlaylistId) : Promise.resolve(null)),
@@ -66,6 +70,7 @@ export function PlayerBar() {
       await action();
       toast.notify('success', message);
       reload();
+      notifyDataChanged();
       if (key === 'start' || key === 'stop' || key === 'restart') {
         window.setTimeout(reload, 2500);
       }
@@ -90,6 +95,7 @@ export function PlayerBar() {
   };
 
   const airDisabled = busy !== null;
+  const localUnavailable = audio.unavailableReason ?? 'Локальное прослушивание недоступно';
 
   return (
     <footer className="player-bar" aria-label="Панель прослушивания и управления эфиром">
@@ -99,12 +105,17 @@ export function PlayerBar() {
         </Link>
         <div className="pb-track__text">
           <span className="pb-track__title" title={track?.title ?? undefined}>
-            {track?.title ?? 'Эфир не начался'}
+            {track?.title ?? statusView.label}
           </span>
-          <span className="pb-track__artist" title={track?.artist ?? undefined}>
-            {track?.artist ?? (station ? 'Тишина в эфире' : 'Нет данных от сервера')}
+          <span className="pb-track__artist" title={track?.artist ?? statusView.detail}>
+            {track?.artist ?? statusView.shortLabel}
           </span>
         </div>
+        {now?.source?.kind === 'override' && (
+          <span className="pb-source-chip" title={sourceName ?? 'Ручной выбор'}>
+            Ручной выбор
+          </span>
+        )}
         {audio.playing && (
           <span className="pb-track__eq" title="Локальное прослушивание">
             <Equalizer />
@@ -119,9 +130,7 @@ export function PlayerBar() {
             label="Перемешать будущую очередь"
             title="Перемешать будущую очередь (ручные вставки сохраняются)"
             disabled={airDisabled}
-            onClick={() =>
-              void run('shuffle', api.admin.queue.shuffle, 'Будущая очередь перемешана')
-            }
+            onClick={() => void run('shuffle', api.admin.queue.shuffle, 'Будущая очередь перемешана')}
           />
           <IconButton
             icon={repeatMode === 'one' ? Repeat1 : Repeat}
@@ -156,21 +165,31 @@ export function PlayerBar() {
                 ? audio.playing
                   ? 'Остановить локальное прослушивание'
                   : 'Слушать эфир локально'
-                : 'Ссылка на поток ещё не получена'
+                : localUnavailable
             }
             title={
               audio.canPlay
                 ? audio.playing
                   ? 'Остановить локальное прослушивание'
                   : 'Слушать эфир локально (эфир не меняется)'
-                : 'Ссылка на поток ещё не получена'
+                : localUnavailable
             }
             tone="accent"
             active={audio.playing}
             disabled={!audio.canPlay || audio.busy}
             onClick={() => void audio.toggle()}
           />
-          <span className="pb-local__label">Локально</span>
+          <span className="pb-local__label">
+            {audio.state === 'connecting'
+              ? 'Подключение…'
+              : audio.state === 'reconnecting'
+                ? 'Переподключение…'
+                : !audio.canPlay
+                  ? audio.unavailableReason === 'Сначала запустите эфир'
+                    ? 'Сначала запустите эфир'
+                    : 'Недоступно'
+                  : 'Локально'}
+          </span>
           <VolumeControl
             className="pb-volume"
             value={audio.volume}
@@ -181,24 +200,19 @@ export function PlayerBar() {
       </div>
 
       <div className="pb-air">
-        <span className="pb-air__label">
-          <span
-            className={`dot ${desired === 'playing' ? 'dot--live' : 'dot--idle'}`}
-            aria-hidden="true"
-          />
-          Эфир
+        <span className="pb-air__label" title={statusView.detail} aria-live="polite">
+          <span className={`dot ${statusDotClass(statusView.tone)}`} aria-hidden="true" />
+          <span className="pb-air__text">{statusView.shortLabel}</span>
         </span>
         <div className="pb-air__buttons">
           <IconButton
             icon={Power}
             label={desired === 'playing' ? 'Эфир уже запущен' : 'Запустить эфир'}
-            title={desired === 'playing' ? 'Эфир уже запущен' : 'Запустить эфир'}
+            title={desired === 'playing' ? `Эфир уже запущен. ${statusView.detail}` : 'Запустить эфир'}
             tone="accent"
             active={desired === 'playing'}
             disabled={desired === 'playing' || airDisabled}
-            onClick={() =>
-              void run('start', api.admin.station.start, 'Эфир запускается')
-            }
+            onClick={() => void run('start', api.admin.station.start, 'Эфир запускается')}
           />
           <IconButton
             icon={Square}
@@ -216,9 +230,7 @@ export function PlayerBar() {
                 : 'Перезапустить движок, сохранив состояние эфира'
             }
             disabled={desired === 'stopped' || airDisabled}
-            onClick={() =>
-              void run('restart', api.admin.station.restart, 'Движок перезапускается')
-            }
+            onClick={() => void run('restart', api.admin.station.restart, 'Движок перезапускается')}
           />
         </div>
       </div>

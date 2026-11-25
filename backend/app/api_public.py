@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 
 from . import db, queue_engine, scheduler
 from .auth import get_conn
-from .models import STATE_LABELS, source_payload
+from .models import STATE_LABELS, playlist_auto_cover, source_payload
 from .util import ApiError, clamp, parse_iso
 
 router = APIRouter(tags=["public"])
@@ -66,7 +66,7 @@ def build_now_playing(conn: sqlite3.Connection, app, now: datetime | None = None
         stats = app.state.icecast.stats() if app.state.icecast is not None else {"available": False}
 
     playback = queue_engine.playback_payload(conn, settings, now)
-    if status.get("desired") != "playing":
+    if status.get("desired") != "playing" or status.get("has_current") is False:
         playback = None
     track_payload: dict | None = None
     source = _no_source()
@@ -117,6 +117,7 @@ def build_now_playing(conn: sqlite3.Connection, app, now: datetime | None = None
             "description": db.get_setting(conn, "station_description"),
             "status": state,
             "status_label": STATE_LABELS.get(state, state),
+            "reason": status.get("reason"),
             "desired": status.get("desired", db.get_setting(conn, "desired_state")),
             "stream_url": f"{base}/radio.mp3",
             "m3u_url": f"{base}/radio.m3u",
@@ -264,14 +265,22 @@ def playlist_cover(
     request: Request,
     conn: sqlite3.Connection = Depends(get_conn),
 ):
+    settings = request.app.state.settings
     row = conn.execute(
-        "SELECT t.cover_path FROM playlist_tracks pt JOIN tracks t ON t.id = pt.track_id "
-        "WHERE pt.playlist_id = ? AND t.cover_path IS NOT NULL ORDER BY pt.position ASC LIMIT 1",
-        (playlist_id,),
+        "SELECT cover_path FROM playlists WHERE id = ?", (playlist_id,)
     ).fetchone()
     if row is None:
+        raise ApiError(404, "playlist_not_found", "Плейлист не найден.")
+    if row["cover_path"]:
+        path = settings.playlist_cover_dir / str(row["cover_path"])
+        if path.exists():
+            return FileResponse(
+                path, media_type="image/jpeg", headers={"Cache-Control": COVER_CACHE}
+            )
+    auto = playlist_auto_cover(conn, playlist_id)
+    if not auto:
         raise ApiError(404, "cover_not_found", "Обложка не найдена.")
-    path = request.app.state.settings.cover_dir / str(row["cover_path"])
+    path = settings.cover_dir / str(auto)
     if not path.exists():
         raise ApiError(404, "cover_not_found", "Обложка не найдена.")
     return FileResponse(path, media_type="image/jpeg", headers={"Cache-Control": COVER_CACHE})

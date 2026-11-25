@@ -34,6 +34,17 @@ Panel → Настройки → Вещание. The backend rewrites
 `/etc/vanilla-dream-radio/encoder.liq` and restarts the engine; the stream
 reconnects for a few seconds.
 
+### Playlists and «Вся медиатека»
+
+«Вся медиатека» is a system playlist: it always exists and always contains every
+available track. It cannot be deleted, and tracks cannot be added to or removed
+from it — delete the file in «Медиатеке» instead. Its own cover and its
+shuffle/repeat settings are editable. To return from a manual «В эфир» choice to
+the schedule/rotation/default source, use «Вернуться к автоматическому».
+
+Playlist covers live in `/srv/vanilla-dream-radio/covers/playlists` and are
+removed together with their playlist; track covers are never touched.
+
 ### Database backup
 
 ```bash

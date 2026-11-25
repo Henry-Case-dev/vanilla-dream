@@ -46,6 +46,12 @@ log "Validating Liquidsoap configuration"
 install -o root -g root -m 0644 "$REL/radio/liquidsoap.liq" "$ETC_DIR/liquidsoap.liq"
 sudo -u "$RADIO_USER" /usr/bin/liquidsoap --check "$ETC_DIR/liquidsoap.liq" || die "invalid liquidsoap configuration"
 
+log "Ensuring runtime directories"
+install -d -o "$RADIO_USER" -g "$RADIO_USER" -m 0755 /srv/vanilla-dream-radio/covers/playlists
+if ! grep -q '^VD_PLAYLIST_COVER_DIR=' "$ETC_DIR/env"; then
+  printf 'VD_PLAYLIST_COVER_DIR=/srv/vanilla-dream-radio/covers/playlists\n' >> "$ETC_DIR/env"
+fi
+
 log "Syncing systemd units and related files"
 install -o root -g root -m 0644 "$REL/deploy/systemd/vanilla-dream-radio.slice" /etc/systemd/system/vanilla-dream-radio.slice
 for unit in api liquidsoap icecast backup; do

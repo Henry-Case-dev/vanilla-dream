@@ -907,7 +907,7 @@
 .pick-list {
   display: grid;
   gap: 1px;
-  max-height: min(52vh, 460px);
+  max-height: min(42vh, 340px);
   overflow-y: auto;
   margin: 0 -4px;
 }
@@ -1492,7 +1492,7 @@
 
 .storage__stats {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
   gap: 10px;
 }
 
@@ -1530,10 +1530,11 @@
 
 .service-row {
   display: grid;
-  grid-template-columns: 10px 1fr auto;
+  grid-template-columns: 10px minmax(0, 1fr) auto;
   grid-template-areas:
     'dot name state'
     '. time time'
+    '. detail detail'
     '. error error';
   gap: 2px 8px;
   align-items: center;
@@ -1552,6 +1553,7 @@
 
 .service-row__name {
   grid-area: name;
+  min-width: 0;
   color: var(--text-primary);
 }
 
@@ -1997,4 +1999,53 @@
     bottom: 156px;
     max-width: none;
   }
+}
+
+/* 1.0.1: системный плейлист, обложка, состав */
+.sidebar__playlist-system {
+  display: block;
+  margin-top: 1px;
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  text-transform: uppercase;
+}
+
+.playlist-card__title-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.playlist-head__eyebrow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.playlist-head__cover-button {
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: none;
+  border-radius: var(--radius-lg);
+  cursor: pointer;
+  text-align: left;
+}
+
+.playlist-head__cover-button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+.playlist-head__cover-button:hover .cover {
+  filter: brightness(1.05);
+}
+
+.playlist-row--system {
+  cursor: default;
 }

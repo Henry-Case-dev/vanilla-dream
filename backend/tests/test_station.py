@@ -10,7 +10,7 @@ from app import db
 from app.config import UNIT_LIQUIDSOAP, Settings
 from app.main import create_app
 from app.station import StationController, compute_state
-from tests.helpers import upload_and_get, write_mp3
+from tests.helpers import play_next, upload_and_get, write_mp3
 
 
 def _upload(env, name: str) -> dict:
@@ -91,19 +91,19 @@ def test_start_stop_use_exact_allow_listed_commands(env, admin):
     assert stopped.json()["state"] == "off"
 
 
-def test_empty_library_sets_no_music_without_start(env, admin):
+def test_empty_library_starts_technical_silence(env, admin):
     response = env.client.post("/api/admin/station/start")
     assert response.status_code == 200
     body = response.json()
     assert body["desired"] == "playing"
     assert body["state"] == "no_music"
-    assert not [call for call in _sudo_calls(env) if call[-2] == "start"]
+    assert body["reason"] == "library_empty"
+    assert [call for call in _sudo_calls(env) if call[-2] == "start"]
 
-    # Uploading music with desired=playing makes the scheduler start the engine.
     _upload(env, "late")
     env.app.state.scheduler.tick()
-    starts = [call for call in _sudo_calls(env) if call[-2] == "start"]
-    assert len(starts) == 1
+    status = env.client.get("/api/admin/station/status").json()
+    assert status["desired"] == "playing"
 
 
 def test_restart_requires_playing(env, admin):
@@ -189,32 +189,41 @@ def test_auto_start_is_throttled(env, admin):
 def test_services_and_links_and_storage(env, admin):
     track = _upload(env, "svc")
     base = env.settings.public_base_url
-    links = env.client.get("/api/admin/links").json()
-    assert links["world_radio"] == f"{base}/radio.mp3"
-    assert links["mp3"] == f"{base}/radio.mp3"
-    assert links["http_mp3"] == f"{base.replace('https://', 'http://')}/radio.mp3"
-    assert links["m3u"] == f"{base}/radio.m3u"
-    assert links["pls"] == f"{base}/radio.pls"
-    assert links["player"] == f"{base}/"
-    assert links["admin"] == f"{base}/admin/"
+    links = env.client.get("/api/admin/links").json()["links"]
+    by_key = {item["key"]: item for item in links}
+    assert "world_radio" not in by_key
+    assert by_key["mp3"]["url"] == f"{base}/radio.mp3"
+    assert by_key["mp3"]["primary"] is True
+    assert "http_mp3" not in by_key  # VD_PUBLIC_HTTP_BASE_URL is not configured
+    assert by_key["m3u"]["url"] == f"{base}/radio.m3u"
+    assert by_key["pls"]["url"] == f"{base}/radio.pls"
+    assert by_key["player"]["url"] == f"{base}/"
+    assert by_key["metadata"]["url"] == f"{base}/api/public/now-playing"
+    for item in links:
+        assert set(("key", "label", "url", "description")) <= set(item)
 
-    services = env.client.get("/api/admin/services").json()
-    labels = {item["label"]: item["state"] for item in services["services"]}
-    assert labels["Backend"] == "active"
-    assert labels["Liquidsoap"] == "inactive"
-    backend = next(
-        item for item in services["services"] if item["label"] == "Backend"
-    )
-    assert backend["detail"] == "процесс отвечает"
-    assert "last_start" in services and "last_error" in services
+    services = env.client.get("/api/admin/services").json()["services"]
+    by_id = {item["id"]: item for item in services}
+    assert set(by_id) == {"api", "liquidsoap", "icecast"}
+    for item in services:
+        assert set(
+            ("id", "unit", "label", "state", "state_label", "detail", "last_start", "last_error")
+        ) <= set(item)
+    assert by_id["api"]["state"] == "active"
+    assert by_id["api"]["detail"] == "процесс отвечает"
+    assert by_id["liquidsoap"]["state"] == "inactive"
+    assert by_id["liquidsoap"]["state_label"] == "Остановлена"
+    assert by_id["liquidsoap"]["last_start"]
 
     storage = env.client.get("/api/admin/storage").json()
     assert storage["tracks"] == 1
     assert storage["bytes"] == track["size"]
-    assert storage["free_bytes"] > 0
-    assert storage["total_bytes"] >= storage["free_bytes"]
-    assert storage["limit_gb"] == 0
-    assert storage["music_dir"] == str(env.settings.music_dir)
+    assert isinstance(storage["free_bytes"], int)
+    assert isinstance(storage["total_bytes"], int)
+    assert isinstance(storage["cover_bytes"], int)
+    assert isinstance(storage["db_bytes"], int)
+    assert isinstance(storage["limit_gb"], (int, float))
+    assert "music_dir" not in storage
 
 
 def test_startup_resumes_desired_playing(env, admin):
@@ -373,6 +382,91 @@ def test_skip_returns_503_only_on_real_engine_failure(env, admin):
     env.station.engine = original
     ok = env.client.post("/api/admin/station/skip")
     assert ok.status_code == 200
+
+
+def test_admin_station_status_has_status_alias(env, admin):
+    def status() -> dict:
+        response = env.client.get("/api/admin/station/status")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == body["state"]
+        return body
+
+    off = status()
+    assert off["state"] == "off"
+
+    env.client.post("/api/admin/station/start")
+    no_music = status()
+    assert no_music["state"] == "no_music"
+
+    _upload(env, "status-on-air")
+    env.icecast.payload = {
+        "available": True,
+        "mount_present": True,
+        "listeners": 1,
+        "bitrate": 128,
+        "title": None,
+        "error": None,
+    }
+    play_next(env)
+    on_air = status()
+    assert on_air["state"] == "on_air"
+
+    env.runner.units[UNIT_LIQUIDSOAP] = "failed"
+    env.station.invalidate_unit_cache()
+    error = status()
+    assert error["state"] == "error"
+
+
+def test_engine_unit_and_sudo_are_configurable(env, admin):
+    import dataclasses
+
+    custom = dataclasses.replace(
+        env.settings,
+        engine_unit="vanilla-dream-radio-liquidsoap-e2e.service",
+        station_sudo=False,
+        engine_label="Liquidsoap E2E",
+    )
+    controller = StationController(
+        custom, env.clock, engine=env.engine, icecast=env.icecast, runner=env.runner
+    )
+    conn = db.open_db(custom)
+    try:
+        controller._start_unit(conn, env.clock.now(), raise_on_error=False)
+        engine_calls = [
+            call for call in env.runner.calls if call[-1] == custom.engine_unit
+        ]
+        assert engine_calls
+        assert all("sudo" not in call for call in engine_calls)
+        assert engine_calls[-1] == [
+            "/usr/bin/systemctl",
+            "start",
+            custom.engine_unit,
+        ]
+        status = controller.status(conn, env.clock.now())
+        assert status["unit"] == custom.engine_unit
+        services = {item["id"]: item for item in controller.services(conn)}
+        assert services["liquidsoap"]["unit"] == custom.engine_unit
+        assert services["liquidsoap"]["label"] == "Liquidsoap E2E"
+    finally:
+        conn.close()
+
+
+def test_engine_env_defaults_and_overrides(monkeypatch):
+    for name in ("VD_ENGINE_UNIT", "VD_STATION_SUDO", "VD_ENGINE_LABEL"):
+        monkeypatch.delenv(name, raising=False)
+    defaults = Settings.from_env()
+    assert defaults.engine_unit == "vanilla-dream-radio-liquidsoap.service"
+    assert defaults.station_sudo is True
+    assert defaults.engine_label == "Liquidsoap"
+
+    monkeypatch.setenv("VD_ENGINE_UNIT", "vanilla-dream-radio-liquidsoap-e2e.service")
+    monkeypatch.setenv("VD_STATION_SUDO", "0")
+    monkeypatch.setenv("VD_ENGINE_LABEL", "Liquidsoap E2E")
+    custom = Settings.from_env()
+    assert custom.engine_unit == "vanilla-dream-radio-liquidsoap-e2e.service"
+    assert custom.station_sudo is False
+    assert custom.engine_label == "Liquidsoap E2E"
 
 
 def test_stop_failure_keeps_desired_state(env, admin):

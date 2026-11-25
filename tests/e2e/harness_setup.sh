@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+# Create an isolated Vanilla Dream Radio instance for end-to-end checks.
+# Test-only: separate DB, music, covers, Icecast (8401), API (8301), Liquidsoap
+# socket, its own systemd unit and its own front door (8300). Production units,
+# ports, database and music are never touched.
+set -Eeuo pipefail
+
+ROOT=/srv/vdr-e2e
+APP=/opt/vanilla-dream-radio/current
+PORT_API=8301
+PORT_ICE=8401
+PORT_WEB=8300
+UNIT=vanilla-dream-radio-e2e-liquidsoap.service
+
+log() { printf '\n== %s\n' "$*"; }
+
+log "Reset isolated state (test instance only)"
+rm -rf "$ROOT"
+install -d -o vdradio -g vdradio -m 0755 "$ROOT"/{music,covers,covers/playlists,state,log,run,etc}
+
+log "Icecast config"
+cat > "$ROOT/etc/icecast.xml" <<EOF
+<icecast>
+  <location>VDR e2e</location>
+  <admin>e2e@localhost</admin>
+  <limits><clients>50</clients><sources>2</sources><queue-size>524288</queue-size>
+    <client-timeout>30</client-timeout><header-timeout>15</header-timeout><source-timeout>30</source-timeout>
+    <burst-on-connect>1</burst-on-connect><burst-size>65536</burst-size></limits>
+  <authentication>
+    <source-password>e2esource</source-password><relay-password>e2erelay</relay-password>
+    <admin-user>admin</admin-user><admin-password>e2eadmin</admin-password>
+  </authentication>
+  <hostname>localhost</hostname>
+  <listen-socket><port>$PORT_ICE</port><bind-address>127.0.0.1</bind-address></listen-socket>
+  <paths>
+    <basedir>/usr/share/icecast2</basedir><logdir>$ROOT/log</logdir>
+    <webroot>/usr/share/icecast2/web</webroot><adminroot>/usr/share/icecast2/admin</adminroot>
+    <pidfile>$ROOT/run/icecast.pid</pidfile><alias source="/" destination="/status.xsl"/>
+  </paths>
+  <logging><accesslog>access.log</accesslog><errorlog>error.log</errorlog><loglevel>3</loglevel></logging>
+  <security><chroot>0</chroot></security>
+</icecast>
+EOF
+
+log "Liquidsoap config"
+cat > "$ROOT/etc/liquidsoap.env.liq" <<EOF
+radio_runtime_dir = "$ROOT/run"
+radio_queue_file = "$ROOT/run/engine-queue.txt"
+radio_internal_url = "http://127.0.0.1:$PORT_API/api/internal/engine/track-start"
+radio_internal_token = "e2e-token"
+radio_icecast_source_password = "e2esource"
+radio_mount = "/radio.mp3"
+radio_public_url = "http://127.0.0.1:18080"
+EOF
+printf 'encoder_bitrate = 128\n' > "$ROOT/etc/encoder.liq"
+cat > "$ROOT/etc/station.liq" <<'EOF'
+station_name = "VDR e2e"
+station_description = "Изолированная проверка"
+station_genre = "Test"
+EOF
+sed -e "s|/etc/vanilla-dream-radio|$ROOT/etc|g" -e "s|port=8101|port=$PORT_ICE|" "$APP/radio/liquidsoap.liq" > "$ROOT/etc/liquidsoap.liq"
+chown -R vdradio:vdradio "$ROOT"
+chmod 0644 "$ROOT/etc/liquidsoap.liq"
+
+log "Isolated Icecast unit"
+cat > /etc/systemd/system/vanilla-dream-radio-e2e-icecast.service <<EOF
+[Unit]
+Description=VDR e2e Icecast
+After=network.target
+[Service]
+Type=simple
+User=vdradio
+Group=vdradio
+ExecStart=/usr/bin/icecast2 -c $ROOT/etc/icecast.xml
+Restart=no
+[Install]
+WantedBy=multi-user.target
+EOF
+
+log "Isolated Liquidsoap unit"
+cat > /etc/systemd/system/$UNIT <<EOF
+[Unit]
+Description=VDR e2e Liquidsoap
+After=network.target vanilla-dream-radio-e2e-icecast.service
+[Service]
+Type=simple
+User=vdradio
+Group=vdradio
+ExecStartPre=/usr/bin/liquidsoap --check $ROOT/etc/liquidsoap.liq
+ExecStart=/usr/bin/liquidsoap $ROOT/etc/liquidsoap.liq
+Restart=no
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl stop "$UNIT" vanilla-dream-radio-e2e-icecast.service 2>/dev/null || true
+systemctl start vanilla-dream-radio-e2e-icecast.service
+sleep 2
+curl -fsS --max-time 3 http://127.0.0.1:$PORT_ICE/status-json.xsl >/dev/null && echo "e2e icecast up on $PORT_ICE"
+
+log "Isolated API (root, no sudo wrapper, own DB)"
+cat > "$ROOT/state/env" <<EOF
+VD_DB_PATH=$ROOT/state/app.db
+VD_MUSIC_DIR=$ROOT/music
+VD_COVER_DIR=$ROOT/covers
+VD_PLAYLIST_COVER_DIR=$ROOT/covers/playlists
+VD_LOG_DIR=$ROOT/log
+VD_ENGINE_DIR=$ROOT/run
+VD_ENGINE_QUEUE_FILE=$ROOT/run/engine-queue.txt
+VD_ENGINE_SOCKET=$ROOT/run/liquidsoap.sock
+VD_ENGINE_UNIT=$UNIT
+VD_STATION_SUDO=0
+VD_ENGINE_LABEL=Liquidsoap e2e
+VD_ENCODER_FILE=$ROOT/etc/encoder.liq
+VD_STATION_FILE=$ROOT/etc/station.liq
+VD_ICECAST_STATS_URL=http://127.0.0.1:$PORT_ICE/status-json.xsl
+VD_ICECAST_ADMIN_USER=admin
+VD_ICECAST_ADMIN_PASSWORD=e2eadmin
+VD_INTERNAL_TOKEN=e2e-token
+VD_BACKEND_URL=http://127.0.0.1:$PORT_API
+VD_PUBLIC_BASE_URL=http://127.0.0.1:18080
+VD_SECURE_COOKIES=0
+VD_SCHEDULER_TICK=1.0
+EOF
+chmod 0600 "$ROOT/state/env"
+set -a; source "$ROOT/state/env"; set +a
+cd "$APP/backend"
+/opt/vanilla-dream-radio/venv/bin/python -m app.cli init-db
+printf 'e2e-owner-password\n' | /opt/vanilla-dream-radio/venv/bin/python -m app.cli set-password
+
+pkill -f "uvicorn app.main:app --host 127.0.0.1 --port $PORT_API" 2>/dev/null || true
+sleep 1
+setsid env $(grep -v '^#' "$ROOT/state/env" | xargs) \
+  /opt/vanilla-dream-radio/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port $PORT_API \
+  > "$ROOT/log/api.log" 2>&1 < /dev/null &
+sleep 3
+curl -fsS --max-time 5 http://127.0.0.1:$PORT_API/api/public/now-playing >/dev/null && echo "e2e api up on $PORT_API"
+
+log "Front door (static + proxy)"
+pkill -f harness_proxy.py 2>/dev/null || true
+setsid env VDR_E2E_DIST="$APP/frontend-dist" VDR_E2E_API_PORT=$PORT_API \
+  VDR_E2E_ICECAST_PORT=$PORT_ICE VDR_E2E_PROXY_PORT=$PORT_WEB \
+  python3 "$APP/tests/e2e/harness_proxy.py" > "$ROOT/log/proxy.log" 2>&1 < /dev/null &
+sleep 2
+curl -fsS --max-time 5 -o /dev/null -w "e2e front door: %{http_code}\n" http://127.0.0.1:$PORT_WEB/
+
+log "Tunnel: ssh -N -L 18080:127.0.0.1:8300 root@192.255.209.205"
+echo "Browser URL: http://127.0.0.1:18080/"

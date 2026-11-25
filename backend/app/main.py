@@ -168,7 +168,7 @@ def create_app(
     icecast = icecast if icecast is not None else IcecastClient(settings)
     station = station or StationController(settings, clock, engine=engine, icecast=icecast)
 
-    app = FastAPI(title="Vanilla Dream Radio", version="1.0.0", lifespan=lifespan)
+    app = FastAPI(title="Vanilla Dream Radio", version="1.0.1", lifespan=lifespan)
     app.state.settings = settings
     app.state.clock = clock
     app.state.engine = engine

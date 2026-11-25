@@ -24,15 +24,19 @@ import { ConfirmDialog } from '../components/Modal';
 import { useToast } from '../components/Toasts';
 import { useLive } from '../lib/live';
 import { useResource, useTick } from '../lib/hooks';
-import { api, errorMessage, linksFromStation } from '../lib/api';
+import { api, errorMessage } from '../lib/api';
 import {
   formatBytes,
   formatCount,
   formatDuration,
   formatRelativeMoment,
   formatTime,
+  sourceDisplayName,
   sourceKindLabel,
 } from '../lib/format';
+import { describeStationStatus } from '../lib/status';
+import { useDataChanged } from '../lib/refresh';
+import { ManualOverrideBanner } from '../components/ManualOverrideBanner';
 import type { HistoryEntry, QueueItem } from '../lib/types';
 
 function Metric({
@@ -87,7 +91,15 @@ function QueueRow({
         <span className="queue-row__title">{item.track?.title ?? 'Трек удалён'}</span>
         <span className="queue-row__sub">
           {item.track?.artist ?? '—'}
-          {item.sourceLabel ? ` · ${item.sourceLabel}` : item.sourceKind ? ` · ${sourceKindLabel(item.sourceKind)}` : ''}
+          {item.sourceKind === 'override'
+            ? ' · Ручной выбор'
+            : item.sourceKind === 'library' || item.sourceLabel === 'library'
+              ? ' · Вся медиатека'
+              : item.sourceLabel
+                ? ` · ${item.sourceLabel}`
+                : item.sourceKind
+                  ? ` · ${sourceKindLabel(item.sourceKind)}`
+                  : ''}
         </span>
       </div>
       <span className="queue-row__time">
@@ -178,6 +190,27 @@ export function OverviewPage() {
   const timeZone = settings.data?.timezone ?? undefined;
   const station = now?.station ?? null;
   const track = now?.track ?? null;
+  const statusView = describeStationStatus(station?.status, station?.reason);
+  const currentSourceName = sourceDisplayName(now?.source);
+  const sourceLabel =
+    now?.source?.kind === 'override'
+      ? 'Ручной выбор'
+      : now?.source?.kind === 'library'
+        ? 'Вся медиатека'
+        : now?.source?.label ?? null;
+  const sourceDetail =
+    now?.source && now.source.kind !== 'override' && now.source.kind !== 'library'
+      ? currentSourceName
+      : null;
+
+  useDataChanged(() => {
+    reload();
+    void queue.reload(true);
+    void library.reload(true);
+    void history.reload(true);
+    void links.reload(true);
+    void settings.reload(true);
+  });
 
   const progress = useMemo(() => {
     if (!track) return null;
@@ -188,7 +221,7 @@ export function OverviewPage() {
     return null;
   }, [track]);
 
-  const radioLinks = links.data && links.data.length > 0 ? links.data : station ? linksFromStation(station) : [];
+  const radioLinks = links.data ?? [];
 
   const failedService = services.data?.find((service) => service.state === 'failed');
   const engineError = settings.data?.engineLastError || failedService?.lastError || null;
@@ -283,9 +316,9 @@ export function OverviewPage() {
         title="Радиостанция"
         subtitle={
           <span className="page-header__status">
-            <StatusPill status={station?.status ?? 'unknown'} label={station?.statusLabel} />
-            <span className="muted">
-              {station?.desired === 'playing' ? 'Эфир включён' : 'Эфир остановлен'}
+            <StatusPill status={station?.status ?? 'unknown'} reason={station?.reason} />
+            <span className="muted" title={statusView.detail}>
+              {statusView.detail}
             </span>
           </span>
         }
@@ -300,6 +333,8 @@ export function OverviewPage() {
           </>
         }
       />
+
+      <ManualOverrideBanner />
 
       {engineError && (
         <div className="banner banner--danger" role="alert">
@@ -322,26 +357,26 @@ export function OverviewPage() {
         </div>
         <div className="np-hero__info">
           <span className="eyebrow">Сейчас в эфире</span>
-          <h2 className="np-hero__title">{track?.title ?? 'Эфир не начался'}</h2>
-          <p className="np-hero__artist">
-            {track?.artist ?? (station?.desired === 'playing' ? 'Ожидание первого трека' : 'Станция остановлена')}
-          </p>
+          <h2 className="np-hero__title">{track?.title ?? statusView.label}</h2>
+          <p className="np-hero__artist">{track?.artist ?? statusView.detail}</p>
           {track?.album && <p className="np-hero__album">{track.album}</p>}
 
-          <div className="np-hero__progress">
-            <ProgressBar value={progress ?? 0} label="Прогресс трека" />
-            <div className="np-hero__times">
-              <span>{formatDuration(track?.elapsed)}</span>
-              <span>{formatDuration(track?.duration)}</span>
+          {track && (
+            <div className="np-hero__progress">
+              <ProgressBar value={progress ?? 0} label="Прогресс трека" />
+              <div className="np-hero__times">
+                <span>{formatDuration(track.elapsed)}</span>
+                <span>{formatDuration(track.duration)}</span>
+              </div>
             </div>
-          </div>
+          )}
 
           <MetaRow>
             <Chip tone="accent">{track ? 'Трек в эфире' : 'Нет трека'}</Chip>
-            {now?.source && (
+            {now?.source && now.source.kind !== 'none' && sourceLabel && (
               <span className="meta-item">
-                Источник: {now.source.label}
-                {now.source.name ? ` · ${now.source.name}` : ''}
+                Источник: {sourceLabel}
+                {sourceDetail ? ` · ${sourceDetail}` : ''}
               </span>
             )}
             {station?.bitrate ? <span className="meta-item">{station.bitrate} кбит/с</span> : null}
@@ -407,8 +442,10 @@ export function OverviewPage() {
             <div>
               <h2 className="panel-title">Ближайшая очередь</h2>
               <p className="panel-subtitle">
-                {queue.data ? `Глубина: ${queue.data.depth ?? '—'}` : 'Загрузка очереди'}
-                {queueItems.some((item) => item.prepared) ? ' · подготовленные не редактируются' : ''}
+                Следующие треки эфира
+                {queueItems.some((item) => item.prepared)
+                  ? ' · подготовленные движком не редактируются'
+                  : ''}
               </p>
             </div>
             <div className="panel-head__actions">
@@ -435,7 +472,7 @@ export function OverviewPage() {
             <ErrorState message={queue.error} onRetry={() => void queue.reload()} />
           ) : queue.data && (queue.data.current || queueItems.length > 0) ? (
             <div className="queue-list">
-              {queue.data.current && (
+              {queue.data.current && station?.desired === 'playing' && station.status !== 'off' && (
                 <QueueRow
                   item={queue.data.current}
                   index={0}
@@ -476,18 +513,15 @@ export function OverviewPage() {
               <h2 className="panel-title">
                 <Link2 size={16} aria-hidden="true" /> Ссылки на трансляцию
               </h2>
-              <p className="panel-subtitle">Основной адрес — для Minecraft / World Radio</p>
+              <p className="panel-subtitle">Основная ссылка — прямой MP3 для плееров и приложений</p>
             </div>
           </div>
           {links.loading && !links.data ? (
             <LoadingState label="Загружаем ссылки…" rows={2} />
+          ) : links.error && !links.data ? (
+            <ErrorState message={links.error} onRetry={() => void links.reload()} />
           ) : radioLinks.length > 0 ? (
-            <>
-              <LinkList links={radioLinks} />
-              {links.error && (
-                <p className="panel-note">Ссылки собраны из текущего состояния станции: {links.error}</p>
-              )}
-            </>
+            <LinkList links={radioLinks} />
           ) : (
             <EmptyState compact icon={Link2} title="Ссылки недоступны" description="Сервер ещё не сообщил адреса трансляции." />
           )}

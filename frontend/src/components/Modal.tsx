@@ -15,6 +15,50 @@ interface ModalProps {
   closeLabel?: string;
 }
 
+const FOCUSABLE_SELECTOR = [
+  'a[href]',
+  'button:not([disabled])',
+  'input:not([disabled]):not([type="hidden"]):not([type="file"]):not(.visually-hidden)',
+  'select:not([disabled])',
+  'textarea:not([disabled])',
+  '[contenteditable="true"]',
+  '[tabindex]:not([tabindex="-1"])',
+].join(', ');
+
+const BODY_FIELD_SELECTOR = [
+  'input:not([type="hidden"]):not([type="file"]):not([disabled]):not(.visually-hidden)',
+  'select:not([disabled])',
+  'textarea:not([disabled])',
+  '[contenteditable="true"]',
+].join(', ');
+
+function visibleFocusable(root: HTMLElement | null): HTMLElement[] {
+  if (!root) return [];
+  return Array.from(root.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter((element) => {
+    if (element.getAttribute('aria-hidden') === 'true') return false;
+    if (element.tabIndex < 0) return false;
+    return element.getClientRects().length > 0;
+  });
+}
+
+/** Счётчик блокировок прокрутки: два одновременно открытых диалога не должны
+ * восстановить overflow раньше времени. */
+let scrollLockCount = 0;
+let scrollLockValue = '';
+
+function lockBodyScroll(): void {
+  if (scrollLockCount === 0) {
+    scrollLockValue = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+  }
+  scrollLockCount += 1;
+}
+
+function unlockBodyScroll(): void {
+  scrollLockCount = Math.max(0, scrollLockCount - 1);
+  if (scrollLockCount === 0) document.body.style.overflow = scrollLockValue;
+}
+
 export function Modal({
   open,
   onClose,
@@ -27,30 +71,86 @@ export function Modal({
 }: ModalProps) {
   const titleId = useId();
   const panelRef = useRef<HTMLDivElement | null>(null);
+  const onCloseRef = useRef(onClose);
+  const focusInitialised = useRef(false);
+  const openerRef = useRef<HTMLElement | null>(null);
+
+  onCloseRef.current = onClose;
 
   useEffect(() => {
-    if (!open) return;
-    const onKeyDown = (event: KeyboardEvent) => {
+    if (!open) {
+      focusInitialised.current = false;
+      return;
+    }
+
+    openerRef.current =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    lockBodyScroll();
+
+    const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
+        event.preventDefault();
         event.stopPropagation();
-        onClose();
+        onCloseRef.current();
+        return;
+      }
+      if (event.key !== 'Tab') return;
+
+      const panel = panelRef.current;
+      if (!panel) return;
+      const focusables = visibleFocusable(panel);
+      if (focusables.length === 0) {
+        event.preventDefault();
+        panel.focus();
+        return;
+      }
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      const active = document.activeElement;
+      if (event.shiftKey) {
+        if (active === first || !panel.contains(active)) {
+          event.preventDefault();
+          last?.focus();
+        }
+      } else if (active === last || !panel.contains(active)) {
+        event.preventDefault();
+        first?.focus();
       }
     };
-    document.addEventListener('keydown', onKeyDown);
-    const previousOverflow = document.body.style.overflow;
-    document.body.style.overflow = 'hidden';
-    const timer = window.setTimeout(() => {
-      const focusable = panelRef.current?.querySelector<HTMLElement>(
-        '.modal__body input:not([type="hidden"]), .modal__body select, .modal__body textarea, .modal__footer button, .modal__head button',
-      );
-      focusable?.focus();
-    }, 30);
+
+    document.addEventListener('keydown', handleKeyDown, true);
+
+    // Фокус ставится один раз за открытие, синхронно: повторные рендеры
+    // (ввод в контролируемое поле, SSE-обновления) не должны его перехватывать.
+    if (!focusInitialised.current) {
+      const panel = panelRef.current;
+      const bodyField = Array.from(
+        panel?.querySelectorAll<HTMLElement>(`.modal__body ${BODY_FIELD_SELECTOR}`) ?? [],
+      ).find((element) => element.getClientRects().length > 0 && element.tabIndex >= 0);
+      const footerButton = Array.from(
+        panel?.querySelectorAll<HTMLElement>('.modal__footer button:not([disabled])') ?? [],
+      ).find((element) => element.getClientRects().length > 0);
+      focusInitialised.current = true;
+      if (bodyField) bodyField.focus();
+      else if (footerButton) footerButton.focus();
+      else panel?.focus();
+    }
+
     return () => {
-      document.removeEventListener('keydown', onKeyDown);
-      document.body.style.overflow = previousOverflow;
-      window.clearTimeout(timer);
+      document.removeEventListener('keydown', handleKeyDown, true);
+      unlockBodyScroll();
+      const opener = openerRef.current;
+      openerRef.current = null;
+      focusInitialised.current = false;
+      if (opener && opener.isConnected) {
+        try {
+          opener.focus();
+        } catch {
+          /* элемент мог стать недоступным — это не ошибка диалога */
+        }
+      }
     };
-  }, [open, onClose]);
+  }, [open]);
 
   if (!open) return null;
 
@@ -63,6 +163,7 @@ export function Modal({
         aria-modal="true"
         aria-labelledby={titleId}
         ref={panelRef}
+        tabIndex={-1}
       >
         <header className="modal__head">
           <div>

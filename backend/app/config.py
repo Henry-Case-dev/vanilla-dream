@@ -13,6 +13,9 @@ from pathlib import Path
 
 DEFAULT_BITRATE = 128
 SUPPORTED_BITRATES = (96, 112, 128, 160, 192, 224, 256, 320)
+SYSTEM_PLAYLIST_ID = "library"
+SYSTEM_PLAYLIST_NAME = "Вся медиатека"
+SYSTEM_PLAYLIST_DESCRIPTION = "Все треки медиатеки. Обновляется автоматически."
 
 UNIT_LIQUIDSOAP = "vanilla-dream-radio-liquidsoap.service"
 UNIT_ICECAST = "vanilla-dream-radio-icecast.service"
@@ -71,14 +74,27 @@ class Settings:
     min_free_bytes: int
     scheduler_enabled: bool = True
     unit_state_ttl: float = 3.0
+    public_http_base_url: str = ""
+    engine_unit: str = UNIT_LIQUIDSOAP
+    station_sudo: bool = True
+    engine_label: str = "Liquidsoap"
+    playlist_cover_dir: Path | None = None
+
+    def __post_init__(self) -> None:
+        if self.playlist_cover_dir is None:
+            object.__setattr__(self, "playlist_cover_dir", self.cover_dir / "playlists")
 
     @classmethod
     def from_env(cls) -> "Settings":
         engine_dir = Path(_env("VD_ENGINE_DIR", "/run/vanilla-dream-radio") or "/run/vanilla-dream-radio")
+        cover_dir = Path(_env("VD_COVER_DIR", "/srv/vanilla-dream-radio/covers") or "")
         return cls(
             db_path=Path(_env("VD_DB_PATH", "/var/lib/vanilla-dream-radio/app.db") or ""),
             music_dir=Path(_env("VD_MUSIC_DIR", "/srv/vanilla-dream-radio/music") or ""),
-            cover_dir=Path(_env("VD_COVER_DIR", "/srv/vanilla-dream-radio/covers") or ""),
+            cover_dir=cover_dir,
+            playlist_cover_dir=Path(
+                _env("VD_PLAYLIST_COVER_DIR", str(cover_dir / "playlists")) or ""
+            ),
             engine_dir=engine_dir,
             engine_queue_file=Path(
                 _env("VD_ENGINE_QUEUE_FILE", str(engine_dir / "engine-queue.txt")) or ""
@@ -104,12 +120,17 @@ class Settings:
             min_free_bytes=_env_int("VD_MIN_FREE_BYTES", 3 * 1024 * 1024 * 1024),
             scheduler_enabled=_env_bool("VD_SCHEDULER_ENABLED", True),
             unit_state_ttl=_env_float("VD_UNIT_STATE_TTL", 3.0),
+            public_http_base_url=(_env("VD_PUBLIC_HTTP_BASE_URL", "") or "").rstrip("/"),
+            engine_unit=_env("VD_ENGINE_UNIT", UNIT_LIQUIDSOAP) or UNIT_LIQUIDSOAP,
+            station_sudo=_env_bool("VD_STATION_SUDO", True),
+            engine_label=_env("VD_ENGINE_LABEL", "Liquidsoap") or "Liquidsoap",
         )
 
     def ensure_directories(self) -> None:
         for path in (
             self.music_dir,
             self.cover_dir,
+            self.playlist_cover_dir,
             self.engine_dir,
             self.queue_link_dir,
             self.db_path.parent,

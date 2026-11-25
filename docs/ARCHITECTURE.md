@@ -60,6 +60,29 @@ not an estimate, and it survives renames inside the music directory. (The
 non-root user.) Positions the engine has already received (`prepared`) cannot be
 reordered in the UI; only `pending` positions can.
 
+## Sources and the system playlist
+
+The station always has a source decision, made in the backend:
+
+1. active manual override (an explicit «В эфир» on a playlist or an override scope);
+2. active schedule rule (highest priority, deterministic tie-break);
+3. enabled rotation with at least one usable item;
+4. the playlist explicitly set as the default;
+5. **«Вся медиатека»** — a system playlist that always exists and always contains
+   every available track of the library (virtual membership, no duplicated rows);
+6. technical silence.
+
+«Вся медиатека» is used when nothing else is configured for the current moment; it
+is not a way to ignore a deliberately chosen source. A user playlist that was
+chosen but is empty or has finished without repeat is reported as such
+(`no_music` with a reason) instead of silently switching to the whole library.
+Rotation and the schedule may move to their next eligible item by design.
+
+The system playlist ships with shuffle and repeat-all enabled so a fresh
+installation plays music as soon as files exist; the owner can change both, and
+the choice persists. It cannot be deleted and its membership cannot be edited —
+removing music is done in the library, which immediately updates the playlist.
+
 ## Failure behaviour
 
 - Backend down: Liquidsoap keeps playing the prepared requests. On the next start

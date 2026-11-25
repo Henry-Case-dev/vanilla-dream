@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS playlists (
     cover_path TEXT,
     shuffle INTEGER DEFAULT 0,
     repeat_mode TEXT DEFAULT 'none',
+    system INTEGER NOT NULL DEFAULT 0,
     created_at TEXT,
     updated_at TEXT
 );

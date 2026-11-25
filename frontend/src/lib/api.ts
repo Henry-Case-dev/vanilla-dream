@@ -1,4 +1,5 @@
 import type {
+  AddTracksResult,
   ConflictInfo,
   HistoryEntry,
   LoginResult,
@@ -11,6 +12,7 @@ import type {
   QueueItem,
   QueueSnapshot,
   RadioLink,
+  RemoveTrackResult,
   Rotation,
   RotationItem,
   RotationMode,
@@ -22,6 +24,7 @@ import type {
   StationStatus,
   StorageInfo,
   Track,
+  TrackIdPage,
   TrackPage,
   TrackQuery,
 } from './types';
@@ -81,6 +84,27 @@ const normalizeStatus = (value: unknown): StationStatus => {
   }
 };
 
+function requireObject(value: unknown, what: string): JsonObject {
+  if (!isObject(value)) throw contractError(what);
+  return value;
+}
+
+function requireString(value: unknown, what: string): string {
+  if (typeof value !== 'string' || value.length === 0) throw contractError(what);
+  return value;
+}
+
+function requireNumber(value: unknown, what: string): number {
+  const number = asNumber(value);
+  if (number === null) throw contractError(what);
+  return number;
+}
+
+function requireArray(value: unknown, what: string): unknown[] {
+  if (!Array.isArray(value)) throw contractError(what);
+  return value;
+}
+
 /* ------------------------------------------------------------------ */
 /* Ошибки и CSRF                                                       */
 /* ------------------------------------------------------------------ */
@@ -117,6 +141,18 @@ export class ApiError extends Error {
     this.status = status;
     this.code = code;
   }
+}
+
+/** Ответ сервера не соответствует зафиксированному контракту. */
+export class PayloadError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'PayloadError';
+  }
+}
+
+export function contractError(what: string): PayloadError {
+  return new PayloadError(`Некорректный ответ сервера: ${what}. Обновите страницу и повторите.`);
 }
 
 export function errorMessage(error: unknown): string {
@@ -281,13 +317,16 @@ function normalizeNowTrack(raw: unknown): NowTrack | null {
 }
 
 function normalizeNowStation(raw: unknown): NowStation {
-  const station = isObject(raw) ? raw : {};
+  const station = requireObject(raw, 'станция в now-playing');
+  const status = normalizeStatus(station.status);
+  if (status === 'unknown') throw contractError('неизвестный статус станции');
   const desired = station.desired === 'playing' ? 'playing' : 'stopped';
   return {
     name: asString(station.name, 'Vanilla Dream Radio'),
     description: asStringOrNull(station.description),
-    status: normalizeStatus(station.status),
+    status,
     statusLabel: asStringOrNull(station.status_label),
+    reason: asStringOrNull(station.reason),
     desired,
     streamUrl: asString(station.stream_url),
     m3uUrl: asString(station.m3u_url),
@@ -298,7 +337,7 @@ function normalizeNowStation(raw: unknown): NowStation {
 }
 
 export function normalizeNowPlaying(raw: unknown): NowPlaying {
-  const data = isObject(raw) ? raw : {};
+  const data = requireObject(raw, 'now-playing');
   const listeners = isObject(data.listeners) ? data.listeners : {};
   const nextSchedule = isObject(data.next_schedule_change) ? data.next_schedule_change : null;
   const nextTrackRaw = isObject(data.next_track) ? data.next_track : null;
@@ -334,22 +373,81 @@ export function normalizeNowPlaying(raw: unknown): NowPlaying {
   };
 }
 
-function normalizePlaylist(raw: unknown): Playlist | null {
-  if (!isObject(raw)) return null;
-  const id = asString(raw.id);
-  if (!id) return null;
-  const repeat = raw.repeat_mode;
+export const SYSTEM_PLAYLIST_ID = 'library';
+export const SYSTEM_PLAYLIST_NAME = 'Вся медиатека';
+export const SYSTEM_PLAYLIST_DESCRIPTION = 'Все треки медиатеки. Обновляется автоматически.';
+
+export function normalizePlaylist(raw: unknown): Playlist {
+  const data = requireObject(raw, 'плейлист');
+  const id = requireString(data.id, 'id плейлиста');
+  const system = id === SYSTEM_PLAYLIST_ID || asBoolean(data.system);
+  const repeat = data.repeat_mode;
+  const coverUrl = asStringOrNull(data.cover_url);
+  const coverKindRaw = asString(data.cover_kind);
+  const coverKind =
+    coverKindRaw === 'custom' || coverKindRaw === 'auto' || coverKindRaw === 'none'
+      ? coverKindRaw
+      : coverUrl
+        ? 'auto'
+        : 'none';
   return {
     id,
-    name: asString(raw.name, 'Без названия'),
-    description: asStringOrNull(raw.description),
-    coverUrl: asStringOrNull(raw.cover_url),
-    trackCount: asNumber(raw.track_count ?? raw.tracks_count),
-    duration: asNumber(raw.duration ?? raw.total_duration),
-    shuffle: asBoolean(raw.shuffle),
+    name: system ? SYSTEM_PLAYLIST_NAME : requireString(data.name, 'название плейлиста'),
+    description: system
+      ? asStringOrNull(data.description) ?? SYSTEM_PLAYLIST_DESCRIPTION
+      : asStringOrNull(data.description),
+    system,
+    coverUrl,
+    coverKind,
+    trackCount: requireNumber(data.track_count, 'track_count плейлиста'),
+    duration: requireNumber(data.duration, 'duration плейлиста'),
+    shuffle: asBoolean(data.shuffle),
     repeatMode: repeat === 'all' || repeat === 'one' ? repeat : 'none',
-    createdAt: asStringOrNull(raw.created_at),
-    updatedAt: asStringOrNull(raw.updated_at),
+    createdAt: asStringOrNull(data.created_at),
+    updatedAt: asStringOrNull(data.updated_at),
+    pendingDeleteCount: asNumber(data.pending_delete_count),
+  };
+}
+
+export function normalizePlaylistDetail(raw: unknown): PlaylistDetail {
+  const data = requireObject(raw, 'деталь плейлиста');
+  const playlistRaw = requireObject(data.playlist, 'playlist в детали плейлиста');
+  const playlist = normalizePlaylist(playlistRaw);
+  const rawTracks = playlistRaw.tracks ?? data.tracks;
+  if (!Array.isArray(rawTracks)) throw contractError('треки в детали плейлиста');
+  const tracks = rawTracks.map((item) => {
+    const track = normalizeTrack(isObject(item) && isObject(item.track) ? item.track : item);
+    if (!track) throw contractError('трек в детали плейлиста');
+    return track;
+  });
+  const tracksTotal = asNumber(playlistRaw.tracks_total ?? data.tracks_total) ?? tracks.length;
+  return { playlist, tracks, tracksTotal };
+}
+
+export function normalizeAddTracksResult(raw: unknown): AddTracksResult {
+  const data = requireObject(raw, 'результат добавления треков');
+  return {
+    added: requireNumber(data.added, 'added'),
+    skipped: requireNumber(data.skipped, 'skipped'),
+    unavailable: requireNumber(data.unavailable, 'unavailable'),
+    playlist: normalizePlaylist(data.playlist),
+  };
+}
+
+export function normalizeRemoveTrackResult(raw: unknown): RemoveTrackResult {
+  const data = requireObject(raw, 'результат удаления трека');
+  return {
+    removed: asBoolean(data.removed),
+    playlist: normalizePlaylist(data.playlist),
+  };
+}
+
+export function normalizeTrackIds(raw: unknown): TrackIdPage {
+  const data = requireObject(raw, 'список id треков');
+  const ids = requireArray(data.ids, 'ids').map((id) => requireString(id, 'id трека'));
+  return {
+    ids: Array.from(new Set(ids)),
+    total: requireNumber(data.total, 'total id треков'),
   };
 }
 
@@ -408,52 +506,199 @@ function normalizeRotationItem(raw: unknown, index: number): RotationItem | null
   };
 }
 
-function normalizeQueueItem(raw: unknown): QueueItem | null {
-  if (!isObject(raw)) return null;
-  const id = asString(raw.id);
-  if (!id) return null;
-  const source = isObject(raw.source) ? raw.source : null;
-  const sourceText = typeof raw.source === 'string' ? raw.source : null;
+function normalizeQueueItem(raw: unknown): QueueItem {
+  const data = requireObject(raw, 'элемент очереди');
+  const id = asString(data.id) || asString(data.position_id);
+  if (!id) throw contractError('id/position_id элемента очереди');
+  const trackRaw = data.track;
+  const track = normalizeTrack(trackRaw);
+  if (!track) throw contractError('трек элемента очереди');
+  const source = isObject(data.source) ? data.source : null;
+  const sourceText = typeof data.source === 'string' ? data.source : null;
   return {
     id,
-    track: normalizeTrack(raw.track),
+    track,
     sourceKind: source
       ? asStringOrNull(source.kind)
-      : sourceText ?? asStringOrNull(raw.source_kind),
+      : sourceText ?? asStringOrNull(data.source_kind),
     sourceLabel: source
       ? asStringOrNull(source.label ?? source.name)
-      : asStringOrNull(raw.source_label) ?? sourceText,
-    prepared: asBoolean(raw.prepared),
-    manual: asBoolean(raw.manual),
-    estimatedStart: asStringOrNull(raw.estimated_start),
+      : asStringOrNull(data.source_label) ?? sourceText,
+    prepared: asBoolean(data.prepared),
+    manual: asBoolean(data.manual),
+    estimatedStart: asStringOrNull(data.estimated_start),
   };
 }
 
-const SERVICE_NAMES: Record<string, string> = {
+export function normalizeQueueSnapshot(raw: unknown): QueueSnapshot {
+  const data = requireObject(raw, 'очередь');
+  const itemsRaw = requireArray(data.items, 'items очереди');
+  const currentRaw = data.current;
+  const current =
+    currentRaw === null || currentRaw === undefined ? null : normalizeQueueItem(currentRaw);
+  const items = itemsRaw.map(normalizeQueueItem);
+  return {
+    current,
+    items,
+    depth: asNumber(data.depth),
+  };
+}
+
+const SERVICE_LABELS: Record<string, string> = {
   icecast: 'Icecast',
   liquidsoap: 'Liquidsoap',
   api: 'Backend',
-  backend: 'Backend',
-  station: 'Движок',
 };
 
-function normalizeService(raw: unknown): ServiceInfo | null {
-  if (!isObject(raw)) return null;
-  const id = asString(raw.id ?? raw.key ?? raw.name);
-  if (!id) return null;
-  const stateRaw = asString(raw.state ?? raw.status ?? raw.active);
-  let state: ServiceInfo['state'] = 'unknown';
-  if (stateRaw === 'active' || stateRaw === 'running' || stateRaw === 'on') state = 'active';
-  else if (stateRaw === 'inactive' || stateRaw === 'stopped' || stateRaw === 'off' || stateRaw === 'false') state = 'inactive';
-  else if (stateRaw === 'failed' || stateRaw === 'error') state = 'failed';
-  else if (asBoolean(raw.active)) state = 'active';
+const SERVICE_STATE_LABELS: Record<ServiceInfo['state'], string> = {
+  active: 'Работает',
+  inactive: 'Остановлена',
+  failed: 'Ошибка',
+  unknown: 'Неизвестно',
+};
+
+function serviceIdFromUnit(unit: string | null): string | null {
+  if (!unit) return null;
+  if (unit.includes('icecast')) return 'icecast';
+  if (unit.includes('liquidsoap')) return 'liquidsoap';
+  if (unit.includes('api')) return 'api';
+  return null;
+}
+
+function normalizeServiceState(value: unknown): ServiceInfo['state'] {
+  switch (value) {
+    case 'active':
+    case 'running':
+    case 'on':
+      return 'active';
+    case 'inactive':
+    case 'stopped':
+    case 'off':
+    case 'false':
+      return 'inactive';
+    case 'failed':
+    case 'error':
+      return 'failed';
+    default:
+      return 'unknown';
+  }
+}
+
+function normalizeService(
+  raw: unknown,
+  fallbackStart: string | null,
+  fallbackError: string | null,
+): ServiceInfo {
+  const data = requireObject(raw, 'служба');
+  const unit = asStringOrNull(data.unit);
+  const id = asString(data.id) || serviceIdFromUnit(unit);
+  if (!id) throw contractError('id/unit службы');
+  const state = normalizeServiceState(data.state);
+  const label = asString(data.label ?? data.name) || SERVICE_LABELS[id] || id;
+  const stateLabel =
+    asString(data.state_label) ||
+    SERVICE_STATE_LABELS[state];
   return {
     id,
-    name: asString(raw.label ?? raw.name, SERVICE_NAMES[id] ?? id),
+    unit,
+    label,
     state,
-    lastStart: asStringOrNull(raw.last_start ?? raw.started_at),
-    lastError: asStringOrNull(raw.last_error ?? raw.error),
+    stateLabel,
+    detail: asStringOrNull(data.detail),
+    lastStart: asStringOrNull(data.last_start) ?? (id === 'liquidsoap' ? fallbackStart : null),
+    lastError: asStringOrNull(data.last_error) ?? (id === 'liquidsoap' ? fallbackError : null),
   };
+}
+
+export function normalizeServices(raw: unknown): ServiceInfo[] {
+  const data = requireObject(raw, 'службы');
+  const list = requireArray(data.services, 'services');
+  const fallbackStart = asStringOrNull(data.last_start);
+  const fallbackError = asStringOrNull(data.last_error);
+  return list.map((item) => normalizeService(item, fallbackStart, fallbackError));
+}
+
+export function normalizeStorage(raw: unknown): StorageInfo {
+  const data = requireObject(raw, 'хранилище');
+  return {
+    tracks: requireNumber(data.tracks, 'tracks хранилища'),
+    bytes: requireNumber(data.bytes, 'bytes хранилища'),
+    coverBytes: asNumber(data.cover_bytes) ?? 0,
+    dbBytes: asNumber(data.db_bytes) ?? 0,
+    freeBytes: requireNumber(data.free_bytes, 'free_bytes хранилища'),
+    totalBytes: requireNumber(data.total_bytes, 'total_bytes хранилища'),
+    limitGb: asNumber(data.limit_gb) ?? 0,
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* Ссылки на трансляцию                                                */
+/* ------------------------------------------------------------------ */
+
+const LINK_LABELS: Record<string, string> = {
+  mp3: 'Прямой MP3',
+  http_mp3: 'HTTP MP3',
+  player: 'Веб-плеер',
+  m3u: 'M3U-плейлист',
+  pls: 'PLS-плейлист',
+  metadata: 'Метаданные эфира',
+};
+
+function normalizeLink(raw: unknown): RadioLink {
+  const data = requireObject(raw, 'ссылка на трансляцию');
+  const key = requireString(data.key, 'key ссылки');
+  const url = requireString(data.url, 'url ссылки');
+  const label = asString(data.label) || LINK_LABELS[key] || key;
+  return {
+    key,
+    label,
+    url,
+    description: asStringOrNull(data.description),
+    primary: 'primary' in data ? asBoolean(data.primary) : key === 'mp3',
+  };
+}
+
+export function normalizeLinks(raw: unknown): RadioLink[] {
+  const data = requireObject(raw, 'ссылки на трансляцию');
+  const list = requireArray(data.links, 'links');
+  return list.map(normalizeLink);
+}
+
+const PUBLIC_STREAM_DESCRIPTION =
+  'Прямая ссылка на аудиопоток для интернет-радиоплееров и совместимых приложений.';
+
+/** Публичная страница не имеет доступа к admin-эндпоинту ссылок: собирает
+ * ссылки только из публичного now-playing. */
+export function publicLinksFromStation(station: NowStation): RadioLink[] {
+  const links: RadioLink[] = [];
+  if (station.streamUrl) {
+    links.push({
+      key: 'mp3',
+      label: LINK_LABELS.mp3 ?? 'Прямой MP3',
+      url: station.streamUrl,
+      description: PUBLIC_STREAM_DESCRIPTION,
+      primary: true,
+    });
+  }
+  if (station.m3uUrl) {
+    links.push({
+      key: 'm3u',
+      label: LINK_LABELS.m3u ?? 'M3U-плейлист',
+      url: station.m3uUrl,
+      description: 'Плейлист M3U для VLC и мобильных плееров.',
+      primary: false,
+    });
+  }
+  if (station.plsUrl) {
+    links.push({
+      key: 'pls',
+      label: LINK_LABELS.pls ?? 'PLS-плейлист',
+      url: station.plsUrl,
+      description: 'Плейлист PLS для совместимых плееров.',
+      primary: false,
+    });
+  }
+  return links;
 }
 
 function normalizeHistoryEntry(raw: unknown): HistoryEntry | null {
@@ -476,6 +721,7 @@ function normalizeHistoryEntry(raw: unknown): HistoryEntry | null {
 export function normalizeSettings(raw: unknown): Settings {
   const data = isObject(raw) && isObject(raw.settings) ? raw.settings : isObject(raw) ? raw : {};
   const desired = data.desired_state === 'playing' ? 'playing' : 'stopped';
+  const defaultPlaylistId = asString(data.default_playlist_id, '');
   return {
     stationName: asString(data.station_name, 'Vanilla Dream Radio'),
     stationDescription: asString(data.station_description, ''),
@@ -484,7 +730,8 @@ export function normalizeSettings(raw: unknown): Settings {
     timezone: asString(data.timezone, 'UTC'),
     scheduleEnabled: asBoolean(data.schedule_enabled, true),
     defaultTransition: asString(data.default_transition, 'after_track'),
-    defaultPlaylistId: asString(data.default_playlist_id, ''),
+    // '' — системный источник «Вся медиатека (автоматически)».
+    defaultPlaylistId: defaultPlaylistId === SYSTEM_PLAYLIST_ID ? '' : defaultPlaylistId,
     queueDepth: Math.trunc(asNumber(data.queue_depth) ?? 6),
     maxUploadMb: Math.trunc(asNumber(data.max_upload_mb) ?? 300),
     maxLibraryGb: Math.trunc(asNumber(data.max_library_gb) ?? 0),
@@ -492,149 +739,6 @@ export function normalizeSettings(raw: unknown): Settings {
     engineLastStart: asString(data.engine_last_start, ''),
     engineLastError: asString(data.engine_last_error, ''),
   };
-}
-
-export function normalizeStorage(raw: unknown): StorageInfo {
-  const data = isObject(raw) ? raw : {};
-  const tracksObj = isObject(data.tracks) ? data.tracks : {};
-  const libraryObj = isObject(data.library) ? data.library : {};
-  return {
-    tracks: Math.trunc(asNumber(tracksObj.count ?? data.track_count ?? libraryObj.count) ?? 0),
-    libraryBytes: asNumber(tracksObj.bytes ?? data.library_bytes ?? libraryObj.bytes ?? data.used_bytes) ?? 0,
-    freeBytes: asNumber(data.free_bytes ?? data.free ?? data.disk_free_bytes),
-    totalBytes: asNumber(data.total_bytes ?? data.total ?? data.disk_total_bytes),
-  };
-}
-
-/* ------------------------------------------------------------------ */
-/* Ссылки на трансляцию                                                */
-/* ------------------------------------------------------------------ */
-
-const LINK_META: Record<string, { label: string; hint: string | null; primary?: boolean }> = {
-  world_radio: {
-    label: 'Minecraft / World Radio',
-    hint: 'Прямая ссылка без HTML-плеера — основной адрес для World Radio',
-    primary: true,
-  },
-  mp3: { label: 'Прямой MP3', hint: 'HTTPS-поток, формат MP3' },
-  http_mp3: { label: 'HTTP MP3', hint: 'Без TLS — только для плееров без поддержки HTTPS' },
-  m3u: { label: 'M3U-плейлист', hint: 'Для VLC и мобильных плееров' },
-  pls: { label: 'PLS-плейлист', hint: 'Формат PLS' },
-  player: { label: 'Веб-плеер', hint: 'Публичная страница станции' },
-  admin: { label: 'Панель управления', hint: 'Вход для администратора' },
-};
-
-const LINK_ORDER = ['world_radio', 'mp3', 'http_mp3', 'player', 'm3u', 'pls', 'admin'];
-
-function normalizeLinkEntry(key: string, value: unknown): RadioLink | null {
-  let url = '';
-  let label = '';
-  let hint: string | null = null;
-  if (typeof value === 'string') {
-    url = value;
-  } else if (isObject(value)) {
-    url = asString(value.url ?? value.href);
-    label = asString(value.label ?? value.title ?? value.name);
-    hint = asStringOrNull(value.hint ?? value.description);
-  }
-  if (!url) return null;
-  const meta = LINK_META[key];
-  return {
-    id: key,
-    label: label || meta?.label || key,
-    url,
-    hint: hint ?? meta?.hint ?? null,
-    primary: meta?.primary ?? false,
-  };
-}
-
-export function normalizeLinks(raw: unknown): RadioLink[] {
-  const entries: Array<[string, unknown]> = [];
-  const source = isObject(raw) && (isObject(raw.links) || Array.isArray(raw.links)) ? raw.links : raw;
-
-  if (Array.isArray(source)) {
-    source.forEach((item, index) => {
-      if (isObject(item)) {
-        const key = asString(item.id ?? item.key ?? item.kind, `link_${index}`);
-        entries.push([key, item]);
-      }
-    });
-  } else if (isObject(source)) {
-    Object.entries(source).forEach(([key, value]) => {
-      if (key === 'base_url' || key === 'station') return;
-      entries.push([key, value]);
-    });
-  }
-
-  const links: RadioLink[] = [];
-  const seen = new Set<string>();
-  entries.forEach(([key, value]) => {
-    const link = normalizeLinkEntry(key, value);
-    if (!link || seen.has(link.id)) return;
-    seen.add(link.id);
-    links.push(link);
-  });
-
-  const rank = (id: string) => {
-    const index = LINK_ORDER.indexOf(id);
-    return index === -1 ? LINK_ORDER.length : index;
-  };
-  return links.sort((a, b) => rank(a.id) - rank(b.id));
-}
-
-/** Резервный набор ссылок из публичного now-playing (если /api/admin/links недоступен). */
-export function linksFromStation(station: NowStation): RadioLink[] {
-  const links: RadioLink[] = [];
-  if (station.streamUrl) {
-    links.push({
-      id: 'world_radio',
-      label: LINK_META.world_radio.label,
-      url: station.streamUrl,
-      hint: LINK_META.world_radio.hint,
-      primary: true,
-    });
-    links.push({
-      id: 'mp3',
-      label: LINK_META.mp3.label,
-      url: station.streamUrl,
-      hint: LINK_META.mp3.hint,
-      primary: false,
-    });
-  }
-  if (station.baseUrl) {
-    links.push({
-      id: 'player',
-      label: LINK_META.player.label,
-      url: new URL('/', ensureBase(station.baseUrl)).toString(),
-      hint: LINK_META.player.hint,
-      primary: false,
-    });
-  }
-  if (station.m3uUrl) {
-    links.push({ id: 'm3u', label: LINK_META.m3u.label, url: station.m3uUrl, hint: LINK_META.m3u.hint, primary: false });
-  }
-  if (station.plsUrl) {
-    links.push({ id: 'pls', label: LINK_META.pls.label, url: station.plsUrl, hint: LINK_META.pls.hint, primary: false });
-  }
-  if (station.baseUrl) {
-    links.push({
-      id: 'admin',
-      label: LINK_META.admin.label,
-      url: new URL('/admin', ensureBase(station.baseUrl)).toString(),
-      hint: LINK_META.admin.hint,
-      primary: false,
-    });
-  }
-  return links;
-}
-
-function ensureBase(base: string): string {
-  try {
-    const url = new URL(base);
-    return url.toString();
-  } catch {
-    return window.location.origin;
-  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -691,19 +795,28 @@ async function tracksList(query: TrackQuery = {}): Promise<TrackPage> {
       offset: query.offset,
     },
   });
-  const items = pickArray(raw, 'items')
-    .map(normalizeTrack)
-    .filter((track): track is Track => track !== null);
-  const data = isObject(raw) ? raw : {};
-  const libraryObj = isObject(data.library) ? data.library : {};
+  const data = requireObject(raw, 'список треков');
+  const items = requireArray(data.items, 'items треков').map((item) => {
+    const track = normalizeTrack(item);
+    if (!track) throw contractError('трек в медиатеке');
+    return track;
+  });
+  const libraryObj = requireObject(data.library, 'library в списке треков');
   return {
     items,
-    total: Math.trunc(asNumber(data.total) ?? items.length),
+    total: requireNumber(data.total, 'total треков'),
     library: {
-      count: Math.trunc(asNumber(libraryObj.count ?? data.total) ?? items.length),
-      bytes: asNumber(libraryObj.bytes) ?? 0,
+      count: requireNumber(libraryObj.count, 'library.count'),
+      bytes: requireNumber(libraryObj.bytes, 'library.bytes'),
     },
   };
+}
+
+async function tracksIds(query: { q?: string; excludePlaylistId?: string } = {}): Promise<TrackIdPage> {
+  const raw = await request<unknown>('/api/admin/tracks/ids', {
+    query: { q: query.q, exclude_playlist_id: query.excludePlaylistId },
+  });
+  return normalizeTrackIds(raw);
 }
 
 async function trackUpdate(id: string, patch: Record<string, unknown>): Promise<void> {
@@ -748,28 +861,23 @@ async function trackEnqueue(id: string): Promise<void> {
 
 async function playlistsList(): Promise<Playlist[]> {
   const raw = await request<unknown>('/api/admin/playlists');
-  return pickArray(raw, 'items')
-    .map(normalizePlaylist)
-    .filter((playlist): playlist is Playlist => playlist !== null);
+  const data = requireObject(raw, 'список плейлистов');
+  const items = requireArray(data.items, 'items плейлистов').map(normalizePlaylist);
+  return items.sort((a, b) => {
+    if (a.system !== b.system) return a.system ? -1 : 1;
+    return a.name.localeCompare(b.name, 'ru');
+  });
 }
 
 async function playlistGet(id: string): Promise<PlaylistDetail> {
   const raw = await request<unknown>(`/api/admin/playlists/${encodeURIComponent(id)}`);
-  const data = isObject(raw) ? raw : {};
-  const playlistRaw = isObject(data.playlist) ? data.playlist : data;
-  const playlist = normalizePlaylist(playlistRaw);
-  if (!playlist) throw new ApiError(404, 'Плейлист не найден');
-  const tracks = pickArray(data.tracks ?? raw, 'tracks')
-    .map((item) => normalizeTrack(isObject(item) && isObject(item.track) ? item.track : item))
-    .filter((track): track is Track => track !== null);
-  return { playlist, tracks };
+  return normalizePlaylistDetail(raw);
 }
 
 async function playlistCreate(payload: { name: string; description?: string }): Promise<Playlist> {
   const raw = await request<unknown>('/api/admin/playlists', { method: 'POST', body: payload });
-  const data = isObject(raw) && isObject(raw.playlist) ? raw.playlist : raw;
-  const playlist = normalizePlaylist(data);
-  if (!playlist) throw new ApiError(500, 'Сервер не вернул созданный плейлист');
+  const data = requireObject(raw, 'создание плейлиста');
+  const playlist = normalizePlaylist(data.playlist ?? data);
   return playlist;
 }
 
@@ -781,18 +889,20 @@ async function playlistDelete(id: string): Promise<void> {
   await request<unknown>(`/api/admin/playlists/${encodeURIComponent(id)}`, { method: 'DELETE' });
 }
 
-async function playlistAddTracks(id: string, trackIds: string[]): Promise<void> {
-  await request<unknown>(`/api/admin/playlists/${encodeURIComponent(id)}/tracks`, {
+async function playlistAddTracks(id: string, trackIds: string[]): Promise<AddTracksResult> {
+  const raw = await request<unknown>(`/api/admin/playlists/${encodeURIComponent(id)}/tracks`, {
     method: 'POST',
     body: { track_ids: trackIds },
   });
+  return normalizeAddTracksResult(raw);
 }
 
-async function playlistRemoveTrack(id: string, trackId: string): Promise<void> {
-  await request<unknown>(
+async function playlistRemoveTrack(id: string, trackId: string): Promise<RemoveTrackResult> {
+  const raw = await request<unknown>(
     `/api/admin/playlists/${encodeURIComponent(id)}/tracks/${encodeURIComponent(trackId)}`,
     { method: 'DELETE' },
   );
+  return normalizeRemoveTrackResult(raw);
 }
 
 async function playlistReorder(id: string, trackIds: string[]): Promise<void> {
@@ -802,8 +912,30 @@ async function playlistReorder(id: string, trackIds: string[]): Promise<void> {
   });
 }
 
-async function playlistPlay(id: string): Promise<void> {
-  await request<unknown>(`/api/admin/playlists/${encodeURIComponent(id)}/play`, { method: 'POST' });
+async function playlistPlay(id: string, mode: 'now' | 'next' = 'now'): Promise<void> {
+  await request<unknown>(`/api/admin/playlists/${encodeURIComponent(id)}/play`, {
+    method: 'POST',
+    body: { mode },
+  });
+}
+
+async function playlistUploadCover(id: string, file: File): Promise<Playlist> {
+  const form = new FormData();
+  form.append('file', file, file.name);
+  const raw = await request<unknown>(`/api/admin/playlists/${encodeURIComponent(id)}/cover`, {
+    method: 'POST',
+    body: form,
+  });
+  const data = requireObject(raw, 'обложка плейлиста');
+  return normalizePlaylist(data.playlist ?? data);
+}
+
+async function playlistResetCover(id: string): Promise<Playlist> {
+  const raw = await request<unknown>(`/api/admin/playlists/${encodeURIComponent(id)}/cover`, {
+    method: 'DELETE',
+  });
+  const data = requireObject(raw, 'сброс обложки плейлиста');
+  return normalizePlaylist(data.playlist ?? data);
 }
 
 async function playlistToRotation(id: string): Promise<void> {
@@ -896,16 +1028,7 @@ async function scheduleConflicts(): Promise<ConflictInfo[]> {
 /* ------------------------------------------------------------------ */
 
 async function queueGet(): Promise<QueueSnapshot> {
-  const raw = await request<unknown>('/api/admin/queue');
-  const data = isObject(raw) ? raw : {};
-  const items = pickArray(raw, 'items')
-    .map(normalizeQueueItem)
-    .filter((item): item is QueueItem => item !== null);
-  return {
-    current: normalizeQueueItem(data.current),
-    items,
-    depth: asNumber(data.depth),
-  };
+  return normalizeQueueSnapshot(await request<unknown>('/api/admin/queue'));
 }
 
 async function queueMove(id: string, moveTo: number): Promise<void> {
@@ -931,12 +1054,12 @@ async function queueClearManual(): Promise<void> {
 /* Станция                                                             */
 /* ------------------------------------------------------------------ */
 
-async function stationStatus(): Promise<NowPlaying> {
-  return normalizeNowPlaying(await request<unknown>('/api/admin/station/status'));
-}
-
 async function stationAction(action: 'start' | 'stop' | 'restart' | 'skip'): Promise<void> {
   await request<unknown>(`/api/admin/station/${action}`, { method: 'POST' });
+}
+
+async function clearOverride(): Promise<void> {
+  await request<unknown>('/api/admin/station/override', { method: 'DELETE' });
 }
 
 /* ------------------------------------------------------------------ */
@@ -957,27 +1080,7 @@ async function storageGet(): Promise<StorageInfo> {
 }
 
 async function servicesGet(): Promise<ServiceInfo[]> {
-  const raw = await request<unknown>('/api/admin/services');
-  if (Array.isArray(raw)) {
-    return raw.map(normalizeService).filter((service): service is ServiceInfo => service !== null);
-  }
-  if (isObject(raw)) {
-    const list = raw.services;
-    if (Array.isArray(list)) {
-      return list.map(normalizeService).filter((service): service is ServiceInfo => service !== null);
-    }
-    if (isObject(list)) {
-      return Object.entries(list)
-        .map(([id, value]) => {
-          if (isObject(value)) return normalizeService({ id, ...value });
-          return normalizeService({ id, state: value });
-        })
-        .filter((service): service is ServiceInfo => service !== null);
-    }
-  }
-  return pickArray(raw, 'items')
-    .map(normalizeService)
-    .filter((service): service is ServiceInfo => service !== null);
+  return normalizeServices(await request<unknown>('/api/admin/services'));
 }
 
 async function linksGet(): Promise<RadioLink[]> {
@@ -986,9 +1089,13 @@ async function linksGet(): Promise<RadioLink[]> {
 
 async function adminHistory(limit = 20): Promise<HistoryEntry[]> {
   const raw = await request<unknown>('/api/admin/history', { query: { limit } });
-  return pickArray(raw, 'items')
-    .map(normalizeHistoryEntry)
-    .filter((entry): entry is HistoryEntry => entry !== null);
+  const data = requireObject(raw, 'история эфира');
+  const items = requireArray(data.items, 'items истории');
+  return items.map((entry) => {
+    const normalized = normalizeHistoryEntry(entry);
+    if (!normalized) throw contractError('запись истории');
+    return normalized;
+  });
 }
 
 /* ------------------------------------------------------------------ */
@@ -1009,6 +1116,7 @@ export const api = {
   admin: {
     tracks: {
       list: tracksList,
+      ids: tracksIds,
       update: trackUpdate,
       remove: trackDelete,
       bulkDelete: tracksBulkDelete,
@@ -1026,6 +1134,8 @@ export const api = {
       removeTrack: playlistRemoveTrack,
       reorder: playlistReorder,
       play: playlistPlay,
+      uploadCover: playlistUploadCover,
+      resetCover: playlistResetCover,
       toRotation: playlistToRotation,
     },
     rotation: {
@@ -1048,11 +1158,11 @@ export const api = {
       clearManual: queueClearManual,
     },
     station: {
-      status: stationStatus,
       start: () => stationAction('start'),
       stop: () => stationAction('stop'),
       restart: () => stationAction('restart'),
       skip: () => stationAction('skip'),
+      clearOverride,
     },
     settings: {
       get: settingsGet,
