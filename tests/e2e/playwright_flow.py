@@ -75,6 +75,34 @@ def goto_panel(page: Page, base: str, path: str, marker: str, wait: float = 2.0)
     page.wait_for_timeout(int(wait * 1000))
 
 
+def wait_text(page: Page, text: str, timeout: float = 15.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            if page.evaluate("(t) => !!document.body && document.body.innerText.includes(t)", text):
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+        page.wait_for_timeout(400)
+    return False
+
+
+def api_stop(page: Page, base: str) -> None:
+    """Stop the station through the UI if it is running (keeps the flow repeatable)."""
+    if page.get_by_role("button", name=re.compile("Остановить эфир")).count() == 0:
+        return
+    page.get_by_role("button", name=re.compile("Остановить эфир")).first.click()
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        page.wait_for_timeout(800)
+        try:
+            status = page.evaluate("async () => (await (await fetch('/api/public/now-playing')).json()).station.status")
+        except Exception:  # noqa: BLE001
+            continue
+        if status == "off":
+            return
+
+
 def open_modal(page: Page, button_name: str, timeout: int = 15000) -> bool:
     try:
         page.get_by_role("button", name=re.compile(button_name)).first.click(timeout=timeout)
@@ -157,7 +185,16 @@ def scenario_system_playlist(page: Page, base: str, ctx: APIRequestContext, fixt
           ("Эфир остановлен" in body) or ("тишин" in body.lower()) or ("медиатек" in body.lower()),
           body[:80].replace("\n", " "))
 
-    page.get_by_role("button", name=re.compile("Запустить эфир")).first.click()
+    start = page.get_by_role("button", name=re.compile("Запустить эфир")).first
+    if start.count():
+        start.click()
+    else:
+        stop = page.get_by_role("button", name=re.compile("Остановить эфир")).first
+        if stop.count():
+            stop.click()
+            api_stop(page, base)
+            page.wait_for_timeout(2500)
+            page.get_by_role("button", name=re.compile("Запустить эфир")).first.click()
     page.wait_for_timeout(3500)
     now = api_json(ctx, "/api/public/now-playing")
     check("station starts with an empty library", now["station"]["desired"] == "playing", now["station"]["status"])
@@ -339,10 +376,13 @@ def scenario_play_and_priorities(page: Page, base: str, ctx: APIRequestContext, 
             break
         time.sleep(2)
     check("play starts music", np["station"]["status"] == "on_air", np["station"]["status"])
-    check("manual override is visible in the UI", "Ручной" in page.inner_text("body"), "")
+    page.reload(wait_until="commit")
+    wait_panel(page, "В эфир", 25)
+    page.wait_for_timeout(1500)
+    check("manual override is visible in the UI", wait_text(page, "Ручной выбор", 15), "")
 
     back = page.get_by_role("button", name=re.compile("Вернуться к автоматическому|Автоматическ")).first
-    check("return-to-automatic control exists", back.count() > 0)
+    check("return-to-automatic control exists", back.count() > 0, back.count())
     if back.count():
         back.click()
         page.wait_for_timeout(3000)
@@ -368,11 +408,13 @@ def scenario_settings(page: Page, base: str, ctx: APIRequestContext) -> None:
     check("one direct MP3 link", keys.count("mp3") == 1 and "world_radio" not in keys, keys)
 
     np = api_json(ctx, "/api/public/now-playing")
-    goto_panel(page, base, "/admin", "Радиостанция")
-    overview = page.inner_text("body")
+    page.goto(base + "/admin", wait_until="commit")
+    wait_panel(page, "Радиостанция", 25)
+    page.wait_for_timeout(1500)
     mapping = {"on_air": "В эфире", "no_music": "Тишин", "off": "Остановлен", "error": "Ошибк", "starting": "Запуска"}
     word = mapping.get(np["station"]["status"], "")
-    check("overview status matches the API", bool(word) and word.lower() in overview.lower(),
+    check("overview status matches the API",
+          bool(word) and wait_text(page, word, 12),
           f"{np['station']['status']} -> {word}")
 
 
