@@ -160,9 +160,9 @@ def check_stream(url: str, seconds: float) -> None:
         return
     check("stream capture", len(raw) > 20000, f"{len(raw)} bytes in {seconds:.1f}s")
 
-    headers = getattr(capture_stream, "last_headers", {})
-    icy_name = headers.get("icy-name") or headers.get("Ice-Name")
-    icy_br = headers.get("icy-br") or headers.get("Ice-Bitrate")
+    headers = {str(k).lower(): v for k, v in getattr(capture_stream, "last_headers", {}).items()}
+    icy_name = headers.get("icy-name") or headers.get("ice-name")
+    icy_br = headers.get("icy-br") or headers.get("ice-bitrate")
     check("icy headers", bool(icy_name and icy_br), f"name={icy_name!r} br={icy_br!r}")
 
     if not shutil.which("ffmpeg"):
