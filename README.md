@@ -2,8 +2,7 @@
 
 Self-hosted internet radio for a small community: a continuous MP3 stream, a
 public web player and a browser control panel. Built to replace a paid radio
-hosting account with something one person can run on a single VPS. Current
-version: **1.2.0** (see `CHANGELOG.md`).
+hosting account with something one person can run on a single VPS. Current version: **1.2.1** (see `CHANGELOG.md`).
 
 - **Liquidsoap** decodes and encodes the stream, **Icecast** distributes it.
 - **FastAPI + SQLite** owns the library, playlists, rotation, schedule, queue

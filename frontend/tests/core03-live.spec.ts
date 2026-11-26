@@ -37,7 +37,8 @@ test('SSE down keeps polling as a fallback', async ({ page }) => {
   await page.route('**/api/public/events', (route) => route.abort());
   await page.goto('/');
   await expect(page.locator('.public-hero__title')).toBeVisible();
-  await expect(page.locator('.public__footer')).toContainText('обновление опросом');
+  await expect(page.locator('.public__footer')).toContainText('Vanilla Dream Radio');
+  await expect(page.locator('.public__footer')).not.toContainText('обновление опросом');
 });
 
 test('local player shows connecting/reconnecting, can cancel and never changes the global station', async ({

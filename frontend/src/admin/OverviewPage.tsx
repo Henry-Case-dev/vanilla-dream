@@ -190,7 +190,7 @@ function QueueRow({
   );
 }
 
-function HistoryList({ entries, timeZone }: { entries: HistoryEntry[]; timeZone?: string }) {
+function HistoryList({ entries }: { entries: HistoryEntry[] }) {
   if (entries.length === 0) {
     return <EmptyState compact title="История пуста" description="Записи появятся после первых треков в эфире." />;
   }
@@ -204,7 +204,7 @@ function HistoryList({ entries, timeZone }: { entries: HistoryEntry[]; timeZone?
       </li>
       {entries.map((entry, index) => (
         <li key={`${entry.trackId ?? entry.title}-${entry.startedAt ?? index}`} className="history-row">
-          <span className="history-row__time">{formatTime(entry.startedAt, timeZone)}</span>
+          <span className="history-row__time">{formatTime(entry.startedAt)}</span>
           <span className="history-row__title">{entry.title}</span>
           <span className="history-row__artist">{entry.artist ?? '—'}</span>
           <span className="history-row__source">
@@ -442,7 +442,7 @@ export function OverviewPage() {
             <Chip tone="accent">{track ? 'Трек в эфире' : 'Нет трека'}</Chip>
             {station?.bitrate ? <span className="meta-item">{station.bitrate} кбит/с</span> : null}
             {track?.startedAt && (
-              <span className="meta-item">Начало: {formatTime(track.startedAt, timeZone)}</span>
+              <span className="meta-item">Начало: {formatTime(track.startedAt)}</span>
             )}
           </MetaRow>
 
@@ -613,7 +613,7 @@ export function OverviewPage() {
         ) : history.error && !history.data ? (
           <ErrorState message={history.error} onRetry={() => void history.reload()} />
         ) : (
-          <HistoryList entries={history.data ?? []} timeZone={timeZone} />
+          <HistoryList entries={history.data ?? []} />
         )}
       </Panel>
 

@@ -522,7 +522,7 @@ export function SettingsPage() {
                   </span>
                   <span className="service-row__time">
                     {service.lastStart
-                      ? `Последний запуск: ${formatDateTime(service.lastStart, settings.data?.timezone)}`
+                      ? `Последний запуск: ${formatDateTime(service.lastStart)}`
                       : 'Запуск ещё не зафиксирован'}
                   </span>
                   {service.detail && <span className="service-row__detail">{service.detail}</span>}
@@ -539,7 +539,7 @@ export function SettingsPage() {
           <div className="service-engine">
             <span className="muted">Движок</span>
             {settings.data?.engineLastStart ? (
-              <span>Последний запуск: {formatDateTime(settings.data.engineLastStart, settings.data.timezone)}</span>
+              <span>Последний запуск: {formatDateTime(settings.data.engineLastStart)}</span>
             ) : (
               <span className="muted">Запусков ещё не было</span>
             )}

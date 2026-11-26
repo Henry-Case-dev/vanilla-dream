@@ -6,14 +6,13 @@ import { Cover } from '../components/Cover';
 import { StatusPill } from '../components/StatusPill';
 import { LinkList } from '../components/LinkList';
 import { EmptyState, InlineError, LoadingState } from '../components/States';
-import { CopyButton } from '../components/CopyButton';
-import { Equalizer, IconButton, MetaRow, ProgressBar } from '../components/ui';
+import { IconButton, MetaRow, ProgressBar } from '../components/ui';
 import { VolumeControl } from '../components/VolumeControl';
 import { useAudio } from '../lib/audio';
 import { useLive } from '../lib/live';
 import { useResource } from '../lib/hooks';
 import { api, publicLinksFromStation } from '../lib/api';
-import { formatDuration, formatTime, formatUntil, effectiveSourceName } from '../lib/format';
+import { formatDuration, formatTime, formatUntil, effectiveSourceName, pluralRu } from '../lib/format';
 import { describeStationStatus } from '../lib/status';
 
 /**
@@ -21,12 +20,13 @@ import { describeStationStatus } from '../lib/status';
  * Локальное прослушивание не меняет эфир, очередь и службы станции.
  */
 export function PublicPlayerPage() {
-  const { now, loading, error, feed, reload } = useLive();
+  const { now, loading, error, reload } = useLive();
   const audio = useAudio();
-  const history = useResource(() => api.public.history(6), []);
 
   const station = now?.station ?? null;
   const track = now?.track ?? null;
+  const historySignal = now?.historyRevision ?? track?.startedAt ?? null;
+  const history = useResource(() => api.public.history(6), [historySignal]);
   const sourceName = effectiveSourceName(station?.effectiveSource ?? now?.source);
   const statusView = describeStationStatus(station?.status, station?.reason);
 
@@ -61,7 +61,7 @@ export function PublicPlayerPage() {
               : audio.state === 'unavailable'
                 ? 'Поток недоступен'
                 : audio.state === 'playing'
-                  ? 'Играет локально'
+                  ? 'Слушаете эфир'
                   : audio.canPlay
                     ? 'Слушать эфир'
                     : audio.unavailableReason ?? 'Прослушивание недоступно';
@@ -78,17 +78,14 @@ export function PublicPlayerPage() {
     void audio.toggle();
   };
 
+  const playTitle = audio.playing ? 'Остановить прослушивание' : localLabel;
+
   if (loading && !now) {
     return (
       <div className="public">
         <div className="public__glow" aria-hidden="true" />
         <header className="public__top">
           <Logo />
-          <div className="public__top-right">
-            <Link className="public__admin-link" to="/admin">
-              Вход в панель
-            </Link>
-          </div>
         </header>
         <main className="public__main">
           <LoadingState label="Подключаемся к эфиру…" rows={3} />
@@ -103,11 +100,6 @@ export function PublicPlayerPage() {
         <div className="public__glow" aria-hidden="true" />
         <header className="public__top">
           <Logo />
-          <div className="public__top-right">
-            <Link className="public__admin-link" to="/admin">
-              Вход в панель
-            </Link>
-          </div>
         </header>
         <main className="public__main">
           <div className="public__offline">
@@ -135,9 +127,6 @@ export function PublicPlayerPage() {
         <Logo />
         <div className="public__top-right">
           {station && <StatusPill status={station.status} reason={station.reason} />}
-          <Link className="public__admin-link" to="/admin">
-            Вход в панель
-          </Link>
         </div>
       </header>
 
@@ -145,11 +134,6 @@ export function PublicPlayerPage() {
         <section className="public-hero" aria-labelledby="now-title">
           <div className="public-hero__cover">
             <Cover src={track?.coverUrl} alt={track ? `Обложка: ${track.title}` : 'Обложка эфира'} size="hero" rounded="lg" />
-            {audio.playing && (
-              <span className="public-hero__live">
-                <Equalizer /> локально
-              </span>
-            )}
           </div>
 
           <div className="public-hero__info">
@@ -176,7 +160,9 @@ export function PublicPlayerPage() {
               {sourceName && <span className="meta-item">Источник: {sourceName}</span>}
               {station?.bitrate ? <span className="meta-item">{station.bitrate} кбит/с</span> : null}
               {now?.listeners.available ? (
-                <span className="meta-item">{now.listeners.count ?? 0} слушателей</span>
+                <span className="meta-item">
+                  {now.listeners.count ?? 0} {pluralRu(now.listeners.count ?? 0, ['слушатель', 'слушателя', 'слушателей'])}
+                </span>
               ) : (
                 <span className="meta-item meta-item--muted">Статистика слушателей недоступна</span>
               )}
@@ -200,10 +186,10 @@ export function PublicPlayerPage() {
                     : localFailed || audio.state === 'blocked'
                       ? 'Переподключиться к потоку'
                       : audio.playing
-                        ? 'Остановить локальное прослушивание'
+                        ? 'Остановить прослушивание'
                         : 'Слушать эфир'
                 }
-                title={localLabel}
+                title={playTitle}
               >
                 {localBusy ? (
                   <X size={22} />
@@ -221,7 +207,6 @@ export function PublicPlayerPage() {
               </button>
               <div className="public-hero__controls-text">
                 <span className="public-hero__controls-title">{localLabel}</span>
-                <span className="public-hero__controls-sub">Звук только в вашем браузере</span>
               </div>
               <VolumeControl value={audio.volume} onChange={audio.setVolume} disabled={!audio.canPlay} />
             </div>
@@ -244,27 +229,18 @@ export function PublicPlayerPage() {
 
         <section className="public-section" aria-labelledby="links-title">
           <div className="public-section__head">
-            <h2 id="links-title">Слушать в других плеерах</h2>
-            <p>Прямые ссылки для интернет-радиоплееров и совместимых приложений.</p>
+            <h2 id="links-title">Прямые ссылки для интернет-радиоплееров и совместимых приложений</h2>
           </div>
           {links.length > 0 ? (
             <LinkList links={links} />
           ) : (
             <EmptyState compact title="Ссылки недоступны" description="Сервер ещё не сообщил адреса трансляции." />
           )}
-          {station?.baseUrl && (
-            <p className="public-section__footnote">
-              Публичный адрес станции:{' '}
-              <span className="public-section__url">{station.baseUrl}</span>
-              <CopyButton value={station.baseUrl} label="Копировать адрес" />
-            </p>
-          )}
         </section>
 
         <section className="public-section" aria-labelledby="history-title">
           <div className="public-section__head">
             <h2 id="history-title">Недавно в эфире</h2>
-            <p>Последние треки и время выхода.</p>
           </div>
           {history.loading && !history.data ? (
             <LoadingState label="Загружаем историю…" rows={2} />
@@ -287,18 +263,12 @@ export function PublicPlayerPage() {
       </main>
 
       <footer className="public__footer">
-        <span>
-          Vanilla Dream Radio · {feed === 'live' ? 'обновляется автоматически' : 'обновление опросом'}
-        </span>
+        <span>Vanilla Dream Radio</span>
         <span className="public__footer-right">
           <IconButton
             icon={Headphones}
-            label={
-              audio.playing
-                ? 'Остановить локальное прослушивание'
-                : 'Слушать эфир локально'
-            }
-            title="Локальное прослушивание не меняет эфир"
+            label={audio.playing ? 'Остановить прослушивание' : 'Слушать эфир'}
+            title={audio.playing ? 'Остановить прослушивание' : 'Слушать эфир'}
             size="sm"
             className="public__footer-icon"
             onClick={localClick}

@@ -1,7 +1,7 @@
 {
   "name": "vanilla-dream-radio-frontend",
   "private": true,
-  "version": "1.2.0",
+  "version": "1.2.1",
   "type": "module",
   "description": "Vanilla Dream Radio — публичный плеер и панель управления",
   "scripts": {

@@ -555,27 +555,29 @@ function nowPlaying(req) {
 }
 
 function historyPayload() {
+  const current = byId.get(state.currentTrackId) ?? byId.get('t1');
+  const previous = byId.get('t3');
   return {
     items: [
       {
-        id: '1',
-        track_id: 't1',
-        title: byId.get('t1').title,
-        artist: byId.get('t1').artist,
-        album: byId.get('t1').album,
-        started_at: nowIso(-96000),
+        id: `current-${state.historyRevision}`,
+        track_id: current.id,
+        title: current.title,
+        artist: current.artist,
+        album: current.album,
+        started_at: state.startedAt,
         ended_at: null,
         source_kind: 'library',
         source_ref: 'library',
       },
       {
-        id: '2',
-        track_id: 't2',
-        title: byId.get('t2').title,
-        artist: byId.get('t2').artist,
-        album: byId.get('t2').album,
-        started_at: nowIso(-300000),
-        ended_at: nowIso(-96000),
+        id: 'previous-1',
+        track_id: previous.id,
+        title: previous.title,
+        artist: previous.artist,
+        album: previous.album,
+        started_at: '2026-11-26T03:00:00Z',
+        ended_at: '2026-11-26T03:03:00Z',
         source_kind: 'library',
         source_ref: 'library',
       },

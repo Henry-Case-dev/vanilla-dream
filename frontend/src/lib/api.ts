@@ -1070,9 +1070,6 @@ export function normalizeLinks(raw: unknown): RadioLink[] {
   return list.map(normalizeLink);
 }
 
-const PUBLIC_STREAM_DESCRIPTION =
-  'Прямая ссылка на аудиопоток для интернет-радиоплееров и совместимых приложений.';
-
 /** Публичная страница не имеет доступа к admin-эндпоинту ссылок: собирает
  * ссылки только из публичного now-playing. */
 export function publicLinksFromStation(station: NowStation): RadioLink[] {
@@ -1082,7 +1079,7 @@ export function publicLinksFromStation(station: NowStation): RadioLink[] {
       key: 'mp3',
       label: LINK_LABELS.mp3 ?? 'Прямой MP3',
       url: station.streamUrl,
-      description: PUBLIC_STREAM_DESCRIPTION,
+      description: null,
       primary: true,
     });
   }
