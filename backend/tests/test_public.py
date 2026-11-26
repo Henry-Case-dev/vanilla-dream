@@ -73,7 +73,7 @@ def test_now_playing_shape(env, admin):
     assert track["duration"] > 0
     assert 0.0 < track["progress"] <= 1.0
     assert 0.0 <= track["elapsed"] <= track["duration"]
-    assert track["cover_url"].endswith(f"/api/public/cover/{first['id']}")
+    assert track["cover_url"].split("?")[0].endswith(f"/api/public/cover/{first['id']}")
     assert track["started_at"]
 
     assert payload["source"]["kind"] == "playlist"

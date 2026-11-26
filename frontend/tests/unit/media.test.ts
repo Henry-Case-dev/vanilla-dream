@@ -156,7 +156,7 @@ describe('upload batch', () => {
     expect(result.id).toBe('b3');
     expect(result.status).toBe('pending');
     expect(result.total).toBe(3);
-    expect(result.counts).toEqual({ added: 1, pending: 1, skipped: 0, errors: 1 });
+    expect(result.counts).toEqual({ added: 1, replaced: 0, pending: 1, skipped: 0, errors: 1 });
     expect(result.items.map((item) => item.state)).toEqual(['added', 'pending', 'error']);
     expect(result.items[1]?.reason).toBe('tags');
     expect(result.items[1]?.matches).toHaveLength(1);
@@ -182,6 +182,81 @@ describe('upload batch', () => {
       }),
     ).toThrow(PayloadError);
     expect(() => normalizeUploadBatch({ batch: { id: 'b' } })).toThrow(PayloadError);
+  });
+
+  it('reads MEDIA-03 replace fields and falls back to the match list for older payloads', () => {
+    const candidate = {
+      id: 't1',
+      title: 'Ночной трамвай',
+      artist: 'Vanilla Dream',
+      album: 'Ночные волны',
+      duration: 238,
+      size: 9520000,
+      bitrate: 320,
+      cover_url: '/mock-cover.svg',
+      is_duplicate: true,
+    };
+    const result = normalizeUploadBatch({
+      batch: {
+        id: 'b4',
+        status: 'pending',
+        total: 1,
+        counts: { added: 0, replaced: 0, pending: 1, skipped: 0, errors: 0 },
+        items: [
+          {
+            ...pendingPayload,
+            filename: 'копия.mp3',
+            size: 9520000,
+            state: 'pending',
+            can_replace: true,
+            identical: false,
+            replace_target: candidate,
+            replace_candidates: [candidate, { ...candidate, id: 't3', title: 'Другое' }],
+            decision_target: null,
+          },
+        ],
+      },
+    });
+    const item = result.items[0];
+    expect(item?.canReplace).toBe(true);
+    expect(item?.identical).toBe(false);
+    expect(item?.replaceTarget?.id).toBe('t1');
+    expect(item?.replaceCandidates.map((entry) => entry.id)).toEqual(['t1', 't3']);
+    expect(item?.replaceCandidates[0]?.isDuplicate).toBe(true);
+
+    const legacy = normalizeUploadBatch({
+      batch: {
+        id: 'b5',
+        status: 'pending',
+        total: 1,
+        counts: { added: 0, pending: 1, skipped: 0, errors: 0 },
+        items: [{ ...pendingPayload, filename: 'старое.mp3', state: 'pending' }],
+      },
+    });
+    expect(legacy.counts.replaced).toBe(0);
+    expect(legacy.items[0]?.replaceCandidates.map((entry) => entry.id)).toEqual(['t1']);
+    expect(legacy.items[0]?.canReplace).toBe(true);
+    expect(legacy.items[0]?.identical).toBe(false);
+
+    const deletedTarget = normalizeUploadBatch({
+      batch: {
+        id: 'b6',
+        status: 'pending',
+        total: 1,
+        counts: { added: 0, pending: 1, skipped: 0, errors: 0 },
+        items: [
+          {
+            ...pendingPayload,
+            filename: 'удалённая цель.mp3',
+            state: 'pending',
+            can_replace: false,
+            replace_candidates: [],
+          },
+        ],
+      },
+    });
+    expect(deletedTarget.items[0]?.replaceCandidates).toEqual([]);
+    expect(deletedTarget.items[0]?.canReplace).toBe(false);
   });
 });
 

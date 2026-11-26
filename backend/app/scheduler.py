@@ -282,6 +282,7 @@ class SchedulerLoop:
             purge_expired_sessions(conn, now)
             uploads.cleanup_pending(conn, self.settings, now)
             exports.cleanup_exports(conn, self.settings, now)
+            media.cleanup_retained_files(conn, self.settings)
             queue_engine.deactivate_expired_overrides(conn, now)
             queue_engine.apply_pending_if_due(conn, self.settings, now)
             stats = self.icecast.stats() if self.icecast is not None else {"available": False}

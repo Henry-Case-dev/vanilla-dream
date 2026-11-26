@@ -2459,13 +2459,18 @@ def handle_track_start(
         ),
     )
     bump_history_revision(conn)
+    snapshot_duration = (
+        float(track["duration"])
+        if track is not None and track["duration"] is not None
+        else None
+    )
     conn.execute(
         "INSERT INTO playback_state(singleton, position_id, track_id, started_at, source_kind, "
-        "source_ref, updated_at) VALUES(1, ?, ?, ?, ?, ?, ?) "
+        "source_ref, updated_at, duration) VALUES(1, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(singleton) DO UPDATE SET position_id = excluded.position_id, "
         "track_id = excluded.track_id, started_at = excluded.started_at, "
         "source_kind = excluded.source_kind, source_ref = excluded.source_ref, "
-        "updated_at = excluded.updated_at",
+        "updated_at = excluded.updated_at, duration = excluded.duration",
         (
             position_id,
             position["track_id"],
@@ -2473,6 +2478,7 @@ def handle_track_start(
             position["source_kind"],
             position["source_ref"],
             stamp,
+            snapshot_duration,
         ),
     )
     conn.execute(
@@ -2551,7 +2557,12 @@ def queue_snapshot(conn: sqlite3.Connection, settings: Settings, now: datetime) 
         if track is not None:
             started = parse_iso(state["started_at"])
             elapsed = max(0.0, (now - started).total_seconds()) if started else 0.0
-            duration = float(track["duration"] or 0.0)
+            snapshot_duration = state["duration"]
+            duration = (
+                float(snapshot_duration)
+                if snapshot_duration is not None
+                else float(track["duration"] or 0.0)
+            )
             remaining_current = max(0.0, duration - elapsed) if duration else 0.0
             current = {
                 "id": state["position_id"],
@@ -2599,7 +2610,12 @@ def playback_payload(conn: sqlite3.Connection, settings: Settings, now: datetime
         return None
     started = parse_iso(state["started_at"])
     elapsed = max(0.0, (now - started).total_seconds()) if started else 0.0
-    duration = float(track["duration"] or 0.0)
+    snapshot_duration = state["duration"]
+    duration = (
+        float(snapshot_duration)
+        if snapshot_duration is not None
+        else float(track["duration"] or 0.0)
+    )
     return {
         "track": track_payload(track, settings),
         "source": source_payload(conn, state["source_kind"], state["source_ref"]),

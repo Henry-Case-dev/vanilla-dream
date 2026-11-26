@@ -28,7 +28,16 @@ CREATE TABLE IF NOT EXISTS tracks (
     play_count INTEGER DEFAULT 0,
     pending_delete INTEGER DEFAULT 0,
     created_at TEXT,
-    updated_at TEXT
+    updated_at TEXT,
+    replaced_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS retained_files (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    track_id TEXT,
+    path TEXT NOT NULL,
+    reason TEXT,
+    created_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS upload_batches (
@@ -56,7 +65,10 @@ CREATE TABLE IF NOT EXISTS pending_uploads (
     state TEXT NOT NULL DEFAULT 'pending',
     decision TEXT,
     created_at TEXT,
-    updated_at TEXT
+    updated_at TEXT,
+    match_sha TEXT,
+    decision_target TEXT,
+    decision_result TEXT
 );
 
 CREATE TABLE IF NOT EXISTS export_jobs (
@@ -119,7 +131,8 @@ CREATE TABLE IF NOT EXISTS playback_state (
     started_at TEXT,
     source_kind TEXT,
     source_ref TEXT,
-    updated_at TEXT
+    updated_at TEXT,
+    duration REAL
 );
 
 CREATE TABLE IF NOT EXISTS history (
@@ -221,3 +234,4 @@ CREATE INDEX IF NOT EXISTS idx_playlist_tracks_order ON playlist_tracks(playlist
 CREATE INDEX IF NOT EXISTS idx_queue_positions_state_seq ON queue_positions(state, seq);
 CREATE INDEX IF NOT EXISTS idx_history_started_at ON history(started_at);
 CREATE INDEX IF NOT EXISTS idx_events_at ON events(at);
+CREATE INDEX IF NOT EXISTS idx_retained_files_track ON retained_files(track_id);

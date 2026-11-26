@@ -1268,7 +1268,7 @@ def test_migration_110_converts_old_playlist_override(settings):
         assert db.get_setting(conn, "state_revision") == "0"
     finally:
         conn.close()
-    assert version == 4
+    assert version == db.SCHEMA_VERSION == 5
     assert mode == "playlist"
     assert selected == "old-program"
     assert launch["active"] == 0

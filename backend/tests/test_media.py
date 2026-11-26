@@ -40,7 +40,7 @@ def test_upload_extracts_tags_and_cover(env, admin):
     assert 0.5 < track["duration"] < 2.0
     assert track["bitrate"] == 128
     assert track["size"] > 0
-    assert track["cover_url"].endswith(f"/api/public/cover/{track['id']}")
+    assert track["cover_url"].split("?")[0].endswith(f"/api/public/cover/{track['id']}")
 
     stored = db.open_db(env.settings)
     try:

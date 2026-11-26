@@ -35,6 +35,23 @@ for frequency in "${frequencies[@]}"; do
     -metadata title="Tone $index" -metadata artist="E2E" -metadata album="Core03" \
     "$ROOT/fixtures/tone-$index.mp3"
 done
+
+# Replacement versions: same tags, a different frequency, bitrate and duration so
+# an actual file switch is observable by duration/bitrate and by ear.
+for index in 1 2 3 4; do
+  frequency=$((frequencies[index - 1] + 55))
+  ffmpeg -loglevel error -y -f lavfi -i "sine=frequency=$frequency:duration=18" \
+    -ac 2 -ar 44100 -b:a 96k \
+    -metadata title="Tone $index" -metadata artist="E2E" -metadata album="Core03" \
+    "$ROOT/fixtures/tone-$index-v2.mp3"
+done
+for index in 1 2; do
+  frequency=$((frequencies[index - 1] + 110))
+  ffmpeg -loglevel error -y -f lavfi -i "sine=frequency=$frequency:duration=20" \
+    -ac 2 -ar 44100 -b:a 112k \
+    -metadata title="Tone $index" -metadata artist="E2E" -metadata album="Core03" \
+    "$ROOT/fixtures/tone-$index-v3.mp3"
+done
 ls "$ROOT/fixtures"
 
 log "Icecast config"

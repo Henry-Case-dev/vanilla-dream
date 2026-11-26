@@ -2260,6 +2260,10 @@
   color: var(--danger);
 }
 
+.upload-footer__count.is-accent {
+  color: var(--accent-hover);
+}
+
 .upload-footer__actions {
   display: flex;
   align-items: center;
@@ -2501,6 +2505,248 @@
   justify-content: space-between;
   flex-wrap: wrap;
 }
+
+.decisions-bulk__notice {
+  margin: -4px 0 10px;
+  font-size: 11.5px;
+  color: var(--text-secondary);
+  line-height: 1.45;
+}
+
+.decisions-footer__counts .is-accent {
+  color: var(--accent-hover);
+}
+
+.decision--replace {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+}
+
+.decision__reason {
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--text-muted);
+  line-height: 1.45;
+}
+
+.decision__replace {
+  display: grid;
+  gap: 7px;
+  padding: 9px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px dashed var(--accent-line);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.decision__note {
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+
+.decision__note-playing {
+  color: var(--accent-hover);
+}
+
+.decision__target-current {
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+.decision__targets {
+  display: grid;
+  gap: 5px;
+}
+
+.decision__targets-label {
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  font-weight: 600;
+}
+
+.target-option {
+  display: grid;
+  grid-template-columns: 18px 32px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-soft);
+  background: rgba(255, 255, 255, 0.015);
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background-color 0.15s ease;
+}
+
+.target-option:hover:not(:disabled) {
+  border-color: var(--border);
+  background: rgba(255, 255, 255, 0.035);
+}
+
+.target-option.is-selected {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+}
+
+.target-option:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.target-option__check {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  color: var(--accent-hover);
+}
+
+.target-option__check.is-on {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+}
+
+.target-option__text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 1px;
+}
+
+.target-option__title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--text-primary);
+}
+
+.target-option__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.target-option__sub,
+.target-option__meta {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10.5px;
+  color: var(--text-muted);
+}
+
+.decision__outcome {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 7px 9px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.02);
+  font-size: 11.5px;
+  color: var(--text-secondary);
+  line-height: 1.45;
+}
+
+.decision__outcome--failed,
+.decision__outcome--conflict {
+  border-color: rgba(229, 139, 158, 0.35);
+  color: #f2a9b8;
+}
+
+.decision__outcome--stale {
+  border-color: rgba(224, 184, 106, 0.4);
+  color: #e6c98d;
+}
+
+.decision__outcome--identical {
+  border-color: var(--border);
+  color: var(--text-muted);
+}
+
+.decision__outcome-text {
+  flex: 1;
+  min-width: 160px;
+}
+
+.decisions-result {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 12px;
+  padding: 9px 11px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-soft);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.decisions-result__counts {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  font-size: 11.5px;
+  color: var(--text-secondary);
+}
+
+.decisions-result__counts .is-ok {
+  color: var(--success);
+}
+
+.decisions-result__counts .is-accent {
+  color: var(--accent-hover);
+}
+
+.decisions-result__counts .is-muted {
+  color: var(--text-muted);
+}
+
+.decisions-result__errors {
+  display: grid;
+  gap: 2px;
+  font-size: 11px;
+  color: #f2a9b8;
+  line-height: 1.45;
+}
+
+@media (max-width: 560px) {
+  .decision__actions .btn {
+    flex: 1 1 auto;
+    justify-content: center;
+  }
+
+  .target-option {
+    grid-template-columns: 18px 28px minmax(0, 1fr);
+  }
+
+  .decision__outcome {
+    align-items: flex-start;
+  }
+
+  /* На узком экране прокручивается весь диалог, а не вложенный список. */
+  .decisions-list {
+    max-height: none;
+    overflow: visible;
+    scroll-snap-type: none;
+    -webkit-mask-image: none;
+    mask-image: none;
+    padding-bottom: 0;
+  }
+}
+
+
 
 /* Редактор трека */
 

@@ -406,7 +406,7 @@ export interface ConflictInfo {
 /* Загрузка музыки (VD-RADIO-MEDIA-02)                                 */
 /* ------------------------------------------------------------------ */
 
-export type DecisionAction = 'save' | 'skip';
+export type DecisionAction = 'save' | 'skip' | 'replace';
 
 /** Поля сравнения «В медиатеке» / «Новый файл». */
 export interface TrackComparison {
@@ -418,6 +418,47 @@ export interface TrackComparison {
   size: number | null;
   bitrate: number | null;
   coverUrl: string | null;
+}
+
+/** Существующий трек — кандидат на замену файла (MEDIA-03). */
+export interface ReplaceCandidate extends Omit<TrackComparison, 'id'> {
+  id: string;
+  isDuplicate: boolean;
+}
+
+/** Разобранный ответ одиночного решения replace. */
+export interface ReplaceDecisionResult {
+  status: 'replaced' | 'identical' | 'stale' | 'failed';
+  replaced: boolean;
+  identical: boolean;
+  trackId: string | null;
+  track: Track | null;
+  engineSynced: boolean;
+  error: string | null;
+  application: ApplicationState | null;
+  stateRevision: number | null;
+  appliedRevision: number | null;
+}
+
+/** Per-item outcome of the batch replace endpoint. */
+export interface ReplaceBatchItem {
+  id: string;
+  status: string;
+  trackId: string | null;
+  error: string | null;
+}
+
+export interface ReplaceBatchResult {
+  replaced: number;
+  skipped: number;
+  failed: number;
+  conflicts: number;
+  identical: number;
+  items: ReplaceBatchItem[];
+  application: ApplicationState | null;
+  engineSynced: boolean;
+  stateRevision: number | null;
+  appliedRevision: number | null;
 }
 
 export interface PendingMatch {
@@ -440,6 +481,7 @@ export type UploadItemState =
   | 'added'
   | 'pending'
   | 'saved'
+  | 'replaced'
   | 'skipped'
   | 'cancelled'
   | 'error';
@@ -453,11 +495,17 @@ export interface UploadBatchItem {
   metadata: TrackComparison | null;
   matches: PendingMatch[];
   decision: DecisionAction | null;
+  decisionTarget: string | null;
   error: string | null;
+  canReplace: boolean;
+  identical: boolean;
+  replaceTarget: ReplaceCandidate | null;
+  replaceCandidates: ReplaceCandidate[];
 }
 
 export interface UploadBatchCounts {
   added: number;
+  replaced: number;
   pending: number;
   skipped: number;
   errors: number;

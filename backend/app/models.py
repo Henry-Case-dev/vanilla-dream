@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from typing import Any
+from urllib.parse import quote
 
 from .config import (
     SYSTEM_PLAYLIST_DESCRIPTION,
@@ -40,6 +42,46 @@ def _value(row: sqlite3.Row | dict[str, Any], key: str, default: Any = None) -> 
     if isinstance(row, sqlite3.Row):
         return row[key] if key in row.keys() else default
     return row.get(key, default)
+
+
+def cover_version(row: sqlite3.Row | dict[str, Any]) -> str | None:
+    """Cache-busting version for the public track cover URL.
+
+    The cover endpoint is cached for 300 s, so a replaced or edited cover must
+    get a new URL. Both timestamps use the same ISO format; the newest wins.
+    The effective cover file name is folded in as a short token, so a new image
+    also busts the cache even when two changes share one timestamp (or a mocked
+    clock is frozen). Without any timestamp the plain URL is kept.
+    """
+
+    candidates = [
+        str(value)
+        for value in (_value(row, "updated_at"), _value(row, "replaced_at"))
+        if value
+    ]
+    if not candidates:
+        return None
+    stamp = max(candidates)
+    cover_name = _value(row, "custom_cover_path") or _value(row, "cover_path")
+    if cover_name:
+        token = hashlib.sha256(str(cover_name).encode("utf-8")).hexdigest()[:8]
+        return f"{stamp}-{token}"
+    return stamp
+
+
+def public_cover_url(
+    settings: Settings,
+    track_id,
+    row: sqlite3.Row | dict[str, Any],
+    *,
+    base: str | None = None,
+) -> str:
+    root = (base or settings.public_base_url or "").rstrip("/")
+    url = f"{root}/api/public/cover/{track_id}"
+    version = cover_version(row)
+    if version:
+        url += "?v=" + quote(version, safe="")
+    return url
 
 
 def playlist_membership_counts(
@@ -79,9 +121,7 @@ def track_payload(
     else:
         cover_kind = "none"
     cover_url = (
-        f"{settings.public_base_url}/api/public/cover/{track_id}"
-        if effective_cover
-        else None
+        public_cover_url(settings, track_id, row) if effective_cover else None
     )
     original_cover_url = (
         f"{settings.public_base_url}/api/public/cover/{track_id}?source=original"
@@ -113,6 +153,7 @@ def track_payload(
         "pending_delete": bool(_value(row, "pending_delete", 0)),
         "created_at": _value(row, "created_at"),
         "updated_at": _value(row, "updated_at"),
+        "replaced_at": _value(row, "replaced_at"),
         "stream_url": f"/api/admin/tracks/{track_id}/stream",
     }
     if original_cover_url:

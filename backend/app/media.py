@@ -447,6 +447,95 @@ def _export_protects_track(conn: sqlite3.Connection, track_id: str) -> bool:
         return False
 
 
+def _export_protects_path(conn: sqlite3.Connection, path: Path) -> bool:
+    try:
+        from . import exports
+
+        return exports.path_is_exported(conn, path)
+    except Exception:  # noqa: BLE001 - protection is best effort, never destructive
+        LOGGER.warning("failed to check export path protection for %s", path, exc_info=True)
+        return True
+
+
+def retained_path(settings: Settings, stored) -> Path | None:
+    if not stored:
+        return None
+    path = Path(str(stored))
+    if not path.is_absolute():
+        path = settings.music_dir / path
+    return path
+
+
+def _queue_link_targets(settings: Settings) -> set[Path]:
+    """Absolute targets still referenced by the engine queue symlinks."""
+
+    targets: set[Path] = set()
+    link_dir = Path(settings.queue_link_dir)
+    try:
+        entries = list(link_dir.glob("*.mp3"))
+    except OSError:
+        return targets
+    for entry in entries:
+        try:
+            if entry.is_symlink():
+                targets.add(Path(os.readlink(entry)).resolve())
+        except OSError:
+            continue
+    return targets
+
+
+def cleanup_retained_files(conn: sqlite3.Connection, settings: Settings) -> int:
+    """Delete replaced files once every consumer released them.
+
+    Safe by construction: a failed unlink keeps the row for the next pass, the
+    row is removed only after the file is gone, and an unresolved engine sync
+    or an active export snapshot blocks deletion entirely.
+    """
+
+    rows = conn.execute(
+        "SELECT * FROM retained_files ORDER BY id ASC"
+    ).fetchall()
+    if not rows:
+        return 0
+    if queue_sync_unresolved(conn):
+        return 0
+    links = _queue_link_targets(settings)
+    removed = 0
+    for row in rows:
+        path = retained_path(settings, row["path"])
+        if path is None:
+            conn.execute("DELETE FROM retained_files WHERE id = ?", (row["id"],))
+            continue
+        if not is_relative_to(path, settings.music_dir):
+            # Never delete outside the library; drop only the bookkeeping row.
+            LOGGER.warning("retained file outside the library: %s", path)
+            conn.execute("DELETE FROM retained_files WHERE id = ?", (row["id"],))
+            continue
+        try:
+            resolved = path.resolve()
+        except OSError:
+            resolved = path
+        if resolved in links:
+            continue
+        if conn.execute(
+            "SELECT 1 FROM tracks WHERE path = ? LIMIT 1", (str(row["path"]),)
+        ).fetchone() is not None:
+            # Defensive: a retained path that some track still uses is never
+            # deleted, even if the bookkeeping row is wrong.
+            continue
+        if _export_protects_path(conn, path):
+            continue
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            LOGGER.warning("failed to delete retained file %s", path, exc_info=True)
+            continue
+        conn.execute("DELETE FROM retained_files WHERE id = ?", (row["id"],))
+        removed += 1
+    conn.commit()
+    return removed
+
+
 def purge_track(conn: sqlite3.Connection, settings: Settings, track_id: str) -> bool:
     """Delete the physical file first; keep the row when deletion fails."""
 
@@ -499,6 +588,25 @@ def purge_track(conn: sqlite3.Connection, settings: Settings, track_id: str) -> 
                 LOGGER.warning("failed to delete cover %s", cover_file, exc_info=True)
     if "custom_cover_path" in row.keys():
         remove_custom_cover(settings, row["custom_cover_path"])
+    for retained in conn.execute(
+        "SELECT id, path FROM retained_files WHERE track_id = ?", (track_id,)
+    ).fetchall():
+        retained_file = retained_path(settings, retained["path"])
+        if retained_file is not None and is_relative_to(retained_file, settings.music_dir):
+            if conn.execute(
+                "SELECT 1 FROM tracks WHERE path = ? AND id <> ? LIMIT 1",
+                (str(retained["path"]), track_id),
+            ).fetchone() is not None:
+                conn.execute(
+                    "DELETE FROM retained_files WHERE id = ?", (retained["id"],)
+                )
+                continue
+            try:
+                retained_file.unlink(missing_ok=True)
+            except OSError:
+                # Keep the row so the shared cleanup pass retries the unlink.
+                continue
+        conn.execute("DELETE FROM retained_files WHERE id = ?", (retained["id"],))
     conn.execute("DELETE FROM playlist_tracks WHERE track_id = ?", (track_id,))
     if conn.execute(
         "DELETE FROM queue_positions WHERE track_id = ?", (track_id,)

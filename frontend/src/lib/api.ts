@@ -34,6 +34,10 @@ import type {
   QueueSnapshot,
   RadioLink,
   RemoveTrackResult,
+  ReplaceBatchItem,
+  ReplaceBatchResult,
+  ReplaceCandidate,
+  ReplaceDecisionResult,
   Rotation,
   RotationItem,
   RotationMode,
@@ -634,7 +638,7 @@ function normalizePendingMatches(raw: unknown, fallback: DuplicateKind | null): 
 }
 
 function normalizeDecision(value: unknown): DecisionAction | null {
-  return value === 'save' || value === 'skip' ? value : null;
+  return value === 'save' || value === 'skip' || value === 'replace' ? value : null;
 }
 
 function normalizePendingUpload(raw: unknown): PendingUpload {
@@ -666,6 +670,7 @@ const ITEM_STATE_ALIASES: Record<string, UploadItemState> = {
   needs_decision: 'pending',
   saved: 'saved',
   duplicate: 'saved',
+  replaced: 'replaced',
   skipped: 'skipped',
   cancelled: 'cancelled',
   canceled: 'cancelled',
@@ -708,10 +713,51 @@ function normalizeBatchCounts(raw: unknown): UploadBatchCounts {
   const data = requireObject(raw, 'счётчики загрузки');
   return {
     added: requireNumber(data.added, 'added загрузки'),
+    replaced: asNumber(data.replaced) ?? 0,
     pending: requireNumber(data.pending, 'pending загрузки'),
     skipped: requireNumber(data.skipped, 'skipped загрузки'),
     errors: requireNumber(data.errors, 'errors загрузки'),
   };
+}
+
+function normalizeReplaceCandidate(raw: unknown): ReplaceCandidate | null {
+  if (!isObject(raw)) return null;
+  const source = isObject(raw.track) ? raw.track : raw;
+  const id = asStringOrNull(source.id);
+  if (!id) return null;
+  return {
+    id,
+    title: asStringOrNull(source.title),
+    artist: asStringOrNull(source.artist),
+    album: asStringOrNull(source.album),
+    duration: asNumber(source.duration),
+    size: asNumber(source.size),
+    bitrate: asNumber(source.bitrate),
+    coverUrl: asStringOrNull(source.cover_url ?? source.coverUrl),
+    isDuplicate: asBoolean(source.is_duplicate ?? source.isDuplicate),
+  };
+}
+
+function normalizeReplaceCandidates(raw: unknown, matches: PendingMatch[]): ReplaceCandidate[] {
+  if (Array.isArray(raw)) {
+    return raw
+      .map(normalizeReplaceCandidate)
+      .filter((candidate): candidate is ReplaceCandidate => candidate !== null);
+  }
+  // Совместимость со старым ответом без MEDIA-03: цели берём из совпадений.
+  return matches
+    .filter((match) => match.track.id !== null)
+    .map((match) => ({
+      id: match.track.id as string,
+      title: match.track.title,
+      artist: match.track.artist,
+      album: match.track.album,
+      duration: match.track.duration,
+      size: match.track.size,
+      bitrate: match.track.bitrate,
+      coverUrl: match.track.coverUrl,
+      isDuplicate: false,
+    }));
 }
 
 function normalizeBatchItem(raw: unknown, fallback: DuplicateKind | null): UploadBatchItem {
@@ -720,6 +766,14 @@ function normalizeBatchItem(raw: unknown, fallback: DuplicateKind | null): Uploa
   const state = normalizeItemState(data.state);
   const reason = normalizeDuplicateKind(data.reason) ?? fallback;
   const metadataRaw = data.metadata;
+  const matches = normalizePendingMatches(data.matches, reason);
+  const identical = asBoolean(data.identical);
+  const replaceCandidates = normalizeReplaceCandidates(data.replace_candidates, matches);
+  const canReplace =
+    data.can_replace === undefined
+      ? replaceCandidates.length > 0 && !identical
+      : asBoolean(data.can_replace);
+  const targetRaw = data.replace_target;
   return {
     id,
     filename: requireString(data.filename, 'имя файла загрузки'),
@@ -730,9 +784,15 @@ function normalizeBatchItem(raw: unknown, fallback: DuplicateKind | null): Uploa
       metadataRaw === undefined || metadataRaw === null
         ? null
         : normalizeComparison(metadataRaw, 'метаданные файла загрузки'),
-    matches: normalizePendingMatches(data.matches, reason),
+    matches,
     decision: normalizeDecision(data.decision),
+    decisionTarget: asStringOrNull(data.decision_target),
     error: asStringOrNull(data.error),
+    canReplace,
+    identical,
+    replaceTarget:
+      targetRaw === undefined || targetRaw === null ? null : normalizeReplaceCandidate(targetRaw),
+    replaceCandidates,
   };
 }
 
@@ -1283,11 +1343,71 @@ async function uploadBatchGet(batchId: string): Promise<UploadBatch> {
   return normalizeUploadBatch(raw);
 }
 
-async function uploadDecide(pendingId: string, action: DecisionAction): Promise<void> {
-  await request<unknown>(`/api/admin/uploads/${encodeURIComponent(pendingId)}/decide`, {
+function normalizeReplaceDecision(raw: unknown): ReplaceDecisionResult | null {
+  if (!isObject(raw)) return null;
+  const status = asString(raw.status);
+  if (
+    status !== 'replaced' &&
+    status !== 'identical' &&
+    status !== 'stale' &&
+    status !== 'failed'
+  ) {
+    return null;
+  }
+  return {
+    status,
+    replaced: asBoolean(raw.replaced),
+    identical: asBoolean(raw.identical) || status === 'identical',
+    trackId: asStringOrNull(raw.track_id),
+    track: normalizeTrack(raw.track),
+    engineSynced: asBoolean(raw.engine_synced),
+    error: asStringOrNull(raw.error),
+    application: 'application' in raw ? normalizeApplication(raw.application) : null,
+    stateRevision: asNumber(raw.state_revision),
+    appliedRevision: asNumber(raw.applied_revision),
+  };
+}
+
+function normalizeReplaceBatchItem(raw: unknown): ReplaceBatchItem | null {
+  if (!isObject(raw)) return null;
+  const id = asStringOrNull(raw.id);
+  if (!id) return null;
+  return {
+    id,
+    status: asStringOrNull(raw.status) ?? 'failed',
+    trackId: asStringOrNull(raw.track_id),
+    error: asStringOrNull(raw.error),
+  };
+}
+
+function normalizeReplaceBatchResult(raw: unknown): ReplaceBatchResult {
+  const data = requireObject(raw, 'результат массовой замены');
+  return {
+    replaced: asNumber(data.replaced) ?? 0,
+    skipped: asNumber(data.skipped) ?? 0,
+    failed: asNumber(data.failed) ?? 0,
+    conflicts: asNumber(data.conflicts) ?? 0,
+    identical: asNumber(data.identical) ?? 0,
+    items: asArray(data.items)
+      .map(normalizeReplaceBatchItem)
+      .filter((item): item is ReplaceBatchItem => item !== null),
+    application: 'application' in data ? normalizeApplication(data.application) : null,
+    engineSynced: asBoolean(data.engine_synced),
+    stateRevision: asNumber(data.state_revision),
+    appliedRevision: asNumber(data.applied_revision),
+  };
+}
+
+async function uploadDecide(
+  pendingId: string,
+  action: DecisionAction,
+  trackId?: string | null,
+): Promise<ReplaceDecisionResult | null> {
+  const raw = await request<unknown>(`/api/admin/uploads/${encodeURIComponent(pendingId)}/decide`, {
     method: 'POST',
-    body: { action },
+    body: trackId ? { action, track_id: trackId } : { action },
   });
+  return action === 'replace' ? normalizeReplaceDecision(raw) : null;
 }
 
 async function uploadDecideBatch(
@@ -1295,11 +1415,15 @@ async function uploadDecideBatch(
   action: DecisionAction,
   scope: 'all' | 'search' = 'all',
   query = '',
-): Promise<void> {
-  await request<unknown>(`/api/admin/uploads/batch/${encodeURIComponent(batchId)}/decide`, {
-    method: 'POST',
-    body: { action, scope, query },
-  });
+): Promise<ReplaceBatchResult | null> {
+  const raw = await request<unknown>(
+    `/api/admin/uploads/batch/${encodeURIComponent(batchId)}/decide`,
+    {
+      method: 'POST',
+      body: { action, scope, query },
+    },
+  );
+  return action === 'replace' ? normalizeReplaceBatchResult(raw) : null;
 }
 
 async function uploadCancelBatch(batchId: string): Promise<void> {

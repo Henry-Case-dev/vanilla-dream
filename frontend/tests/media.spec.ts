@@ -106,6 +106,11 @@ test('upload dialog shows per-file states, filters, decisions apply only to unde
   const apply = decisions.getByRole('button', { name: 'Применить решения' });
   await expect(apply).toBeEnabled();
   await apply.click();
+  await expect(decisions.locator('.decisions-result')).toContainText('Добавлено: 1');
+  await expect(decisions.locator('.decisions-result')).toContainText('Пропущено: 2');
+  // Диалог не закрывается сам: итог виден, загрузку открываем вручную.
+  await expect(decisions).toBeVisible();
+  await decisions.getByRole('button', { name: 'Назад к загрузке' }).first().click();
   await expect(decisions).toBeHidden();
   await expect(upload).toBeVisible();
 

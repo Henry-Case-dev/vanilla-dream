@@ -26,6 +26,7 @@ from .models import (
     minutes_to_hhmm,
     playlist_membership_counts,
     playlist_payload,
+    public_cover_url,
     schedule_rule_payload,
     source_payload,
     track_payload,
@@ -95,6 +96,45 @@ def _library_membership_changed(request: Request, conn, now) -> str:
     synced = _sync(request, conn)
     request.app.state.scheduler.wake()
     return "applied" if synced else "pending"
+
+
+def _replace_application(request: Request, conn, changed: bool) -> dict:
+    """Rebuild the queue and force one sync after replacing audio files.
+
+    The replace can affect any source, so this is not limited to the library
+    playlist. When the station is stopped nothing has to be confirmed: the
+    on-disk queue is authoritative and the next start refreshes every link.
+    """
+
+    now = request.app.state.clock.now()
+    if changed:
+        queue_engine.bump_state_revision(conn)
+        queue_engine.bump_queue_revision(conn)
+        conn.commit()
+        queue_engine.ensure_queue(conn, request.app.state.settings, now)
+        conn.commit()
+    if not changed or request.app.state.station.desired(conn) != "playing":
+        synced = True
+    else:
+        synced = queue_engine.sync_engine(
+            conn,
+            request.app.state.settings,
+            request.app.state.engine,
+            now=now,
+            force=True,
+            sync_state=getattr(request.app.state, "sync_state", None),
+        )
+    request.app.state.scheduler.wake()
+    if not changed or request.app.state.station.desired(conn) != "playing":
+        application = "saved"
+    else:
+        application = "applied" if synced else "pending"
+    return {
+        "application": application,
+        "engine_synced": bool(synced),
+        "state_revision": queue_engine.state_revision(conn),
+        "applied_revision": _applied_revision(request),
+    }
 
 
 ENGINE_SETTING_KEYS = ("station_name", "station_description", "station_genre", "bitrate")
@@ -331,6 +371,8 @@ def decide_upload_batch(
         )
         result["state_revision"] = queue_engine.state_revision(conn)
         result["applied_revision"] = _applied_revision(request)
+    elif action == "replace":
+        result.update(_replace_application(request, conn, bool(result.get("replaced"))))
     return result
 
 
@@ -352,8 +394,17 @@ def decide_upload(
     conn: sqlite3.Connection = Depends(get_conn),
     session: dict = Depends(require_csrf),
 ):
-    action = str((body or {}).get("action") or "")
-    result = uploads.decide(conn, _settings(request), pending_id, action, _now(request))
+    data = body or {}
+    action = str(data.get("action") or "")
+    track_id = data.get("track_id")
+    result = uploads.decide(
+        conn,
+        _settings(request),
+        pending_id,
+        action,
+        _now(request),
+        track_id=str(track_id) if track_id else None,
+    )
     if action == "save":
         queue_engine.bump_state_revision(conn)
         conn.commit()
@@ -366,6 +417,10 @@ def decide_upload(
         )
         result["state_revision"] = queue_engine.state_revision(conn)
         result["applied_revision"] = _applied_revision(request)
+    elif action == "replace":
+        result.update(
+            _replace_application(request, conn, result.get("status") == "replaced")
+        )
     return result
 
 
@@ -2150,7 +2205,9 @@ def admin_history(
 ):
     limit = max(1, min(int(limit or 50), 200))
     rows = conn.execute(
-        "SELECT h.*, COALESCE(t.custom_cover_path, t.cover_path) AS cover_path "
+        "SELECT h.*, COALESCE(t.custom_cover_path, t.cover_path) AS cover_path, "
+        "t.cover_path AS track_cover_path, t.custom_cover_path AS track_custom_cover_path, "
+        "t.updated_at AS track_updated_at, t.replaced_at AS track_replaced_at "
         "FROM history h LEFT JOIN tracks t ON t.id = h.track_id "
         "ORDER BY h.started_at DESC, h.id DESC LIMIT ?",
         (limit,),
@@ -2170,7 +2227,17 @@ def admin_history(
                 "ended_at": row["ended_at"],
                 "source": source_payload(conn, row["source_kind"], row["source_ref"]),
                 "cover_url": (
-                    f"{base.rstrip('/')}/api/public/cover/{row['track_id']}"
+                    public_cover_url(
+                        settings,
+                        row["track_id"],
+                        {
+                            "cover_path": row["track_cover_path"],
+                            "custom_cover_path": row["track_custom_cover_path"],
+                            "updated_at": row["track_updated_at"],
+                            "replaced_at": row["track_replaced_at"],
+                        },
+                        base=base,
+                    )
                     if row["track_id"] and row["cover_path"]
                     else None
                 ),

@@ -12,7 +12,12 @@ from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 
 from . import db, media, queue_engine, scheduler
 from .auth import get_conn
-from .models import STATE_LABELS, playlist_auto_cover, source_payload
+from .models import (
+    STATE_LABELS,
+    playlist_auto_cover,
+    public_cover_url,
+    source_payload,
+)
 from .util import ApiError, clamp, is_relative_to, parse_iso
 
 router = APIRouter(tags=["public"])
@@ -31,7 +36,9 @@ def public_base(conn: sqlite3.Connection, settings) -> str:
 def _public_track(track: sqlite3.Row, settings, base: str) -> dict:
     effective_cover = track["custom_cover_path"] or track["cover_path"]
     cover_url = (
-        f"{base}/api/public/cover/{track['id']}" if effective_cover else None
+        public_cover_url(settings, track["id"], track, base=base)
+        if effective_cover
+        else None
     )
     return {
         "id": track["id"],
@@ -75,6 +82,10 @@ def build_now_playing(conn: sqlite3.Connection, app, now: datetime | None = None
         row = conn.execute("SELECT * FROM tracks WHERE id = ?", (playback["track"]["id"],)).fetchone()
         if row is not None:
             track_payload = _public_track(row, settings, base)
+            # The current instance finishes the old file: duration and progress
+            # come from the snapshot taken at track start, not from the row's
+            # freshly replaced metadata.
+            track_payload["duration"] = playback["duration"]
             track_payload.update(
                 {
                     "started_at": playback["started_at"],
@@ -164,7 +175,9 @@ def history(
     settings = request.app.state.settings
     base = public_base(conn, settings)
     rows = conn.execute(
-        "SELECT h.*, COALESCE(t.custom_cover_path, t.cover_path) AS cover_path "
+        "SELECT h.*, COALESCE(t.custom_cover_path, t.cover_path) AS cover_path, "
+        "t.cover_path AS track_cover_path, t.custom_cover_path AS track_custom_cover_path, "
+        "t.updated_at AS track_updated_at, t.replaced_at AS track_replaced_at "
         "FROM history h LEFT JOIN tracks t ON t.id = h.track_id "
         "ORDER BY h.started_at DESC, h.id DESC LIMIT ?",
         (limit,),
@@ -182,7 +195,17 @@ def history(
                 "ended_at": row["ended_at"],
                 "source": source_payload(conn, row["source_kind"], row["source_ref"]),
                 "cover_url": (
-                    f"{base}/api/public/cover/{row['track_id']}"
+                    public_cover_url(
+                        settings,
+                        row["track_id"],
+                        {
+                            "cover_path": row["track_cover_path"],
+                            "custom_cover_path": row["track_custom_cover_path"],
+                            "updated_at": row["track_updated_at"],
+                            "replaced_at": row["track_replaced_at"],
+                        },
+                        base=base,
+                    )
                     if row["cover_path"] and row["track_id"]
                     else None
                 ),

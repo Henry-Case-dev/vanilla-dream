@@ -20,7 +20,7 @@ import { duplicateReasonLabel } from '../lib/media';
 import { formatBytes } from '../lib/format';
 import { UPLOAD_ACCEPT } from '../lib/upload';
 
-type UploadFilter = 'all' | 'matches' | 'added' | 'errors';
+type UploadFilter = 'all' | 'matches' | 'added' | 'replaced' | 'errors';
 
 const STATE_LABELS: Record<UploadItemState, string> = {
   queued: 'Ожидает',
@@ -29,6 +29,7 @@ const STATE_LABELS: Record<UploadItemState, string> = {
   added: 'Добавлен',
   pending: 'Требует решения',
   saved: 'Сохранён как дубликат',
+  replaced: 'Заменён',
   skipped: 'Пропущен',
   cancelled: 'Отменён',
   error: 'Ошибка',
@@ -38,11 +39,13 @@ const FILTERS: Array<{ value: UploadFilter; label: string }> = [
   { value: 'all', label: 'Все' },
   { value: 'matches', label: 'Совпадения' },
   { value: 'added', label: 'Добавленные' },
+  { value: 'replaced', label: 'Заменённые' },
   { value: 'errors', label: 'Ошибки' },
 ];
 
 function statusIcon(state: UploadItemState | LocalUploadItem['status']) {
   if (state === 'added' || state === 'saved') return <Check size={14} aria-hidden="true" />;
+  if (state === 'replaced') return <RefreshCw size={14} aria-hidden="true" />;
   if (state === 'pending') return <ListChecks size={14} aria-hidden="true" />;
   if (state === 'error') return <CircleAlert size={14} aria-hidden="true" />;
   if (state === 'uploading' || state === 'processing') return <Spinner size={13} />;
@@ -52,7 +55,7 @@ function statusIcon(state: UploadItemState | LocalUploadItem['status']) {
 }
 
 function statusTone(state: string): string {
-  if (state === 'added' || state === 'saved') return 'is-ok';
+  if (state === 'added' || state === 'saved' || state === 'replaced') return 'is-ok';
   if (state === 'pending') return 'is-warn';
   if (state === 'error') return 'is-error';
   return '';
@@ -128,6 +131,8 @@ export function UploadDialog({
         return combined.filter((row) => row.state === 'pending' && !row.decision);
       case 'added':
         return combined.filter((row) => row.state === 'added' || row.state === 'saved');
+      case 'replaced':
+        return combined.filter((row) => row.state === 'replaced');
       case 'errors':
         return combined.filter((row) => row.state === 'error');
       default:
@@ -155,6 +160,7 @@ export function UploadDialog({
       0) + localItems.filter((item) => item.status === 'error').length;
 
   const added = batch?.counts.added ?? 0;
+  const replaced = batch?.counts.replaced ?? 0;
   const needsDecision = batch?.counts.pending ?? 0;
   const errors = (batch?.counts.errors ?? 0) + localItems.filter((item) => item.status === 'error').length;
   const active = uploading || (batch?.counts.pending ?? 0) > 0;
@@ -224,6 +230,9 @@ export function UploadDialog({
         <ProgressBar value={progress} label="Общий прогресс загрузки" />
         <div className="upload-counters">
           <span className="upload-footer__count is-ok">Добавлено: {added}</span>
+          {replaced > 0 && (
+            <span className="upload-footer__count is-accent">Заменено: {replaced}</span>
+          )}
           <span className="upload-footer__count is-warn">Требуют решения: {needsDecision}</span>
           <span className="upload-footer__count is-error">Ошибки: {errors}</span>
         </div>
@@ -264,15 +273,15 @@ export function UploadDialog({
         <Upload size={22} aria-hidden="true" />
         <span className="dropzone__title">Перетащите файлы сюда или выберите на диске</span>
         <span className="dropzone__hint">
-          Новый файл всегда становится отдельной записью: совпадение по хешу или тегам не заменит
-          существующий трек.
+          Совпадение по хешу или тегам не заменяет трек само по себе: сохраните копию, замените
+          существующий трек или пропустите файл — решение принимаете вы.
         </span>
       </label>
 
       {batchError && <InlineError message={batchError} />}
 
       <div className="upload-filters" role="tablist" aria-label="Фильтр файлов загрузки">
-        {FILTERS.map((entry) => (
+        {FILTERS.filter((entry) => entry.value !== 'replaced' || replaced > 0).map((entry) => (
           <button
             key={entry.value}
             type="button"
@@ -283,6 +292,7 @@ export function UploadDialog({
           >
             {entry.label}
             {entry.value === 'matches' && needsDecision > 0 ? ` (${needsDecision})` : ''}
+            {entry.value === 'replaced' && replaced > 0 ? ` (${replaced})` : ''}
           </button>
         ))}
       </div>
@@ -320,7 +330,9 @@ export function UploadDialog({
                   {row.state === 'pending' && row.decision
                     ? row.decision === 'save'
                       ? 'Сохранён как дубликат'
-                      : 'Пропущен'
+                      : row.decision === 'replace'
+                        ? 'Заменён'
+                        : 'Пропущен'
                     : STATE_LABELS[row.state as UploadItemState]}
                 </span>
               )}

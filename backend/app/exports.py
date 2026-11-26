@@ -338,6 +338,42 @@ def track_is_exported(conn: sqlite3.Connection, track_id: str) -> bool:
     return False
 
 
+def path_is_exported(conn: sqlite3.Connection, path) -> bool:
+    """True when an active export snapshot still references this absolute path."""
+
+    target = Path(str(path))
+    try:
+        target_resolved = target.resolve()
+    except OSError:
+        target_resolved = target
+    placeholders = ",".join("?" for _ in ACTIVE_EXPORT_STATES)
+    rows = conn.execute(
+        f"SELECT snapshot FROM export_jobs WHERE state IN ({placeholders})",
+        ACTIVE_EXPORT_STATES,
+    ).fetchall()
+    for row in rows:
+        try:
+            snapshot = json.loads(row["snapshot"] or "[]")
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(snapshot, list):
+            continue
+        for item in snapshot:
+            if not isinstance(item, dict):
+                continue
+            stored = str(item.get("path") or "")
+            if not stored:
+                continue
+            candidate = Path(stored)
+            try:
+                candidate_resolved = candidate.resolve()
+            except OSError:
+                candidate_resolved = candidate
+            if candidate == target or candidate_resolved == target_resolved:
+                return True
+    return False
+
+
 def _snapshot_track(settings: Settings, row) -> dict:
     source = media.resolve_track_path(settings, row)
     cover_path = media.effective_cover_path(settings, row)

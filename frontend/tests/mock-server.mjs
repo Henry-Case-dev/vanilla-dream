@@ -48,6 +48,9 @@ const tracks = Array.from({ length: 120 }, (_, index) => {
     bitrate: 320,
     size: 8000000 + index * 1000,
     ext: 'mp3',
+    sha256: `sha-${String(number).padStart(3, '0')}`,
+    path: `music/t${number}.mp3`,
+    replaced_at: null,
     cover_url: index % 4 === 0 ? COVER : null,
     cover_kind: index % 4 === 0 ? 'file' : 'none',
     original_cover_url: COVER,
@@ -80,6 +83,7 @@ const state = {
   queueRevision: 3,
   historyRevision: 2,
   currentTrackId: 't1',
+  frozenPlayback: null,
   currentSource: {
     kind: 'playlist',
     playlist_id: 'p1',
@@ -190,6 +194,7 @@ function resetMock() {
   state.queueRevision = 3;
   state.historyRevision = 2;
   state.currentTrackId = 't1';
+  state.frozenPlayback = null;
   state.currentSource = {
     kind: 'playlist',
     playlist_id: 'p1',
@@ -211,12 +216,24 @@ function resetMock() {
   stateMedia.batches.clear();
   stateMedia.exports.clear();
   stateMedia.seq = 0;
+  stateMedia.requests = [];
+  stateMedia.replaceStaleOnce = false;
+  stateMedia.replaceFailOnce = false;
+  stateMedia.replaceFailAttempt = 0;
+  stateMedia.replaceAttempts = 0;
+  stateMedia.noTargetOnce = false;
 }
 
 const stateMedia = {
   batches: new Map(),
   exports: new Map(),
   seq: 0,
+  requests: [],
+  replaceStaleOnce: false,
+  replaceFailOnce: false,
+  replaceFailAttempt: 0,
+  replaceAttempts: 0,
+  noTargetOnce: false,
 };
 
 function nowIso(offsetMs = 0) {
@@ -237,8 +254,42 @@ function comparison(track) {
     duration: track.duration,
     size: track.size,
     bitrate: track.bitrate,
-    cover_url: track.cover_url,
+    cover_url: versionedCover(track),
   };
+}
+
+/**
+ * Same rule as the real backend: the cover URL carries a version derived from
+ * the track's own timestamps, so it changes only after the track row changes.
+ */
+function versionedCover(track) {
+  if (!track.cover_url) return null;
+  const stamp = track.replaced_at || track.updated_at || '';
+  const parsed = Date.parse(stamp);
+  const version = Number.isFinite(parsed) ? parsed : 0;
+  const base = String(track.cover_url).split('?')[0];
+  return `${base}?v=${version}`;
+}
+
+function withVersionedCover(track) {
+  return { ...track, cover_url: versionedCover(track) };
+}
+
+function candidateSummary(track) {
+  return { ...comparison(track), is_duplicate: Boolean(track.is_duplicate) };
+}
+
+function decoratePending(item) {
+  const candidates = (item.matches || [])
+    .map((match) => byId.get(match.track?.id))
+    .filter(Boolean)
+    .map(candidateSummary);
+  item.replace_candidates = candidates;
+  item.identical = Boolean(item.identical);
+  item.can_replace = item.state === 'pending' && candidates.length > 0 && !item.identical;
+  item.replace_target = candidates.length === 1 ? candidates[0] : null;
+  item.decision_target = item.decision_target ?? null;
+  return item;
 }
 
 function batchItemPayload(item) {
@@ -251,14 +302,20 @@ function batchItemPayload(item) {
     metadata: item.metadata,
     matches: item.matches,
     decision: item.decision,
+    decision_target: item.decision_target ?? null,
     error: item.error,
+    can_replace: item.can_replace ?? false,
+    identical: item.identical ?? false,
+    replace_target: item.replace_target ?? null,
+    replace_candidates: item.replace_candidates ?? [],
   };
 }
 
 function batchPayload(batch) {
-  const counts = { added: 0, pending: 0, skipped: 0, errors: 0 };
+  const counts = { added: 0, replaced: 0, pending: 0, skipped: 0, errors: 0 };
   for (const item of batch.items) {
     if (item.state === 'added' || item.state === 'saved') counts.added += 1;
+    else if (item.state === 'replaced') counts.replaced += 1;
     else if (item.state === 'pending') counts.pending += 1;
     else if (item.state === 'skipped') counts.skipped += 1;
     else if (item.state === 'error') counts.errors += 1;
@@ -328,7 +385,7 @@ function userPlaylistCount(trackId) {
 }
 
 function trackWithCounts(track) {
-  return { ...track, playlists_count: userPlaylistCount(track.id) };
+  return { ...withVersionedCover(track), playlists_count: userPlaylistCount(track.id) };
 }
 
 function playlistPayload(id) {
@@ -526,19 +583,28 @@ function nowPlaying(req) {
       diagnostic_reason: null,
     },
     track: current
-      ? {
-          id: current.id,
-          title: current.title,
-          artist: current.artist,
-          album: current.album,
-          genre: current.genre,
-          year: current.year,
-          cover_url: current.cover_url,
-          duration: current.duration,
-          started_at: state.startedAt,
-          elapsed: 96,
-          progress: 96 / current.duration,
-        }
+      ? (() => {
+          const frozen =
+            state.frozenPlayback &&
+            state.frozenPlayback.trackId === current.id &&
+            state.frozenPlayback.startedAt === state.startedAt
+              ? state.frozenPlayback.duration
+              : null;
+          const duration = frozen ?? current.duration;
+          return {
+            id: current.id,
+            title: current.title,
+            artist: current.artist,
+            album: current.album,
+            genre: current.genre,
+            year: current.year,
+            cover_url: versionedCover(current),
+            duration,
+            started_at: state.startedAt,
+            elapsed: 96,
+            progress: duration ? 96 / duration : null,
+          };
+        })()
       : null,
     source: playing
       ? state.currentSource ?? effective
@@ -665,7 +731,7 @@ function queuePayload() {
       id: 'pos-current',
       position_id: 'pos-current',
       position: -1,
-      track: byId.get(state.currentTrackId) ?? byId.get('t1'),
+      track: withVersionedCover(byId.get(state.currentTrackId) ?? byId.get('t1')),
       source: effectiveSourcePayload(),
       started_at: state.startedAt,
       elapsed: 96,
@@ -674,7 +740,7 @@ function queuePayload() {
       id: item.id,
       position_id: item.id,
       position: index,
-      track: byId.get(item.trackId),
+      track: withVersionedCover(byId.get(item.trackId)),
       source: item.manual
         ? { kind: 'manual', label: 'Ручная вставка', name: 'Ручная вставка' }
         : effectiveSourcePayload(),
@@ -732,6 +798,26 @@ const server = http.createServer(async (req, res) => {
   if (route === '/api/mock/reset') {
     resetMock();
     return json(res, 200, { ok: true });
+  }
+  if (route === '/api/mock/requests') {
+    return json(res, 200, { requests: stateMedia.requests });
+  }
+  if (route === '/api/mock/replace-stale') {
+    stateMedia.replaceStaleOnce = url.searchParams.get('on') === '1';
+    return json(res, 200, { stale: stateMedia.replaceStaleOnce });
+  }
+  if (route === '/api/mock/no-target') {
+    stateMedia.noTargetOnce = url.searchParams.get('on') === '1';
+    return json(res, 200, { no_target: stateMedia.noTargetOnce });
+  }
+  if (route === '/api/mock/replace-fail') {
+    stateMedia.replaceFailOnce = url.searchParams.get('on') === '1';
+    stateMedia.replaceFailAttempt = Number(url.searchParams.get('attempt') || 0);
+    stateMedia.replaceAttempts = 0;
+    return json(res, 200, {
+      fail: stateMedia.replaceFailOnce,
+      attempt: stateMedia.replaceFailAttempt,
+    });
   }
   if (route === '/api/mock/override') {
     if (url.searchParams.get('on') === '1') {
@@ -924,7 +1010,7 @@ const server = http.createServer(async (req, res) => {
       }
       if (lower.includes('dup') || lower.includes('copy') || lower.includes('same')) {
         const kind = lower.includes('same') ? 'content' : lower.includes('possible') ? 'possible' : 'tags';
-        const match = byId.get('t1');
+        const match = byId.get(lower.includes('second') ? 't3' : 't1');
         const metadata = {
           title: base,
           artist: 'Новый артист',
@@ -944,12 +1030,24 @@ const server = http.createServer(async (req, res) => {
           matches: [
             { duplicate_kind: kind, track: comparison(match) },
             ...(kind === 'tags'
-              ? [{ duplicate_kind: 'possible', track: comparison(byId.get('t3')) }]
+              ? [
+                  { duplicate_kind: 'possible', track: comparison(byId.get('t3')) },
+                  { duplicate_kind: 'possible', track: comparison(byId.get('t2')) },
+                ]
               : []),
           ],
           decision: null,
           error: null,
+          identical: kind === 'content',
         };
+        decoratePending(item);
+        if (stateMedia.noTargetOnce) {
+          stateMedia.noTargetOnce = false;
+          item.matches = [];
+          item.replace_candidates = [];
+          item.replace_target = null;
+          item.can_replace = false;
+        }
         batch.items.push(item);
         return json(res, 202, {
           status: 'pending',
@@ -975,6 +1073,8 @@ const server = http.createServer(async (req, res) => {
         bitrate: 320,
         size,
         ext: 'mp3',
+        sha256: `sha-${id}`,
+        path: `music/${id}.mp3`,
         cover_url: COVER,
         cover_kind: 'file',
         is_duplicate: false,
@@ -1050,6 +1150,8 @@ const server = http.createServer(async (req, res) => {
           bitrate: item.metadata?.bitrate ?? 320,
           size: item.metadata?.size ?? item.size,
           ext: 'mp3',
+          sha256: `sha-${id}`,
+          path: `music/${id}.mp3`,
           cover_url: item.metadata?.cover_url ?? COVER,
           cover_kind: 'file',
           is_duplicate: true,
@@ -1074,10 +1176,136 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
+    function applyReplace(item, target) {
+      const metadata = item.metadata || {};
+      const oldPath = target.path;
+      if (target.id === state.currentTrackId) {
+        // The running instance keeps the duration it started with, even if the
+        // same track is replaced again before it finishes.
+        const alreadyFrozen =
+          state.frozenPlayback &&
+          state.frozenPlayback.trackId === target.id &&
+          state.frozenPlayback.startedAt === state.startedAt;
+        if (!alreadyFrozen) {
+          state.frozenPlayback = {
+            trackId: target.id,
+            startedAt: state.startedAt,
+            duration: target.duration,
+          };
+        }
+      }
+      target.duration = metadata.duration ?? target.duration;
+      target.size = metadata.size ?? item.size ?? target.size;
+      target.bitrate = metadata.bitrate ?? target.bitrate;
+      target.source_filename = item.filename;
+      target.sha256 = `sha-replaced-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+      target.path = `music/${target.id}-${Math.random().toString(16).slice(2, 8)}.mp3`;
+      target.replaced_at = nowIso();
+      target.updated_at = target.replaced_at;
+      item.state = 'replaced';
+      item.decision = 'replace';
+      item.decision_target = target.id;
+      item.replace_candidates = [];
+      item.can_replace = false;
+      item.replace_target = null;
+      state.revision += 1;
+      state.queueRevision += 1;
+      state.appliedRevision = state.revision;
+      return oldPath;
+    }
+
+    function decideReplace(res, found, body) {
+      const { item } = found;
+      stateMedia.replaceAttempts += 1;
+      stateMedia.requests.push({
+        action: 'replace',
+        pending_id: item.id,
+        track_id: body.track_id ? String(body.track_id) : null,
+      });
+      const candidates = item.replace_candidates || [];
+      if (item.identical) {
+        const target = candidates[0] ? byId.get(candidates[0].id) : null;
+        return json(res, 200, {
+          status: 'identical',
+          replaced: false,
+          identical: true,
+          track_id: target?.id ?? null,
+          track: target ? trackWithCounts(target) : null,
+          engine_synced: true,
+          state_revision: state.revision,
+          applied_revision: state.appliedRevision,
+        });
+      }
+      if (body.track_id && !candidates.some((candidate) => candidate.id === String(body.track_id))) {
+        return json(res, 422, {
+          detail: {
+            code: 'invalid_target',
+            message: 'Выбранный трек не входит в список совпадений.',
+          },
+        });
+      }
+      if (stateMedia.replaceStaleOnce) {
+        stateMedia.replaceStaleOnce = false;
+        return json(res, 409, {
+          detail: {
+            code: 'stale_match',
+            message: 'Совпадение изменилось. Проверьте трек и подтвердите замену.',
+          },
+        });
+      }
+      if (stateMedia.replaceFailOnce || stateMedia.replaceFailAttempt) {
+        const fail =
+          stateMedia.replaceFailOnce ||
+          stateMedia.replaceAttempts === stateMedia.replaceFailAttempt;
+        stateMedia.replaceFailOnce = false;
+        if (stateMedia.replaceFailAttempt && fail) stateMedia.replaceFailAttempt = 0;
+        if (fail) {
+          return json(res, 507, {
+            detail: {
+              code: 'replace_failed',
+              message: 'Не удалось заменить файл. Проверьте свободное место и повторите.',
+            },
+          });
+        }
+      }
+      let target = null;
+      if (body.track_id) target = byId.get(String(body.track_id)) ?? null;
+      else if (candidates.length === 1) target = byId.get(candidates[0].id) ?? null;
+      else if (candidates.length > 1) {
+        return json(res, 422, {
+          detail: {
+            code: 'ambiguous_target',
+            message: 'Найдено несколько совпадений. Выберите трек для замены.',
+          },
+        });
+      }
+      if (!target) {
+        return json(res, 409, {
+          detail: {
+            code: 'stale_match',
+            message: 'Совпадение изменилось. Проверьте трек и подтвердите замену.',
+          },
+        });
+      }
+      applyReplace(item, target);
+      return json(res, 200, {
+        status: 'replaced',
+        replaced: true,
+        identical: false,
+        track_id: target.id,
+        track: trackWithCounts(target),
+        application: 'applied',
+        engine_synced: true,
+        state_revision: state.revision,
+        applied_revision: state.appliedRevision,
+      });
+    }
+
     const decideMatch = route.match(/^\/api\/admin\/uploads\/([^/]+)\/decide$/);
     if (decideMatch && req.method === 'POST') {
       const body = await readBody(req);
-      const action = body.action === 'skip' ? 'skip' : 'save';
+      const action =
+        body.action === 'skip' || body.action === 'replace' ? body.action : 'save';
       let found = null;
       for (const batch of stateMedia.batches.values()) {
         const item = batch.items.find((entry) => entry.id === decodeURIComponent(decideMatch[1]));
@@ -1085,11 +1313,20 @@ const server = http.createServer(async (req, res) => {
       }
       if (!found) return json(res, 404, { detail: { code: 'pending_not_found', message: 'Файл не найден' } });
       if (found.item.decision) {
-        if (found.item.decision === action) return json(res, 200, { ok: true, already: true });
+        if (found.item.decision === action) {
+          if (action === 'replace') return decideReplace(res, found, body);
+          return json(res, 200, { ok: true, already: true });
+        }
         return json(res, 409, {
           detail: { code: 'already_decided', message: 'Решение уже принято' },
         });
       }
+      if (action === 'replace') return decideReplace(res, found, body);
+      stateMedia.requests.push({
+        action,
+        pending_id: found.item.id,
+        track_id: null,
+      });
       applyDecision(found.item, action);
       return json(res, 200, { ok: true, batch: batchPayload(found.batch) });
     }
@@ -1097,17 +1334,81 @@ const server = http.createServer(async (req, res) => {
     const batchDecideMatch = route.match(/^\/api\/admin\/uploads\/batch\/([^/]+)\/decide$/);
     if (batchDecideMatch && req.method === 'POST') {
       const body = await readBody(req);
-      const action = body.action === 'skip' ? 'skip' : 'save';
+      const action =
+        body.action === 'skip' || body.action === 'replace' ? body.action : 'save';
       const query = String(body.query || '').toLowerCase();
       const batch = stateMedia.batches.get(decodeURIComponent(batchDecideMatch[1]));
       if (!batch) return json(res, 404, { detail: { code: 'batch_not_found', message: 'Пакет не найден' } });
-      for (const item of batch.items) {
-        if (item.state !== 'pending' || item.decision) continue;
-        if (query && !`${item.filename} ${item.metadata?.title || ''} ${item.metadata?.artist || ''}`.toLowerCase().includes(query)) {
-          continue;
+      const selected = batch.items.filter(
+        (item) =>
+          item.state === 'pending' &&
+          !item.decision &&
+          (!query ||
+            `${item.filename} ${item.metadata?.title || ''} ${item.metadata?.artist || ''}`
+              .toLowerCase()
+              .includes(query)),
+      );
+      if (action === 'replace') {
+        let replaced = 0;
+        let skipped = 0;
+        let failed = 0;
+        let conflicts = 0;
+        let identical = 0;
+        const items = [];
+        const claimed = new Set();
+        for (const item of selected) {
+          const candidates = item.replace_candidates || [];
+          if (item.identical) {
+            identical += 1;
+            items.push({ id: item.id, status: 'identical', track_id: candidates[0]?.id ?? null, error: null });
+            continue;
+          }
+          if (candidates.length !== 1) {
+            failed += 1;
+            items.push({
+              id: item.id,
+              status: 'failed',
+              track_id: null,
+              error: 'Нужен явный выбор трека для замены.',
+            });
+            continue;
+          }
+          const target = byId.get(candidates[0].id);
+          if (!target) {
+            failed += 1;
+            items.push({ id: item.id, status: 'stale', track_id: candidates[0].id, error: 'Совпадение изменилось.' });
+            continue;
+          }
+          if (claimed.has(target.id)) {
+            conflicts += 1;
+            items.push({
+              id: item.id,
+              status: 'conflict',
+              track_id: target.id,
+              error: 'Несколько файлов претендуют на один трек. Выберите одну версию.',
+            });
+            continue;
+          }
+          claimed.add(target.id);
+          applyReplace(item, target);
+          replaced += 1;
+          items.push({ id: item.id, status: 'replaced', track_id: target.id, error: null });
         }
-        applyDecision(item, action);
+        return json(res, 200, {
+          replaced,
+          skipped,
+          failed,
+          conflicts,
+          identical,
+          items,
+          application: 'applied',
+          engine_synced: true,
+          state_revision: state.revision,
+          applied_revision: state.appliedRevision,
+          batch: batchPayload(batch),
+        });
       }
+      for (const item of selected) applyDecision(item, action);
       return json(res, 200, { ok: true, batch: batchPayload(batch) });
     }
 
@@ -1142,7 +1443,7 @@ const server = http.createServer(async (req, res) => {
       if (!track) return json(res, 404, { detail: { code: 'track_not_found', message: 'Трек не найден' } });
       if (req.method === 'POST') {
         await readRaw(req);
-        track.cover_url = `${COVER}?v=${Date.now()}`;
+        track.cover_url = COVER;
         track.cover_kind = 'custom';
         track.can_revert_cover = true;
       } else {
@@ -1255,7 +1556,7 @@ const server = http.createServer(async (req, res) => {
         };
         if (patch.cover_action === 'replace') {
           track.cover_kind = 'custom';
-          track.cover_url = `${COVER}?v=${Date.now()}`;
+          track.cover_url = COVER;
           track.can_revert_cover = true;
         } else if (patch.cover_action === 'revert') {
           track.cover_kind = 'file';

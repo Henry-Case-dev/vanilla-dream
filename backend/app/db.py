@@ -15,7 +15,7 @@ from .config import (
     Settings,
 )
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
 DEFAULT_SETTINGS: dict[str, str] = {
@@ -131,6 +131,50 @@ def _migrate_locked(conn: sqlite3.Connection, previous_version: int) -> None:
         )
     _migrate_tracks_v3(conn)
     _migrate_core_v4(conn, previous_version)
+    _migrate_media_v5(conn, previous_version)
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {
+        str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+
+
+def _migrate_media_v5(conn: sqlite3.Connection, previous_version: int = 5) -> None:
+    """Additive 1.3.0 media columns, playback duration and retained files.
+
+    Only new columns/table; every existing row, relation and setting is kept.
+    """
+
+    if "replaced_at" not in _table_columns(conn, "tracks"):
+        conn.execute("ALTER TABLE tracks ADD COLUMN replaced_at TEXT")
+
+    pending_columns = _table_columns(conn, "pending_uploads")
+    for column in ("match_sha", "decision_target", "decision_result"):
+        if column not in pending_columns:
+            conn.execute(f"ALTER TABLE pending_uploads ADD COLUMN {column} TEXT")
+
+    if "duration" not in _table_columns(conn, "playback_state"):
+        conn.execute("ALTER TABLE playback_state ADD COLUMN duration REAL")
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS retained_files ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, track_id TEXT, path TEXT NOT NULL, "
+        "reason TEXT, created_at TEXT)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_retained_files_track ON retained_files(track_id)"
+    )
+    if previous_version < 5:
+        # Legacy pending duplicates predate ``match_sha``. Capture the matched
+        # target's current hash once, so a later replace can still detect a
+        # change; nothing else about the pending item is touched.
+        conn.execute(
+            "UPDATE pending_uploads SET match_sha = ("
+            "SELECT sha256 FROM tracks WHERE id = pending_uploads.match_track_id"
+            ") WHERE state = 'pending' AND match_sha IS NULL "
+            "AND match_track_id IS NOT NULL"
+        )
 
 
 def _convert_override_source_refs(

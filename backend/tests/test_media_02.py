@@ -368,7 +368,13 @@ def test_batch_mix_in_batch_duplicates_and_error_counter(env, admin):
     batch = env.client.get(f"/api/admin/uploads/{batch_id}").json()["batch"]
     assert batch["status"] == "pending"
     assert batch["total"] == 4
-    assert batch["counts"] == {"added": 1, "pending": 2, "skipped": 0, "errors": 1}
+    assert batch["counts"] == {
+        "added": 1,
+        "replaced": 0,
+        "pending": 2,
+        "skipped": 0,
+        "errors": 1,
+    }
     assert {item["state"] for item in batch["items"]} == {"added", "pending", "error"}
     assert not any(
         path.name.startswith("incoming-") for path in env.settings.pending_dir.iterdir()
@@ -1301,7 +1307,7 @@ def test_migration_v2_preserves_rows_relations_and_drops_unique(settings):
     finally:
         conn.close()
 
-    assert version == db.SCHEMA_VERSION == 4
+    assert version == db.SCHEMA_VERSION == 5
     assert track["path"] == "legacy.mp3"
     assert track["title"] == "Legacy"
     assert track["cover_path"] == "old-1.jpg"

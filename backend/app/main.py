@@ -103,6 +103,7 @@ async def lifespan(app: FastAPI):
         auth.purge_expired_sessions(conn, app.state.clock.now())
         uploads.startup_cleanup(conn, settings)
         exports.startup_cleanup(conn, settings, app.state.clock.now())
+        media.cleanup_retained_files(conn, settings)
         queue_engine.deactivate_expired_overrides(conn, app.state.clock.now())
         conn.commit()
         now = app.state.clock.now()
